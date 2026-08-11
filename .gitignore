@@ -1,0 +1,14 @@
+# Go
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Coverage
+coverage.out
