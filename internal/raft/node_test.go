@@ -3,7 +3,8 @@ package raft
 import "testing"
 
 func TestNewNode(t *testing.T) {
-	n := NewNode(1)
+
+	n := NewNode(1, []int{0, 2}, nil)
 
 	if n.state != Follower {
 		t.Errorf("expected follower, got %v", n.state)
@@ -23,5 +24,12 @@ func TestNewNode(t *testing.T) {
 
 	if n.lastLogTerm() != 0 {
 		t.Errorf("expected last log term 0, got %d", n.lastLogTerm())
+	}
+
+	// peers must exclude self, so cluster size is len(peers)+1.
+	for _, p := range n.peers {
+		if p == n.id {
+			t.Errorf("peers must not contain self, got %v", n.peers)
+		}
 	}
 }
