@@ -5,33 +5,6 @@ import (
 	"time"
 )
 
-// currentLeaders returns every node that believes it leads, keyed by term.
-func currentLeaders(c *cluster) map[int][]int {
-	byTerm := make(map[int][]int)
-	for _, n := range c.nodes {
-		if s, term, _ := n.snapshotState(); s == Leader {
-			byTerm[term] = append(byTerm[term], n.id)
-		}
-	}
-	return byTerm
-}
-
-func waitForLeader(t *testing.T, c *cluster, within time.Duration) *Node {
-	t.Helper()
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		for term, ids := range currentLeaders(c) {
-			if len(ids) > 1 {
-				t.Fatalf("term %d has %d leaders: %v", term, len(ids), ids)
-			}
-			return c.nodes[ids[0]]
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("no leader within %v (seed %d)", within, c.seed)
-	return nil
-}
-
 // assertTimerWasReset checks the deadline sits in a plausible future window.
 func assertTimerWasReset(t *testing.T, n *Node, context string) {
 	t.Helper()
@@ -58,7 +31,11 @@ func TestHeartbeatsKeepLeadershipStable(t *testing.T) {
 	c := newCluster(t, 3, 1)
 	c.start()
 
-	leader := waitForLeader(t, c, 2*time.Second)
+	leaderID := c.waitForSingleLeader(2 * time.Second)
+	if leaderID == None {
+		t.Fatalf("no leader within 2s (seed %d)", c.seed)
+	}
+	leader := c.nodes[leaderID]
 	_, termAtWin, _ := leader.snapshotState()
 
 	time.Sleep(3 * electionTimeoutMax)
@@ -88,7 +65,11 @@ func TestFollowersTimeOutWhenHeartbeatsStop(t *testing.T) {
 	c := newCluster(t, 3, 1)
 	c.start()
 
-	leader := waitForLeader(t, c, 2*time.Second)
+	leaderID := c.waitForSingleLeader(2 * time.Second)
+	if leaderID == None {
+		t.Fatalf("no leader within 2s (seed %d)", c.seed)
+	}
+	leader := c.nodes[leaderID]
 	_, oldTerm, _ := leader.snapshotState()
 
 	// Cut the leader off. Its heartbeats stop reaching anyone.
@@ -96,7 +77,7 @@ func TestFollowersTimeOutWhenHeartbeatsStop(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		for term, ids := range currentLeaders(c) {
+		for term, ids := range c.leadersByTerm() {
 			if term > oldTerm && ids[0] != leader.id {
 				return // a new leader emerged in a later term, as it should
 			}

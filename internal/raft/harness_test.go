@@ -3,7 +3,9 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -243,20 +245,93 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 	return c
 }
 
-// checkSingleLeader returns the id of the leader, or -1 if there isn't exactly one legitimate leader.
-//
-// TODO (yours): implement this. Walk every node, read state and currentTerm
-// under that node's own lock, and count leaders.
-//
-// The trap: counting nodes in Leader state and asserting the count is 1 will
-// give you a flaky test. Raft permits two nodes to believe they lead at the same
-// moment, as long as they are in DIFFERENT terms -- a partitioned old leader has
-// not yet learned it was deposed. What is forbidden is two leaders in the SAME
-// term. Group by term before you assert. B-12 and B-14 will hand you exactly
-// this situation.
+// leadersByTerm groups every node that believes it leads by the term it thinks it leads in.
+func (c *cluster) leadersByTerm() map[int][]int {
+	byTerm := make(map[int][]int)
+	for _, n := range c.nodes {
+		if state, term, _ := n.snapshotState(); state == Leader {
+			byTerm[term] = append(byTerm[term], n.id)
+		}
+	}
+	return byTerm
+}
+
+// checkSingleLeader returns the id of the leader in the newest term, or None if no node currently believes it leads.
 func (c *cluster) checkSingleLeader() int {
 	c.t.Helper()
-	return -1
+
+	byTerm := c.leadersByTerm()
+
+	newestTerm := -1
+	leader := None
+
+	for term, ids := range byTerm {
+		if len(ids) > 1 {
+			c.t.Fatalf("ELECTION SAFETY VIOLATED: term %d has %d leaders %v (seed %d)",
+				term, len(ids), ids, c.seed)
+		}
+		if term > newestTerm {
+			newestTerm = term
+			leader = ids[0]
+		}
+	}
+
+	return leader
+}
+
+func (c *cluster) waitForSingleLeader(within time.Duration) int {
+	c.t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if leader := c.checkSingleLeader(); leader != None {
+			return leader
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+	return None
+}
+
+// waitForStableCluster polls until exactly one leader exists AND every other node has settled into follower.
+// Returns the leader's id, or None if the cluster did not settle in time.
+func (c *cluster) waitForStableCluster(within time.Duration) int {
+	c.t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		leader := c.checkSingleLeader()
+		if leader != None && c.allOthersAreFollowers(leader) {
+			return leader
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+	return None
+}
+
+// allOthersAreFollowers reports whether every node except the leader has stood down.
+func (c *cluster) allOthersAreFollowers(leader int) bool {
+	for _, n := range c.nodes {
+		if n.id == leader {
+			continue
+		}
+		if state, _, _ := n.snapshotState(); state != Follower {
+			return false
+		}
+	}
+	return true
+}
+
+// describe renders every node's state, for failure messages.
+func (c *cluster) describe() string {
+	var b strings.Builder
+	for i, n := range c.nodes {
+		state, term, votedFor := n.snapshotState()
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "node %d: %v term=%d votedFor=%d", n.id, state, term, votedFor)
+	}
+	return b.String()
 }
 
 func (c *cluster) start() {

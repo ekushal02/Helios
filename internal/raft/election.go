@@ -42,7 +42,9 @@ func (n *Node) Start() {
 
 // Stop shuts the background loops down
 func (n *Node) Stop() {
-	close(n.stopCh)
+	n.stopOnce.Do(func() {
+		close(n.stopCh)
+	})
 }
 
 // ticker is the single goroutine that watches the election deadline.

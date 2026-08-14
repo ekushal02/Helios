@@ -56,6 +56,8 @@ type Node struct {
 	electionDeadline time.Time     //election starting timer
 	rng              *rand.Rand    //randomised election timeout
 	stopCh           chan struct{} //shut ticker down
+
+	stopOnce sync.Once //stopOnce makes Stop safe to call more than once.
 }
 
 // New node returns a node in the state every RAFT server starts in: follower
