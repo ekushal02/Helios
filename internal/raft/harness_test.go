@@ -142,11 +142,29 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 	mustRoundTrip(args, &argsCopy)
 
 	var replyCopy RequestVoteReply
+	target.RequestVote(&argsCopy, &replyCopy)
 
-	// TODO (yours): once the handler exists in B-7, replace this with
-	//     target.RequestVote(&argsCopy, &replyCopy)
-	// Until then every call returns a zero reply.
-	_ = target
+	if !e.net.deliverable(to, e.from) {
+		return false
+	}
+	mustRoundTrip(&replyCopy, reply)
+	return true
+}
+
+func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	target, delay, ok := e.net.route(e.from, to)
+	if !ok {
+		return false
+	}
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+
+	var argsCopy AppendEntriesArgs
+	mustRoundTrip(args, &argsCopy)
+
+	var replyCopy AppendEntriesReply
+	target.AppendEntries(&argsCopy, &replyCopy)
 
 	if !e.net.deliverable(to, e.from) {
 		return false
@@ -217,7 +235,7 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 				peers = append(peers, j)
 			}
 		}
-		node := NewNode(i, peers, net.endpoint(i))
+		node := NewNode(i, peers, net.endpoint(i), seed+int64(i))
 		net.register(node)
 		c.nodes = append(c.nodes, node)
 	}
@@ -239,4 +257,18 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 func (c *cluster) checkSingleLeader() int {
 	c.t.Helper()
 	return -1
+}
+
+func (c *cluster) start() {
+	c.t.Helper()
+	for _, n := range c.nodes {
+		n.Start()
+	}
+	c.t.Cleanup(c.stop)
+}
+
+func (c *cluster) stop() {
+	for _, n := range c.nodes {
+		n.Stop()
+	}
 }

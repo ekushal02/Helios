@@ -1,6 +1,10 @@
 package raft
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // State is the role a node currently occupies
 type State int
@@ -46,20 +50,29 @@ type Node struct {
 	commitIndex int   //last commited
 	lastApplied int   //last executed
 	state       State //current role
+
+	leaderID int
+
+	electionDeadline time.Time     //election starting timer
+	rng              *rand.Rand    //randomised election timeout
+	stopCh           chan struct{} //shut ticker down
 }
 
 // New node returns a node in the state every RAFT server starts in: follower
-func NewNode(id int, peers []int, transport Transport) *Node {
+func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 	return &Node{
 		id:          id,
 		peers:       peers,
 		transport:   transport,
 		currentTerm: 0,
 		votedFor:    None,
+		leaderID:    None,
 		log:         []LogEntry{{Term: 0}},
 		commitIndex: 0,
 		lastApplied: 0,
 		state:       Follower,
+		rng:         rand.New(rand.NewSource(seed)),
+		stopCh:      make(chan struct{}),
 	}
 }
 
