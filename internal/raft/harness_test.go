@@ -248,7 +248,7 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 				peers = append(peers, j)
 			}
 		}
-		node := NewNode(i, peers, net.endpoint(i), seed+int64(i))
+		node := NewNode(i, peers, net.endpoint(i), seed*1_000_003+int64(i))
 		net.register(node)
 		c.nodes = append(c.nodes, node)
 	}
