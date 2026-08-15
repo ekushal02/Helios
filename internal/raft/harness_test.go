@@ -220,6 +220,9 @@ type cluster struct {
 	net   *fakeNetwork
 	nodes []*Node
 	seed  int64
+
+	mu   sync.Mutex   //guards dead
+	dead map[int]bool //ids killed via kill()
 }
 
 // newCluster builds n fully-connected in-memory nodes.
@@ -228,7 +231,7 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 	t.Logf("cluster: n=%d seed=%d", n, seed)
 
 	net := newFakeNetwork(seed)
-	c := &cluster{t: t, net: net, seed: seed}
+	c := &cluster{t: t, net: net, seed: seed, dead: make(map[int]bool)}
 
 	for i := 0; i < n; i++ {
 		var peers []int
@@ -245,10 +248,72 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 	return c
 }
 
+func (c *cluster) start() {
+	c.t.Helper()
+	for _, n := range c.nodes {
+		n.Start()
+	}
+	c.t.Cleanup(c.stop)
+}
+
+func (c *cluster) stop() {
+	for _, n := range c.nodes {
+		n.Stop()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Killing nodes
+// ---------------------------------------------------------------------------
+
+// kill simulates a crash. B-12 onward.
+//
+// BOTH halves are necessary, and the second is the one that is easy to miss.
+// Stop only closes stopCh, which ends the election ticker and the heartbeat
+// loop. It does NOT stop RequestVote and AppendEntries, because the fake
+// network calls those handlers directly on the struct -- there is no process to
+// exit and no socket to close. A node that is stopped but still reachable goes
+// on granting votes forever, so a test that "kills" three of five nodes would
+// still see five voters and elect a leader from a minority.
+//
+// Cutting the network is what makes the node actually absent. Contrast with
+// B-14, where a node is partitioned but very much alive.
+
+func (c *cluster) kill(id int) {
+	c.t.Helper()
+
+	c.nodes[id].Stop()
+	c.net.disconnect(id)
+
+	c.mu.Lock()
+	c.dead[id] = true
+	c.mu.Unlock()
+}
+
+func (c *cluster) isDead(id int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dead[id]
+}
+
+// alive returns the ids still running.
+func (c *cluster) alive() []int {
+	var ids []int
+	for _, n := range c.nodes {
+		if !c.isDead(n.id) {
+			ids = append(ids, n.id)
+		}
+	}
+	return ids
+}
+
 // leadersByTerm groups every node that believes it leads by the term it thinks it leads in.
 func (c *cluster) leadersByTerm() map[int][]int {
 	byTerm := make(map[int][]int)
 	for _, n := range c.nodes {
+		if c.isDead(n.id) {
+			continue
+		}
 		if state, term, _ := n.snapshotState(); state == Leader {
 			byTerm[term] = append(byTerm[term], n.id)
 		}
@@ -279,6 +344,7 @@ func (c *cluster) checkSingleLeader() int {
 	return leader
 }
 
+// waitForSingleLeader polls until exactly one leader exists, or the bound expires.
 func (c *cluster) waitForSingleLeader(within time.Duration) int {
 	c.t.Helper()
 
@@ -308,10 +374,26 @@ func (c *cluster) waitForStableCluster(within time.Duration) int {
 	return None
 }
 
+// waitForNewLeader polls for a leader that is neither the old one nor leading in a term at or below the old one.
+func (c *cluster) waitForNewLeader(oldLeader, oldTerm int, within time.Duration) int {
+	c.t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if leader := c.checkSingleLeader(); leader != None && leader != oldLeader {
+			if _, term, _ := c.nodes[leader].snapshotState(); term > oldTerm {
+				return leader
+			}
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+	return None
+}
+
 // allOthersAreFollowers reports whether every node except the leader has stood down.
 func (c *cluster) allOthersAreFollowers(leader int) bool {
 	for _, n := range c.nodes {
-		if n.id == leader {
+		if n.id == leader || c.isDead(n.id) {
 			continue
 		}
 		if state, _, _ := n.snapshotState(); state != Follower {
@@ -330,20 +412,9 @@ func (c *cluster) describe() string {
 			b.WriteString("; ")
 		}
 		fmt.Fprintf(&b, "node %d: %v term=%d votedFor=%d", n.id, state, term, votedFor)
+		if c.isDead(n.id) {
+			b.WriteString(" (KILLED)")
+		}
 	}
 	return b.String()
-}
-
-func (c *cluster) start() {
-	c.t.Helper()
-	for _, n := range c.nodes {
-		n.Start()
-	}
-	c.t.Cleanup(c.stop)
-}
-
-func (c *cluster) stop() {
-	for _, n := range c.nodes {
-		n.Stop()
-	}
 }
