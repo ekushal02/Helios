@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
@@ -40,12 +41,13 @@ type LogEntry struct {
 type Node struct {
 	mu sync.Mutex //guards every field below
 
-	id          int        // Node's ID
-	peers       []int      //ids of all the other nodes in the cluster
-	transport   Transport  //how this node reaches peers
-	currentTerm int        //current election term
-	votedFor    int        //current vote
-	log         []LogEntry //replicated commands
+	id          int          // Node's ID
+	peers       []int        //ids of all the other nodes in the cluster
+	transport   Transport    //how this node reaches peers
+	logger      *slog.Logger //nil until SetLogger; lg() falls back to discard
+	currentTerm int          //current election term
+	votedFor    int          //current vote
+	log         []LogEntry   //replicated commands
 
 	commitIndex int   //last commited
 	lastApplied int   //last executed
@@ -66,6 +68,7 @@ func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 		id:          id,
 		peers:       peers,
 		transport:   transport,
+		logger:      discardLogger,
 		currentTerm: 0,
 		votedFor:    None,
 		leaderID:    None,

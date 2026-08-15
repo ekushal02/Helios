@@ -241,6 +241,8 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 	net := newFakeNetwork(seed)
 	c := &cluster{t: t, net: net, seed: seed, dead: make(map[int]bool)}
 
+	base := newTestLogger(t, seed)
+
 	for i := 0; i < n; i++ {
 		var peers []int
 		for j := 0; j < n; j++ {
@@ -249,6 +251,7 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 			}
 		}
 		node := NewNode(i, peers, net.endpoint(i), seed*1_000_003+int64(i))
+		node.SetLogger(base)
 		net.register(node)
 		c.nodes = append(c.nodes, node)
 	}
