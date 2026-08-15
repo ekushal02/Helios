@@ -23,6 +23,7 @@ type fakeNetwork struct {
 	reachable map[int]map[int]bool //N x N matrix
 
 	dropRate float64       //chance a deliverable message is dropped anyway
+	minDelay time.Duration //lower bound on random per-message delay
 	maxDelay time.Duration //upper bound on random per-message delay
 
 	rpcCount int //for asserting things like "the minority got no votes"
@@ -114,6 +115,13 @@ func (fn *fakeNetwork) setMaxDelay(d time.Duration) {
 	fn.maxDelay = d
 }
 
+func (fn *fakeNetwork) setDelayRange(min, max time.Duration) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	fn.minDelay = min
+	fn.maxDelay = max
+}
+
 func (fn *fakeNetwork) rpcs() int {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
@@ -189,9 +197,9 @@ func (fn *fakeNetwork) route(from, to int) (*Node, time.Duration, bool) {
 		return nil, 0, false
 	}
 
-	var delay time.Duration
-	if fn.maxDelay > 0 {
-		delay = time.Duration(fn.rng.Int63n(int64(fn.maxDelay)))
+	delay := fn.minDelay
+	if fn.maxDelay > fn.minDelay {
+		delay += time.Duration(fn.rng.Int63n(int64(fn.maxDelay - fn.minDelay)))
 	}
 	return fn.nodes[to], delay, true
 }
@@ -321,6 +329,36 @@ func (c *cluster) leadersByTerm() map[int][]int {
 	return byTerm
 }
 
+// candidatesByTerm groups every live node currently campaigning by the term it is campaigning in.
+func (c *cluster) candidatesByTerm() map[int][]int {
+	byTerm := make(map[int][]int)
+	for _, n := range c.nodes {
+		if c.isDead(n.id) {
+			continue
+		}
+		if state, term, _ := n.snapshotState(); state == Candidate {
+			byTerm[term] = append(byTerm[term], n.id)
+		}
+	}
+	return byTerm
+}
+
+// waitForSplitVote polls until at least atLeast live nodes are campaigning in the SAME term, and returns that term with the ids involved.
+func (c *cluster) waitForSplitVote(atLeast int, within time.Duration) (int, []int) {
+	c.t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		for term, ids := range c.candidatesByTerm() {
+			if len(ids) >= atLeast {
+				return term, ids
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return None, nil
+}
+
 // checkSingleLeader returns the id of the leader in the newest term, or None if no node currently believes it leads.
 func (c *cluster) checkSingleLeader() int {
 	c.t.Helper()
@@ -417,4 +455,16 @@ func (c *cluster) describe() string {
 		}
 	}
 	return b.String()
+}
+
+// alignElectionDeadlines forces the given nodes to time out at the same instant.
+func (c *cluster) alignElectionDeadlines(at time.Time, ids ...int) {
+	c.t.Helper()
+
+	for _, id := range ids {
+		n := c.nodes[id]
+		n.mu.Lock()
+		n.electionDeadline = at
+		n.mu.Unlock()
+	}
 }
