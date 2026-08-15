@@ -343,6 +343,17 @@ func (c *cluster) candidatesByTerm() map[int][]int {
 	return byTerm
 }
 
+// maxTermAmong reports the highest term seen in a group.
+func (c *cluster) maxTermAmong(ids []int) int {
+	highest := -1
+	for _, id := range ids {
+		if _, term, _ := c.nodes[id].snapshotState(); term > highest {
+			highest = term
+		}
+	}
+	return highest
+}
+
 // waitForSplitVote polls until at least atLeast live nodes are campaigning in the SAME term, and returns that term with the ids involved.
 func (c *cluster) waitForSplitVote(atLeast int, within time.Duration) (int, []int) {
 	c.t.Helper()
@@ -396,6 +407,20 @@ func (c *cluster) waitForSingleLeader(within time.Duration) int {
 	return None
 }
 
+// leadersAmong is leadersByTerm restricted to one side of a partition.
+func (c *cluster) leadersAmong(ids []int) map[int][]int {
+	byTerm := make(map[int][]int)
+	for _, id := range ids {
+		if c.isDead(id) {
+			continue
+		}
+		if state, term, _ := c.nodes[id].snapshotState(); state == Leader {
+			byTerm[term] = append(byTerm[term], id)
+		}
+	}
+	return byTerm
+}
+
 // waitForStableCluster polls until exactly one leader exists AND every other node has settled into follower.
 // Returns the leader's id, or None if the cluster did not settle in time.
 func (c *cluster) waitForStableCluster(within time.Duration) int {
@@ -441,6 +466,17 @@ func (c *cluster) allOthersAreFollowers(leader int) bool {
 	return true
 }
 
+// othersThan returns every live node id except the given one, in order.
+func (c *cluster) othersThan(id int) []int {
+	var ids []int
+	for _, n := range c.nodes {
+		if n.id != id && !c.isDead(n.id) {
+			ids = append(ids, n.id)
+		}
+	}
+	return ids
+}
+
 // describe renders every node's state, for failure messages.
 func (c *cluster) describe() string {
 	var b strings.Builder
@@ -466,5 +502,42 @@ func (c *cluster) alignElectionDeadlines(at time.Time, ids ...int) {
 		n.mu.Lock()
 		n.electionDeadline = at
 		n.mu.Unlock()
+	}
+}
+
+// waitForLeaderAmong polls until some node in ids leads in a term of at least minTerm.
+func (c *cluster) waitForLeaderAmong(ids []int, minTerm int, within time.Duration) int {
+	c.t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		for term, leaders := range c.leadersAmong(ids) {
+			if len(leaders) > 1 {
+				c.t.Fatalf("ELECTION SAFETY VIOLATED: term %d has %d leaders %v (seed %d)",
+					term, len(leaders), leaders, c.seed)
+			}
+			if term >= minTerm {
+				return leaders[0]
+			}
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+	return None
+}
+
+// assertNoLeaderAmong watches a group for the whole window and fails if any member ever leads in a term above aboveTerm.
+func (c *cluster) assertNoLeaderAmong(ids []int, aboveTerm int, during time.Duration) {
+	c.t.Helper()
+
+	deadline := time.Now().Add(during)
+	for time.Now().Before(deadline) {
+		for term, leaders := range c.leadersAmong(ids) {
+			if term > aboveTerm {
+				c.t.Fatalf("MINORITY ELECTED A LEADER: nodes %v lead term %d, above the "+
+					"pre-partition term %d, from a group of %d in a cluster of %d (seed %d): %s",
+					leaders, term, aboveTerm, len(ids), len(c.nodes), c.seed, c.describe())
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
