@@ -31,12 +31,6 @@ func (s State) String() string {
 
 const None = -1 //no vote yet
 
-// Log entry is one command in the replicated log
-type LogEntry struct {
-	Term    int    //creation term
-	Command []byte //Client Command
-}
-
 // Node is a single RAFT server
 type Node struct {
 	mu sync.Mutex //guards every field below
@@ -53,7 +47,9 @@ type Node struct {
 	lastApplied int   //last executed
 	state       State //current role
 
-	leaderID int
+	leaderID   int
+	nextIndex  map[int]int // guess: where to send next. Optimistic.
+	matchIndex map[int]int // proven: replicated up to here. Pessimistic.
 
 	electionDeadline time.Time     //election starting timer
 	rng              *rand.Rand    //randomised election timeout

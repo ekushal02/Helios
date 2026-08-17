@@ -140,9 +140,8 @@ func (n *Node) becomeLeader() {
 
 	n.leaderID = n.id
 
-	// Heartbeats must start NOW. A leader that stays silent for even one
-	// election timeout is deposed by its own followers. The loop is passed the
-	// term it belongs to so it exits cleanly if this node is ever replaced.
+	n.initLeaderState()
+
 	go n.heartbeatLoop(n.currentTerm)
 
 	// TODO (C-2): initialise nextIndex[] and matchIndex[] for every peer.

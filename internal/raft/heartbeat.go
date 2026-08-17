@@ -2,9 +2,24 @@ package raft
 
 import "time"
 
-// heartbeatLoop keeps this node's leadership alive for as long as it holds it.
+// heartbeatLoop keeps this node's leadership alive for as long as it holds it,
+// and doubles as the retry engine for replication.
+//
+// term is the term this leadership belongs to. The loop exits the moment the
+// node is no longer leader OF THAT TERM. Passing it in rather than reading
+// n.currentTerm matters: a node can step down, win a later election, and start a
+// second loop. Without the term check the old loop would keep running alongside
+// the new one, both sending.
+//
+// C-3 turns this from a heartbeat loop into a general replication tick. It no
+// longer sends empty messages -- it sends whatever each follower is missing,
+// which is empty only when that follower is caught up. This is also what makes
+// dropped AppendEntries self-healing: there is no retry queue, because the next
+// tick recomputes and resends from nextIndex regardless of what was lost.
 func (n *Node) heartbeatLoop(term int) {
-	n.sendHeartbeats(term)
+	// Send one IMMEDIATELY. Waiting a full interval hands every follower a 50ms
+	// head start on timing out, right when leadership is least established.
+	n.replicateAll(term)
 
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
@@ -21,52 +36,7 @@ func (n *Node) heartbeatLoop(term int) {
 			if !stillLeading {
 				return
 			}
-			n.sendHeartbeats(term)
+			n.replicateAll(term)
 		}
-	}
-}
-
-// sendHeartbeats fans an empty AppendEntries out to every peer.
-func (n *Node) sendHeartbeats(term int) {
-	n.mu.Lock()
-
-	// Leadership may have ended between the ticker firing and this lock.
-	if n.state != Leader || n.currentTerm != term {
-		n.mu.Unlock()
-		return
-	}
-
-	// TODO (C-3): PrevLogIndex/PrevLogTerm must become per-follower, derived
-	// from nextIndex[peer], and Entries must carry whatever that follower is
-	// missing. Then each peer needs its OWN args struct -- sharing one is only
-	// safe while every peer gets identical content.
-	args := &AppendEntriesArgs{
-		Term:         term,
-		LeaderID:     n.id,
-		PrevLogIndex: n.lastLogIndex(),
-		PrevLogTerm:  n.lastLogTerm(),
-		Entries:      nil, // empty: this is a heartbeat
-		LeaderCommit: n.commitIndex,
-	}
-	peers := append([]int(nil), n.peers...)
-
-	n.mu.Unlock() // never send RPCs holding the lock
-
-	for _, peer := range peers {
-		go func(to int) {
-			var reply AppendEntriesReply
-			if !n.transport.SendAppendEntries(to, args, &reply) {
-				return // dropped, partitioned or dead: nothing to do
-			}
-
-			n.mu.Lock()
-			defer n.mu.Unlock()
-
-			if n.state != Leader || n.currentTerm != term {
-				return
-			}
-
-			n.stepDownIfStale(reply.Term)
-		}(peer)
 	}
 }

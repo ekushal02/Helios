@@ -14,6 +14,15 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
+// LogEntry is one command in the replicated log.
+type LogEntry struct {
+	// Term is the term in which the LEADER created this entry, not the term in which a follower received it.
+	Term int
+
+	// Command is the opaque client payload handed to the state machine on apply.
+	Command []byte
+}
+
 // It is the response to a RequestVote RPC
 type RequestVoteReply struct {
 	Term        int
