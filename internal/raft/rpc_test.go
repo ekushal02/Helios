@@ -79,20 +79,14 @@ func TestAppendEntriesArgsMatchesFigure2(t *testing.T) {
 }
 
 func TestAppendEntriesReplyMatchesFigure2(t *testing.T) {
+	// Figure 2 fields FIRST and unchanged, then the documented §5.3 extension.
+	// Ordering matters for readability, not for gob, which is name-keyed.
 	assertFields(t, AppendEntriesReply{}, []fieldSpec{
 		{"Term", "int"},
 		{"Success", "bool"},
+		{"ConflictIndex", "int"},
+		{"ConflictTerm", "int"},
 	})
-
-	// Fast backup (§5.3) is deliberately not implemented. When the task that
-	// adds it lands, delete this check and update DESIGN.md in the same commit.
-	rt := reflect.TypeOf(AppendEntriesReply{})
-	for _, name := range []string{"ConflictIndex", "ConflictTerm", "XLen"} {
-		if _, ok := rt.FieldByName(name); ok {
-			t.Errorf("AppendEntriesReply has %s: fast backup is not Figure 2, "+
-				"record the deviation in DESIGN.md before adding it", name)
-		}
-	}
 }
 
 func TestRequestVoteMatchesFigure2(t *testing.T) {

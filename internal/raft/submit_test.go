@@ -431,9 +431,7 @@ func TestReplicationStopsAfterStepDown(t *testing.T) {
 	}
 }
 
-// No commit logic in this task. commitIndex must not move no matter how many
-// followers report success.
-func TestSubmitDoesNotCommit(t *testing.T) {
+func TestSubmitReplicatesAndCommits(t *testing.T) {
 	n := leaderWithTransport(t, newRecordingTransport(5), 5)
 
 	for i := 0; i < 3; i++ {
@@ -444,15 +442,22 @@ func TestSubmitDoesNotCommit(t *testing.T) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if n.commitIndex != 0 {
-		t.Errorf("commitIndex = %d, want 0: commitment is C-10", n.commitIndex)
+	for _, p := range n.peers {
+		if got := n.matchIndexFor(p); got != 3 {
+			t.Errorf("matchIndex[%d] = %d, want 3: every entry was acknowledged",
+				p, got)
+		}
+		if got := n.nextIndexFor(p); got != 4 {
+			t.Errorf("nextIndex[%d] = %d, want 4 (one past matchIndex)", p, got)
+		}
+	}
+
+	if n.commitIndex != 3 {
+		t.Errorf("commitIndex = %d, want 3: three current-term entries on a "+
+			"majority of three nodes", n.commitIndex)
 	}
 	if n.lastApplied != 0 {
-		t.Errorf("lastApplied = %d, want 0", n.lastApplied)
-	}
-	for _, p := range n.peers {
-		if got := n.matchIndexFor(p); got != 0 {
-			t.Errorf("matchIndex[%d] = %d, want 0: advancing it is C-6", p, got)
-		}
+		t.Errorf("lastApplied = %d, want 0: applying committed entries to the "+
+			"state machine is C-12", n.lastApplied)
 	}
 }

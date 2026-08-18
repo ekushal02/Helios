@@ -2,9 +2,9 @@ package raft
 
 // AppendEntries is the receiving side of the AppendEntries RPC (Figure 2, §5.3).
 //
-// Order of operations here is load-bearing and is not the order Figure 2 lists
-// the rules in. Legitimacy is settled first (is the sender the leader of a term
-// I accept?), and only then does the log get examined. A message can come from a
+// Order of operations is load-bearing and is not the order Figure 2 lists the
+// rules in. Legitimacy is settled first (is the sender the leader of a term I
+// accept?), and only then does the log get examined. A message can come from a
 // perfectly valid leader and still be unusable by this follower, and those two
 // judgements must not contaminate each other.
 func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -19,14 +19,12 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	// --- Receiver rule 1: reply false if term < currentTerm (§5.1) ---
 	//
-	// No timer reset here: this node owes a deposed leader nothing. This is the
-	// ONLY rejection path that withholds the reset.
+	// No timer reset, and NO CONFLICT HINT: this rejection is about the sender's
+	// term, not about any log. A leader that read a hint here would back off for
+	// the wrong reason, and it is about to step down anyway.
 	if args.Term < n.currentTerm {
 		return
 	}
-
-	// From here args.Term == n.currentTerm, so the sender is the legitimate
-	// leader of this node's current term.
 
 	if n.state == Candidate {
 		n.becomeFollower(args.Term)
@@ -36,11 +34,13 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	// Reset BEFORE the log check: a follower that fails the check is behind or
 	// diverged, which is normal and is exactly when the leader is repairing it.
-	// See DESIGN.md.
 	n.resetElectionTimer()
 
 	// --- Receiver rule 2: the consistency check (§5.3) ---
 	if !n.logMatchesAt(args.PrevLogIndex, args.PrevLogTerm) {
+		// Fast backup (§5.3, not Figure 2). Tell the leader WHY, so it can back
+		// off by a whole term instead of one index per round trip.
+		reply.ConflictIndex, reply.ConflictTerm = n.conflictHint(args.PrevLogIndex)
 		return
 	}
 
@@ -50,13 +50,13 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	// TODO (C-11): rule 5, if LeaderCommit > commitIndex set commitIndex to
 	// min(LeaderCommit, index of last new entry). The second half of that min
 	// matters and is easy to drop: this node may hold entries beyond what the
-	// message covered, and it must not treat them as committed on the strength
-	// of a LeaderCommit that was never about them.
+	// message covered, and must not treat them as committed on the strength of
+	// a LeaderCommit that was never about them.
 
 	reply.Success = true
 }
 
-// mergeEntries applies Figure 2's receiver rules 3 and 4 to entries that begin
+// mergeEntries applies Figure 2's receiver rules 3 and 4 to entries beginning
 // at prevLogIndex+1.
 //
 // THE THING THIS FUNCTION EXISTS TO AVOID.
@@ -76,8 +76,8 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 // So rule 3 is read literally. Truncation happens at the first index where the
 // TERMS ACTUALLY DIFFER, not at prevLogIndex. Same index plus same term means
 // the same entry (Log Matching, §5.3), so a message that is entirely a duplicate
-// changes nothing -- which is the idempotence that lets Raft retry without
-// sequence numbers.
+// changes nothing -- the idempotence that lets Raft retry without sequence
+// numbers.
 //
 // Caller must hold mu.
 func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
@@ -88,21 +88,16 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 		// from this point on is new. Rule 4.
 		if idx > n.lastLogIndex() {
 			// Copies the entry structs out of the message rather than retaining
-			// the message's slice, so the log does not alias memory owned by
-			// the transport. Command bytes are still shared, which is safe
-			// under the immutability invariant in DESIGN.md.
+			// the message's slice, so the log does not alias transport memory.
 			n.log = append(n.log, entries[i:]...)
 			return
 		}
 
-		// Same index, same term: by Log Matching this is the same entry. Not a
-		// conflict, and not something to re-append.
+		// Same index, same term: by Log Matching this is the same entry.
 		if n.log[idx].Term == e.Term {
 			continue
 		}
 
-		// A genuine conflict. Rule 3: delete this entry and every one after it.
-		//
 		// Believed impossible: a committed entry can never conflict, because it
 		// was replicated to a majority and any leader elected afterwards must
 		// have held it (§5.4.1). If this fires, the bug is upstream in the
@@ -113,30 +108,20 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 				"haveTerm", n.log[idx].Term, "wantTerm", e.Term)
 		}
 
-		// Truncate and append in one step. n.log[:idx] drops the conflicting
-		// entry and its successors; the append then writes the leader's version
-		// over the same backing array.
+		// Rule 3: delete the conflicting entry and every one after it, then
+		// append the leader's version over the same backing array.
 		n.log = append(n.log[:idx], entries[i:]...)
 		return
 	}
 
-	// Falling out of the loop means every entry in the message was already
-	// present with a matching term. The log is untouched -- INCLUDING any
-	// entries beyond what this message covered, which stay put. They are
-	// uncommitted and will be truncated when the leader eventually sends
-	// something at their indices.
+	// Falling out means every entry in the message was already present with a
+	// matching term. The log is untouched -- INCLUDING entries beyond what this
+	// message covered, which stay put. They are uncommitted and get truncated
+	// when the leader eventually sends something at their indices.
 }
 
 // logMatchesAt reports whether this node holds an entry at index whose term is
 // term. It is the whole of Figure 2's receiver rule 2.
-//
-// Two distinct failures collapse into one false:
-//
-//	index > lastLogIndex   this node is simply BEHIND; it has nothing there.
-//	term mismatch          this node's log DIVERGED.
-//
-// One boolean suffices because the repair is identical either way: the leader
-// backs nextIndex up and retries (C-7).
 //
 // Caller must hold mu.
 func (n *Node) logMatchesAt(index int, term int) bool {

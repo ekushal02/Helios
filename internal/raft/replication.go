@@ -1,16 +1,24 @@
 package raft
 
 // replicateAll fans one AppendEntries out to every follower.
+//
+// term is the leadership term this fan-out belongs to, passed in rather than
+// read from n.currentTerm so a fan-out started before a step-down cannot send
+// messages claiming a term this node no longer holds.
+//
+// This is the single send path. A heartbeat is not a separate kind of message:
+// it is whatever this produces when a follower happens to be caught up.
 func (n *Node) replicateAll(term int) {
 	n.mu.Lock()
 
-	// Leadership may have ended between the caller's decision and this lock.
 	if n.state != Leader || n.currentTerm != term {
 		n.mu.Unlock()
 		return
 	}
 
-	// Build every message under the lock, ONE STRUCT PER PEER.
+	// Build every message under the lock, ONE STRUCT PER PEER. Peers sit at
+	// different points in their logs, so sharing an args pointer would send
+	// them each other's consistency checks.
 	msgs := make(map[int]*AppendEntriesArgs, len(n.peers))
 	for _, p := range n.peers {
 		msgs[p] = n.buildAppendEntries(p, term)
@@ -23,16 +31,16 @@ func (n *Node) replicateAll(term int) {
 	}
 }
 
-// buildAppendEntries constructs the message for one follower from this leader's current belief about where that follower's log has got to.
+// buildAppendEntries constructs the message for one follower from this leader's
+// current belief about where that follower's log has got to.
+//
+// Caller must hold mu.
 func (n *Node) buildAppendEntries(peer int, term int) *AppendEntriesArgs {
 	next := n.nextIndexFor(peer)
 
-	// Defensive clamp. nextIndex should always be in [1, lastLogIndex+1]:
-	// initLeaderState sets it to lastLogIndex+1, and C-7's backoff must stop at
-	// 1. Clamping rather than panicking because a leader that crashes on a
-	// bookkeeping slip takes the cluster's availability with it -- but the
-	// clamp is a bug indicator, not a design feature. If a test ever trips it,
-	// the fix is in whoever wrote nextIndex, not here.
+	// Defensive clamp. nextIndex should always be in [1, lastLogIndex+1]. This
+	// is a bug indicator, not a design feature: if it ever fires, the fault is
+	// in whoever wrote nextIndex.
 	if next < 1 {
 		next = 1
 	}
@@ -40,12 +48,12 @@ func (n *Node) buildAppendEntries(peer int, term int) *AppendEntriesArgs {
 		next = n.lastLogIndex() + 1
 	}
 
-	// The entry immediately BEFORE what is being sent. The follower must already
-	// hold a matching entry here, or it rejects everything in this message
-	// (C-4). At next == 1 this is the sentinel at index 0, term 0, which every
-	// node has -- so the check trivially passes and repair can always bottom out.
 	prevIndex := next - 1
 
+	// Copy the entries out of n.log. A subslice would hand the network
+	// goroutine a window into the live log, which a later append can reallocate
+	// and a truncation can rewrite. Shallow on purpose: Command bytes are
+	// immutable once appended, so sharing them is safe. See DESIGN.md.
 	entries := append([]LogEntry(nil), n.log[next:]...)
 
 	return &AppendEntriesArgs{
@@ -55,22 +63,20 @@ func (n *Node) buildAppendEntries(peer int, term int) *AppendEntriesArgs {
 		PrevLogTerm:  n.log[prevIndex].Term,
 		Entries:      entries,
 
-		// Sent, but nothing acts on it yet: the follower ignores it until C-11
-		// and the leader never advances commitIndex until C-10. Carrying the
-		// real value now means the field is exercised end to end before anything
-		// depends on it.
+		// Followers learn what is committed from here; they never derive it.
+		// Because this is read at build time, a commit decided just after this
+		// message goes out reaches followers on the next tick -- which is why
+		// heartbeats matter even when there is nothing to replicate.
 		LeaderCommit: n.commitIndex,
 	}
 }
 
-// sendAppendEntries delivers one message and handles the reply.
-//
-// The only reply handling in this task is the term check. Success and failure
-// are otherwise ignored: advancing nextIndex/matchIndex on success is C-6, and
-// backing off on rejection is C-7. Until then every fan-out resends the same
-// entries, which is wasteful and harmless -- AppendEntries is idempotent, so
-// delivering a message twice lands the follower in the same state as once.
+// sendAppendEntries delivers one message and applies its reply to this leader's
+// per-follower bookkeeping.
 func (n *Node) sendAppendEntries(peer int, term int, args *AppendEntriesArgs) {
+	// A FRESH reply per call, never reused. gob omits zero values, so decoding
+	// into a dirty struct leaves the previous call's values in place and they
+	// read as though they came off the wire.
 	var reply AppendEntriesReply
 
 	if !n.transport.SendAppendEntries(peer, args, &reply) {
@@ -80,19 +86,65 @@ func (n *Node) sendAppendEntries(peer int, term int, args *AppendEntriesArgs) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// A follower reporting a newer term means this node has been replaced. The
+	// only channel through which a leader isolated in a minority finds out.
+	n.stepDownIfStale(reply.Term)
+
+	// The world may have moved on while this was in flight. Checked AFTER the
+	// step-down so a stale-term reply still deposes this node, but before any
+	// bookkeeping, so a deposed leader does not write leader state.
 	if n.state != Leader || n.currentTerm != term {
 		return
 	}
 
-	// A follower reporting a newer term means this node has been replaced.
-	n.stepDownIfStale(reply.Term)
+	if reply.Success {
+		n.advanceFollower(peer, args)
+		return
+	}
 
-	// TODO (C-6): if reply.Success, advance matchIndex[peer] to
-	// args.PrevLogIndex + len(args.Entries) and nextIndex[peer] to one past it.
-	// Derived from what was SENT -- the log may have grown since this left.
+	// A rejection that is not about the term is a log disagreement.
+	n.backOffFollower(peer, args, &reply)
+}
+
+// advanceFollower records what a successful reply proved. Caller must hold mu.
+func (n *Node) advanceFollower(peer int, args *AppendEntriesArgs) {
+	// Derived from WHAT WAS SENT, never from lastLogIndex() at reply time. The
+	// log may have grown since this message left, and crediting the follower
+	// with entries it never received is how a leader counts a majority for an
+	// entry that exists on one machine.
+	match := args.PrevLogIndex + len(args.Entries)
+
+	// Monotonic, per Figure 2. Replies arrive out of order over a real network,
+	// so a late reply to an older, shorter message must not drag matchIndex
+	// backwards -- that would un-prove agreement the leader has already counted
+	// toward a commit.
+	if match > n.matchIndex[peer] {
+		n.matchIndex[peer] = match
+	}
+	n.nextIndex[peer] = n.matchIndex[peer] + 1
+
+	// The replication evidence changed, so the commit decision may have too.
+	// This is the only thing that ever moves a leader's commitIndex.
+	n.advanceCommitIndex()
+}
+
+// backOffFollower moves nextIndex back after a log rejection.
+//
+// Caller must hold mu.
+func (n *Node) backOffFollower(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	current := n.nextIndexFor(peer)
+
+	// ONLY ACT ON A REPLY THAT ANSWERS THE CURRENT ATTEMPT.
 	//
-	// TODO (C-7): if !reply.Success and the term was not the reason, walk
-	// nextIndex[peer] back and retry.
-	//
-	// TODO (C-10): recount the majority and advance commitIndex.
+	// Replies arrive out of order. A rejection from an older, higher-indexed
+	// message can land after backoff has already made progress, and applying it
+	// would push nextIndex back to where it started -- a live-lock where repair
+	// keeps undoing itself and never converges. Tying the reply to the attempt
+	// that produced it is what makes backoff monotonic.
+	if args.PrevLogIndex+1 != current {
+		return
+	}
+
+	n.nextIndex[peer] = nextIndexAfterConflict(
+		n.log, current, reply.ConflictIndex, reply.ConflictTerm)
 }

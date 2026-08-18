@@ -1,8 +1,9 @@
-# Helios — Design Document (v1)
+# Helios — Design Document
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.1 — written before any Raft code exists. Covers the consensus layer only.
+**Status:** v1.2 — leader election and log replication implemented. Entries commit on
+the leader; nothing is applied to a state machine yet.
 
 ---
 
@@ -31,13 +32,15 @@ Each node runs three layers:
         |
    apply channel
         |
-   [ state machine ]  
+   [ state machine ]
 ```
 
 Writes go to the leader, are replicated to a majority, and only then are applied to
 the state machine. The state machine never sees an uncommitted entry.
 
-The Raft module reaches its peers through a Transport interface rather than a concrete network client. Tests supply an in-memory switchboard whose connectivity can be cut arbitrarily; production will supply gRPC.
+The Raft module reaches its peers through a Transport interface rather than a concrete
+network client. Tests supply an in-memory switchboard whose connectivity can be cut
+arbitrarily; production will supply gRPC.
 
 ---
 
@@ -74,7 +77,7 @@ The only node that accepts client writes.
 ### The rule that governs all three
 
 > If any node, in any state, sees a term greater than its own, it immediately adopts that term and reverts to follower.
-> If a leader from an older term becomes active again after being disconnected, it may still believe that it is the leader. However, another leader may already have been elected in a newer term. Therefore, when the old leader learns about the newer term, it must update its term and become a follower. This prevents an outdated leader from continuing to coordinate the cluster with stale information 
+> If a leader from an older term becomes active again after being disconnected, it may still believe that it is the leader. However, another leader may already have been elected in a newer term. Therefore, when the old leader learns about the newer term, it must update its term and become a follower. This prevents an outdated leader from continuing to coordinate the cluster with stale information
 
 ---
 
@@ -144,6 +147,7 @@ Sent by the leader. Does **two** jobs: log replication, and — with an empty
 |---|---|
 | `term` | Receiver's current term |
 | `success` | True if the follower contained an entry matching `prevLogIndex`/`prevLogTerm` |
+| `conflictIndex`, `conflictTerm` | Fast-backup hint. **Not Figure 2** — see §8. Set only on a log rejection. |
 
 **Receiver rules**
 1. Reply false if `term < currentTerm`.
@@ -153,6 +157,9 @@ Sent by the leader. Does **two** jobs: log replication, and — with an empty
 5. If `leaderCommit > commitIndex`, set `commitIndex = min(leaderCommit, index of last new entry)`.
 
 >The consistency check ensures that the follower and leader agree on the log before the new entries are appended. If an existing follower entry conflicts with the leader's entry at the same index, the follower deletes that entry and all entries after it, then accepts the leader's entries. This is safe because conflicting entries are not committed entries. A follower may have persisted an entry that was received from an earlier leader but never reached a majority. Committed entries cannot be overwritten, so removing an uncommitted suffix does not lose a committed write.
+
+**Implementation status.** Rules 1–4 are implemented. Rule 5 is not: followers ignore
+`leaderCommit` for now, so only the leader's `commitIndex` ever moves.
 
 ---
 
@@ -172,6 +179,9 @@ does not know who won.
 
 >A server may vote for only one candidate in a given term. For example, if C votes for A in term 5 and then crashes, C must persist votedFor = A. If C forgets this information after restarting, it could vote for B in the same term. With enough other votes, both A and B could obtain a majority and be elected leaders in term 5, violating Raft's Election Safety property. Therefore votedFor must be persisted before responding to the vote request.
 
+**Not yet persisted.** All three currently live in memory only. Durability is Phase E;
+until then a "restart" in tests means a fresh node, not a recovered one.
+
 ---
 
 ## 6. Volatile state
@@ -189,7 +199,7 @@ conservatively reinitialised.
 | `electionDeadline` | When to start an election | Fresh deadline on start |
 
 ### Configuration and machinery
- 
+
 | Field | Meaning |
 |---|---|
 | `id`, `peers` | Cluster membership. `peers` excludes self, so cluster size is `len(peers)+1`. |
@@ -205,132 +215,294 @@ conservatively reinitialised.
 | `matchIndex[peer]` | Highest index known replicated on that peer. Initialised to 0. |
 
 The optimistic/pessimistic split is deliberate: `nextIndex` guesses high and backs
-off on rejection, while `matchIndex` claims nothing it has not proven.
+off on rejection, while `matchIndex` claims nothing it has not proven. Initialising
+`matchIndex` to the leader's last index for symmetry would let a fresh leader count a
+majority immediately and commit entries held on one machine.
+
+Both maps are keyed by peer id and **contain no entry for the leader itself**. There
+is no meaningful "next entry to send to myself", and a self entry in `matchIndex`
+would need updating on every local append — a step whose omission shows up only as an
+off-by-one in the commit count. The majority count starts its tally at 1 instead.
+
+Fresh maps are allocated on each election rather than the old ones cleared, so a
+reply handler still in flight from a previous term cannot write into current state.
+They are **not** cleared on step-down: clearing swaps one wrong answer (a stale index)
+for another (zero, which reads as valid). The real guard is the
+`state == Leader && currentTerm == term` check on every path that reads them.
 
 ---
 
 ## 7. Commit rules
 
-- An entry is committed once it is stored on a majority **and** is from the leader's
-  current term.
-- Once committed, all prior entries are committed too.
+An entry is committed once it is stored on a majority **and** is from the leader's
+current term. Once an entry commits, every entry before it commits with it.
 
-<!-- TODO (yours): the current-term restriction is the subtlest rule in the paper
-     (Figure 8). Come back and write this up when you reach task C-9. Leaving it
-     unanswered for now is fine; pretending it is obvious is not. -->
+### Why the current-term restriction (§5.4.2, Figure 8)
+
+A majority holding entry E stops a candidate that **lacks** E from winning: the two
+majorities intersect, and the up-to-date check makes the shared voter refuse. It says
+nothing about a candidate whose log is differently shaped but more up to date **by
+term**.
+
+Figure 8 is the counterexample. S1 leads term 2, gets index 2 onto itself and S2, and
+crashes. S5 wins term 3 from S3 and S4 — legitimately, since neither saw index 2 —
+writes its own index 2 in term 3, and crashes. S1 restarts, wins term 4, and finishes
+replicating its **inherited** term-2 entry to S3. Index 2 is now on a majority. If
+that counted as a commit, S5 could still win term 5 from S2, S3 and S4, because its
+last-log term of 3 beats their 2 — and then overwrite the committed entry.
+
+Waiting for a current-term entry closes it. Every node in that majority then has a
+last-log term of at least `currentTerm`, so no candidate with an older tail can
+out-rank them. The rule is not merely cautious: it manufactures the condition that
+puts the entry beyond reach of any future leader.
+
+Older entries commit **indirectly**, carried by Log Matching when something above them
+commits directly.
+
+### Consequence: inherited entries stall
+
+A new leader holding uncommitted entries from previous terms cannot commit them until
+it appends one of its own. On an idle cluster they sit indefinitely, and any client
+waiting on them waits with them.
+
+The standard remedy is a blank no-op entry appended on election (§8 of the paper).
+Not implemented: it changes the indices clients observe and interacts with read-only
+query handling, so it belongs to the task that needs it. Recorded here so the absence
+is a decision, not an oversight.
 
 ---
 
 ## 8. Implementation decisions
- 
+
 Each decision paired with the alternative rejected and why.
- 
-### Log indexing: a sentinel entry at `log[0]`
- 
-Raft indexes from 1; Go slices index from 0. A dummy entry at position 0 (term 0,
-no command) makes slice position equal Raft index everywhere.
- 
-*Rejected:* storing an offset and translating at every access. It works, but the
-translation leaks into every RPC handler and every comparison, and each site is an
-off-by-one waiting to happen. The sentinel also makes `prevLogIndex = 0` work
-naturally for the very first AppendEntries instead of being a special case.
- 
-*Cost:* Phase D snapshotting truncates the log and breaks the position-equals-index
-invariant. This will need revisiting then.
- 
-### `LogEntry` has no `Index` field
- 
-Position in the slice is the index. Storing it too creates two sources of truth
-that can disagree.
- 
-*Revisit at:* Phase D, for the same truncation reason.
- 
-### `votedFor` sentinel is `-1`, not a pointer
- 
-*Rejected:* `*int` with `nil` meaning "no vote". Nil dereference risk for no
-benefit; `-1` compares cheaply and serialises trivially.
- 
-### Election timer is a deadline, polled by a ticker
- 
-An absolute `time.Time`, checked every 10ms by one goroutine.
- 
-*Rejected:* `time.Timer` with `Reset`. Resetting a timer that may have already
-fired but not been drained is a documented Go footgun, and this timer is reset from
-several goroutines constantly. Polling makes a reset a plain field assignment: no
-draining, no stale firings arriving after a reset.
- 
-*Cost:* up to one tick (10ms) of imprecision. Irrelevant against a 150–300ms
-timeout.
- 
-### Election timeouts drawn from a per-node seeded RNG
- 
-Never the global `rand`. The seed is `clusterSeed + nodeID`, so nodes within one
-cluster differ while the whole run replays from a single number.
- 
-*Why:* task G-2 requires that any failure reproduce exactly from a seed. Retrofitting
-determinism is far harder than starting with it.
- 
-*Caveat:* this gives seeded **fault injection**, not deterministic simulation.
-Goroutine scheduling still varies between runs. True replay needs a virtual clock
-and a single-threaded event loop — a real rework, deferred to Phase G.
- 
-### Peers reached through a `Transport` interface
- 
-*Rejected:* a gRPC client inside `Node`. The interface lets tests substitute an
-in-memory switchboard with controllable connectivity, which is what makes partition
-and message-loss testing possible at all.
- 
-### Vote requests fan out in parallel
- 
-One goroutine per peer, replies collected on a buffered channel.
- 
-*Rejected:* a sequential loop. A single unreachable peer would consume the entire
-150–300ms election window, so no election could ever complete while any node was
-down — which defeats the purpose of the system.
- 
-Every reply is re-checked against the node's current state and term before being
-counted. A reply from an election the node has already left must be discarded;
-counting one is the standard route to two leaders in a single term.
- 
-### `becomeFollower` resets the election timer
- 
-See §9 — this is a known deviation from Figure 2, kept deliberately.
- 
----
- 
-## 9. Open questions
- 
-Deliberately unresolved. Each is answered by a later phase.
- 
-- **Election timer reset on stepping down.** `becomeFollower` resets the timer
-  whenever a node adopts a newer term, including when it then refuses the vote on
-  the up-to-date check. Figure 2 lists only two reset events (a granted vote, and
-  AppendEntries from the current leader), so this is a third.
-  *Alternative rejected:* not resetting. A leader's deadline is never refreshed
-  while it leads (the ticker skips leaders), so a leader stepping down would hold a
-  deadline far in the past and would immediately campaign against whoever just
-  deposed it — disrupting every failover. Resetting trades a certain disruption for
-  a rarer one.
-  *The rarer one is real:* a node partitioned alone inflates its term by
-  campaigning, and on rejoining forces the whole cluster to step down and reset,
-  despite having a log too stale to win. **Prevote (Phase D-12)** is the proper fix.
-  Current behaviour is asserted explicitly by
-  `TestHigherTermResetsTimerEvenWhenRefused`, which should be inverted when Prevote
-  lands.
-- **Linearizable reads.** Reading local state on the leader is unsafe. Plan: commit a
-  no-op entry per read (Phase C), then evaluate lease-based reads.
-- **fsync policy.** Per-write fsync is correct but slow. Measure the tradeoff (Phase D).
-- **Batching.** Multiple client writes per AppendEntries. Deferred until there are
-  baseline numbers to compare against.
-- **Snapshots.** Log truncation and `InstallSnapshot` (Phase D). Will break the
-  sentinel/position-equals-index convention from §8.
-- **Membership changes.** Single-server add/remove (Phase D).
+
+### Log and entries
+
+**Sentinel entry at `log[0]`.** Raft indexes from 1; Go slices index from 0. A dummy
+entry (term 0, no command) makes slice position equal Raft index everywhere.
+*Rejected:* an offset translated at every access — the translation leaks into every
+handler and each site is an off-by-one waiting to happen. The sentinel also makes
+`prevLogIndex = 0` work naturally for the first AppendEntries, and it is what
+**guarantees log repair terminates**: a leader that has backed all the way off always
+finds agreement at index 0.
+*Cost:* Phase D truncation breaks position-equals-index. Revisit then.
+
+**`LogEntry` has no `Index` field.** Position in the slice is the index; storing it too
+creates two sources of truth that can disagree — and they would, the first time a
+follower truncates. *Revisit at:* Phase D.
+
+**`LogEntry.Command` is immutable once appended.** `Submit` copies the caller's bytes
+in so the log owns them, and nothing writes to them afterwards. This is what lets
+outgoing messages copy entries **shallowly** — the message gets its own view of *which*
+entries are being sent, but shares the command bytes.
+*Rejected:* deep-copying every command on every send, which costs an allocation and
+memcpy of the whole outstanding log per peer per tick.
+*Obligation:* consumers must treat `Command` as read-only. The pressure point is the
+state machine in Phase F — a handler that decodes into the slice it was handed would
+rewrite committed history.
+
+**`votedFor` sentinel is `-1`, not a pointer.** *Rejected:* `*int` with `nil` meaning
+"no vote". Nil dereference risk for no benefit.
+
+### Timing and concurrency
+
+**Election timer is a deadline, polled by a ticker.** An absolute `time.Time`, checked
+every 10ms by one goroutine.
+*Rejected:* `time.Timer` with `Reset` — resetting a timer that may have fired but not
+been drained is a documented Go footgun, and this timer is reset from several
+goroutines constantly. Polling makes a reset a plain field assignment.
+*Cost:* up to 10ms imprecision, irrelevant against a 150–300ms timeout.
+
+**Election timeouts from a per-node seeded RNG.** Never the global `rand`. Seed is
+`clusterSeed + nodeID` so nodes differ while a whole run replays from one number.
+*Caveat:* this is seeded **fault injection**, not deterministic simulation — goroutine
+scheduling still varies. True replay needs a virtual clock (Phase G).
+
+**Vote requests fan out in parallel.** One goroutine per peer, replies on a buffered
+channel. *Rejected:* a sequential loop — one unreachable peer would consume the entire
+election window. Every reply is re-checked against current state and term before being
+counted; counting a reply from an election the node has left is the standard route to
+two leaders in one term.
+
+**Peers reached through a `Transport` interface.** *Rejected:* a gRPC client inside
+`Node`. The interface is what makes partition and message-loss testing possible at all.
+
+### Replication
+
+**One send path for heartbeats and replication.** There is no separate heartbeat
+message; `replicateAll` sends each follower whatever it is missing, which is nothing
+when that follower is caught up. Consequence: the consistency check runs during idle
+periods, so a divergent follower is detected without waiting for a client write.
+
+**One args struct per peer, all built under one lock.** Peers sit at different points
+in their logs, so a shared pointer would send them each other's consistency checks.
+Building the whole fan-out at one instant also means the leader's picture of the
+cluster is self-consistent.
+*Rejected:* lock-per-peer inside the loop — peers would see the log at different
+moments, and once replies mutate `nextIndex` concurrently the leader's view becomes
+incoherent with itself.
+
+**Entries are copied out of the log before sending.** A subslice would hand the network
+goroutine a window into the live log, which a later append can reallocate and a
+truncation can rewrite.
+
+**`Submit` returns before replication, and its index is a prediction.** It appends
+locally and returns `(index, term, isLeader)` immediately. If this leader is deposed
+before the entry commits, a later leader may overwrite that position.
+*Obligation on callers:* observe that index applied **with the returned term**. A
+different term at that index means the submission was overwritten and must be reported
+as failed, not retried — a blind retry risks double-applying if the original committed
+after all.
+*Known limit:* one goroutine per `Submit` means bursts produce redundant fan-outs. The
+fix is per-follower replication goroutines woken by a condition variable; deferred
+until there is a measurement.
+
+**A rejected AppendEntries still resets the election timer.** The reset happens
+**before** the log check. Rejection means the follower is behind or diverged — normal
+after a partition heals, and exactly when the leader is repairing it. Resetting only
+on acceptance would have a lagging follower time out mid-repair and campaign,
+disrupting a healthy cluster at the worst moment. Legitimacy is decided by term
+(receiver rule 1, the only rejection that withholds the reset); the log check decides
+only whether *this message* applies.
+
+**Truncation happens at the first conflicting term, not at `prevLogIndex`.** Rule 3 is
+implemented literally: scan the incoming entries against the log and truncate where
+the terms actually differ.
+*Why it matters:* RPCs arrive out of order. A leader sends 1..5 then 1..8; the 1..8
+message lands first; the delayed 1..5 then arrives with `prevLogIndex = 0`, which
+passes the consistency check because the sentinel always matches. Blind truncation
+would destroy entries 6–8, which the leader may already have committed.
+
+**A repaired follower may be longer than the leader.** Entries at indices no message
+has addressed stay put — they are uncommitted, and Log Matching constrains only
+claimed indices. They are truncated when the leader sends something at those positions.
+*Consequence for tests:* asserting "follower log == leader log" straight after repair
+is wrong.
+
+### Leader bookkeeping
+
+**`matchIndex` is derived from what was sent.** `prevLogIndex + len(entries)`, never
+`lastLogIndex()` at reply time. The log may have grown since the message left, and
+crediting a follower with entries it never received is how a leader counts a majority
+for an entry that exists on one machine.
+
+**Reply handling is tied to the attempt that produced it.** `matchIndex` advances with
+`max()`, so a late reply to an older, shorter message cannot un-prove agreement already
+counted toward a commit. Backoff ignores any reply whose `prevLogIndex + 1` differs
+from the current `nextIndex` — applying a superseded rejection would push `nextIndex`
+back to where it started, a live-lock where repair keeps undoing itself.
+
+**Fast-backup hint on the reply (deviation from Figure 2).** Figure 2's reply has two
+fields; Helios adds `conflictIndex` and `conflictTerm` (§5.3 of the paper).
+
+| Rejection | Follower reports | Leader does |
+|---|---|---|
+| Log too short | term 0, index = its `lastLogIndex + 1` | resume there |
+| Term mismatch | the term it holds, and where that term's run begins | resume past its own last entry of that term, or discard the whole run if it has none |
+
+*Safety rule:* the hint may only move `nextIndex` **backwards**. Moving it forward
+would assume agreement never verified. `nextIndexAfterConflict` clamps to
+`[1, current-1]` regardless of what the reply says, so a malformed hint costs round
+trips rather than correctness.
+
+*Measured:* across the six Figure 7 scenarios, 25 round trips → 12. Cases (a), (c) and
+(d) are unchanged — they diverged by at most one index, so there was nothing to skip.
+The entire benefit is in the badly diverged cases, which is why the paper treats it as
+optional.
+
 ---
 
-## 10. Revision log
- 
+## 9. Testing conventions
+
+**Scope fences.** A test may assert that a feature is *not yet* built, so that the task
+implementing it gets a red build instead of silent scope creep. Fence failure messages
+name the retiring task, making them greppable:
+
+```
+grep -rn "is C-[0-9]" internal/raft/*_test.go
+```
+
+Run it before starting a task. Convert rather than delete when the test still covers
+something. Three have expired so far (C-5, C-6, C-10).
+
+**Property checkers live in `properties_test.go`.** `assertLogMatching` and
+`assertPrefixIntact` are stated over any set of logs, not one scenario, because every
+later phase must re-establish them: Phase D that snapshotting preserves them, Phase E
+that a restart from disk does, Phase H that a membership change does.
+
+**Safety is monitored over runs, not asserted at moments.** `commitLedger` accumulates
+every entry any node has committed and re-checks the set after each step. The property
+is §5.4.3: once an entry is committed at an index, no node may hold a different entry
+at that index **within its own committed prefix**. The qualifier is load-bearing —
+nodes routinely hold divergent uncommitted entries, and Figure 8 turns on one surviving
+on S5 for two terms.
+
+**Safety tests are paired with a mutation that must break them.** A passing safety test
+is worth nothing until it has been seen to fail for the right reason.
+`TestFigure8DetectsAMissing5_4_2Check` replays the Figure 8 narrative with a
+test-local commit rule that omits the term check and requires the monitor to catch it.
+The mutation runs the real rule first and the unsafe one after — since the unsafe rule
+can only advance `commitIndex` further, the result is exactly what a build without
+§5.4.2 would produce, with no production code touched and no test-only knob added.
+**A green result there is a failure to investigate, not a success.**
+
+**Elections in scenario tests are real.** Figure 8 runs through the actual
+`RequestVote` and up-to-date check, because S5's ability to overwrite a
+majority-replicated entry depends on the election restriction *permitting* it.
+Deciding elections by hand would assume away the mechanism under test.
+
+**Timer assertions.** "Was reset" needs a property test — force the deadline to expire,
+then assert remaining time is positive and within bounds. Never compare two randomly
+drawn deadlines. "Was **not** reset" may use equality, since no second draw happened.
+
+**Test files ship.** Go excludes `_test.go` from `go build`, so they add nothing to the
+binary. The cost is CI time, addressed by tiering with `testing.Short()` rather than by
+deletion. For a consensus implementation the tests are the only available evidence of
+correctness.
+
+---
+
+## 10. Open questions
+
+Deliberately unresolved. Each is answered by a later phase.
+
+- **Election timer reset on stepping down.** `becomeFollower` resets the timer whenever
+  a node adopts a newer term, including when it then refuses the vote on the up-to-date
+  check. Figure 2 lists only two reset events, so this is a third.
+  *Alternative rejected:* not resetting — a leader's deadline is never refreshed while
+  it leads, so a leader stepping down would hold a deadline far in the past and
+  immediately campaign against whoever deposed it, disrupting every failover.
+  *The cost is real:* a node partitioned alone inflates its term by campaigning, and on
+  rejoining forces the whole cluster to step down and reset despite a log too stale to
+  win. **Prevote (D-12)** is the proper fix. Pinned by
+  `TestHigherTermResetsTimerEvenWhenRefused`, to be inverted when Prevote lands.
+- **No-op entry on election.** Would release entries inherited from previous terms
+  immediately (§7), and is also the foundation for `ReadIndex`. Deferred because it puts
+  an entry in the log no client submitted, which every index-reporting path must
+  account for. Decide before Phase F rather than during.
+- **Linearizable reads.** Reading local state on the leader is unsafe — a deposed
+  leader does not know it. Plan: `ReadIndex` (no-op at start of term, then confirm
+  leadership by heartbeat before serving), then evaluate lease-based reads.
+- **fsync policy.** Per-write fsync is correct but slow. Measure the tradeoff (Phase E).
+- **Batching.** Multiple client writes per AppendEntries, and coalescing the per-`Submit`
+  fan-out. Deferred until there are baseline numbers.
+- **Snapshots.** Log truncation and `InstallSnapshot` (Phase D). Breaks the
+  sentinel/position-equals-index convention, the `lastIndexOfTerm` scan, and the
+  assumption in `logMatchesAt` that index 0 is always checkable. A `prevLogIndex` below
+  the snapshot floor must be answered with `InstallSnapshot`, not a rejection.
+- **Membership changes.** Single-server add/remove (Phase D/H). Note that
+  `logMatchesAt` is only correct because of one-leader-per-term, which is exactly what
+  joint consensus exists to preserve.
+- **Test suite runtime.** ~2 minutes under `-race` and growing, dominated by tests that
+  sleep in real multiples of `electionTimeoutMax`. Candidate fix: pull the virtual clock
+  (G-2) forward.
+
+---
+
+## 11. Revision log
+
 | Version | Date | Change |
 |---|---|---|
 | v1 | | Initial design: states, RPCs, persistent and volatile state |
 | v1.1 | | Through B-8. Majority-intersection argument for the up-to-date check; §8 implementation decisions; timer-reset deviation recorded as an open question; volatile state expanded to match the implementation |
- 
+| v1.2 | | Through Phase C. §7 commit rules written up with the Figure 8 argument; fast-backup hint recorded as a deviation with measured saving; §8 reorganised into log / timing / replication / bookkeeping; §9 testing conventions added; open questions updated |

@@ -56,4 +56,7 @@ type AppendEntriesReply struct {
 	// PrevLogTerm. Until C-4 the check is not implemented and this is true for
 	// any request at a current term.
 	Success bool
+
+	ConflictIndex int
+	ConflictTerm  int
 }
