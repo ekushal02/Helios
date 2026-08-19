@@ -24,6 +24,15 @@ type sim struct {
 	// unsafeCommit swaps in a commit rule with the §5.4.2 term check removed.
 	// Used only by the mutation test, to prove the safety monitor can fail.
 	unsafeCommit bool
+
+	// commitAfterC is S1's commitIndex at the end of state (c), sampled inside
+	// the narrative because that is the only moment it answers the question.
+	//
+	// Since C-11 a follower adopts the leader's commitIndex, so S1's value at
+	// the END of the run belongs to S5: state (d) repairs S1 and hands it
+	// LeaderCommit 3. Reading it there measures S5's commit decision, not S1's.
+	// Under the real rule this is 0; with §5.4.2 removed it is 2.
+	commitAfterC int
 }
 
 func newFigure8Sim(t *testing.T) *sim {
@@ -253,6 +262,11 @@ func figure8Narrative(t *testing.T, s *sim) string {
 	s.bring(t, 0, 1)
 	s.bring(t, 0, 2)
 
+	// The load-bearing observation of the whole scenario, taken while S1 is
+	// still the leader that made the decision. Recorded rather than asserted:
+	// the mutation test runs this same narrative and needs the opposite answer.
+	s.commitAfterC = commitIndexOf(s.nodes[0])
+
 	if v := check("state (c)"); v != "" {
 		return v
 	}
@@ -288,9 +302,31 @@ func TestFigure8NoCommittedEntryIsEverOverwritten(t *testing.T) {
 	}
 
 	// And the specific fact the whole rule turns on.
-	if got := commitIndexOf(s.nodes[0]); got != 0 {
-		t.Errorf("S1 commitIndex = %d after the run, want 0: it never committed "+
-			"the inherited term-2 entry", got)
+	// The specific fact the whole rule turns on, sampled in state (c) where S1
+	// was the leader deciding. Index 2 sat on three of five nodes; counting
+	// alone says commit, §5.4.2 says no because term 2 is not S1's current term.
+	if s.commitAfterC != 0 {
+		t.Errorf("S1 commitIndex = %d at the end of state (c), want 0: it "+
+			"committed an inherited term-2 entry on a majority count", s.commitAfterC)
+	}
+
+	// And the other half, which only became observable with C-11: what S1 holds
+	// committed at the END of the run is S5's log, adopted as a follower. The
+	// entry at index 2 must be S5's term-3 version -- the one that overwrote the
+	// term-2 entry S1 never committed.
+	s1 := s.nodes[0]
+	s1.mu.Lock()
+	committed, term2 := s1.commitIndex, s1.log[2].Term
+	s1.mu.Unlock()
+
+	if committed != 3 {
+		t.Errorf("S1 commitIndex = %d after the run, want 3: state (d) repaired "+
+			"it and handed it S5's LeaderCommit", committed)
+	}
+	if term2 != 3 {
+		t.Errorf("S1 log[2].Term = %d, want 3: S5 overwrote index 2, and that "+
+			"overwrite is only safe because nobody had committed the term-2 entry",
+			term2)
 	}
 }
 

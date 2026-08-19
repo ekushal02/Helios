@@ -91,11 +91,7 @@ func (n *Node) advanceCommitIndex() {
 			// idx commits the whole prefix -- which is how entries inherited
 			// from earlier terms become committed despite never qualifying on
 			// their own.
-			n.commitIndex = idx
-
-			// TODO (C-12): wake the apply loop. commitIndex moving is what
-			// releases entries to the state machine, and a client waiting on
-			// Submit's returned index is waiting on exactly this.
+			n.commitTo(idx)
 			return
 		}
 	}

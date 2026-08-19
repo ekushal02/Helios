@@ -236,7 +236,7 @@ func TestConsistencyCheckRunsOnEmptyMessages(t *testing.T) {
 	}
 }
 
-func TestStoringEntriesDoesNotCommit(t *testing.T) {
+func TestStoredEntriesAreCommittedWhenLeaderCommitCoversThem(t *testing.T) {
 	f := followerWithLog(t, 5)
 
 	var reply AppendEntriesReply
@@ -249,14 +249,26 @@ func TestStoringEntriesDoesNotCommit(t *testing.T) {
 		LeaderCommit: 2,
 	}, &reply)
 
+	if !reply.Success {
+		t.Fatal("rejected a message whose consistency check lands on the sentinel")
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.commitIndex != 0 {
-		t.Errorf("commitIndex = %d, want 0: LeaderCommit is handled in C-11",
+
+	if f.lastLogIndex() != 2 {
+		t.Errorf("lastLogIndex = %d, want 2: rule 4 stored both entries",
+			f.lastLogIndex())
+	}
+	if f.commitIndex != 2 {
+		t.Errorf("commitIndex = %d, want 2: min(LeaderCommit 2, last new index 2)",
 			f.commitIndex)
 	}
+	// lastApplied stays 0: this test never receives from ApplyCh, and the
+	// applier is parked on a send. Delivery is apply_test.go's subject.
 	if f.lastApplied != 0 {
-		t.Errorf("lastApplied = %d, want 0", f.lastApplied)
+		t.Errorf("lastApplied = %d, want 0: nothing consumed the apply channel",
+			f.lastApplied)
 	}
 }
 

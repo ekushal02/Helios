@@ -11,6 +11,10 @@ import (
 // recordingTransport captures every AppendEntries that goes out, so tests can
 // assert on what was SENT. That is the right level for C-3: followers do not
 // store entries until C-5, so nothing downstream is observable yet.
+//
+// It also replies Success on everything, which is easy to forget and matters:
+// a node built with this transport commits and applies in the background while
+// the test body runs. See TestSentEntriesSurviveLogChanges.
 type recordingTransport struct {
 	mu   sync.Mutex
 	sent []*AppendEntriesArgs
@@ -281,11 +285,32 @@ func TestSentEntriesSurviveLogChanges(t *testing.T) {
 
 	// Grow the log hard enough to force at least one reallocation, then throw
 	// most of it away -- the two things that would corrupt a subslice.
+	//
+	// COMMIT STATE MUST BE ROLLED BACK IN THE SAME CRITICAL SECTION, and this
+	// is not bookkeeping. recordingTransport answers Success to everything, so
+	// by the time this line runs a reply handler has already credited both
+	// followers with indices 1 and 2, counted a majority of three, and called
+	// commitTo(2). The truncation below then leaves commitIndex at 2 over a log
+	// holding only the sentinel.
+	//
+	// Raft cannot reach that state -- a leader never truncates, and receiver
+	// rule 3 only removes an uncommitted tail -- so nothing downstream defends
+	// against it beyond a logged Error. Before that Error existed the applier
+	// woke, walked from lastApplied+1 to commitIndex, and panicked on
+	// n.log[1]; whether it did depended on the race between its wake-up and
+	// this line, which is why the whole suite passed for weeks and then failed
+	// once under -race.
+	//
+	// The test's subject is the in-flight message, not the commit path. Undoing
+	// the commit keeps the node in a state Raft could actually be in, so the
+	// only artificial thing left is the truncation itself.
 	n.mu.Lock()
 	for i := 0; i < 64; i++ {
 		n.log = append(n.log, LogEntry{Term: 5, Command: []byte{byte(i)}})
 	}
 	n.log = n.log[:1] // truncate back to the sentinel
+	n.commitIndex = 0
+	n.lastApplied = 0
 	n.mu.Unlock()
 
 	if len(sent.Entries) != 2 {
@@ -372,6 +397,11 @@ func TestReplicationToAnEmptyFollowerStartsAtTheSentinel(t *testing.T) {
 
 // Concurrent clients must each get a distinct index, with no gaps and no
 // duplicates. This is the test that earns its keep under -race.
+//
+// It is also the real proof that Submit's critical section is right, and worth
+// knowing about before reading concurrent_test.go: that file's term/index
+// collision check covers the same ground across leader changes, but this one is
+// deterministic and fails loudly.
 func TestConcurrentSubmitsGetDistinctIndices(t *testing.T) {
 	n := leaderWithTransport(t, newRecordingTransport(5), 5)
 
@@ -456,8 +486,13 @@ func TestSubmitReplicatesAndCommits(t *testing.T) {
 		t.Errorf("commitIndex = %d, want 3: three current-term entries on a "+
 			"majority of three nodes", n.commitIndex)
 	}
+
+	// No consumer is attached to ApplyCh, so the applier is parked on its first
+	// send and lastApplied has not moved. That is the back-pressure design
+	// working, not a stall: consensus reached commitIndex 3 with a completely
+	// dead state machine.
 	if n.lastApplied != 0 {
-		t.Errorf("lastApplied = %d, want 0: applying committed entries to the "+
-			"state machine is C-12", n.lastApplied)
+		t.Errorf("lastApplied = %d, want 0: nothing is reading ApplyCh, so the "+
+			"applier is parked on its first delivery", n.lastApplied)
 	}
 }

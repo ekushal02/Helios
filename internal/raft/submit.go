@@ -36,6 +36,16 @@ func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
 	index = n.lastLogIndex()
 	term = n.currentTerm
 
+	// The append is itself replication evidence, and in a single-node cluster it
+	// is the only evidence there will ever be. Every other call to
+	// advanceCommitIndex hangs off an AppendEntries reply, so a cluster with no
+	// peers sends nothing, hears nothing, and never evaluates the commit rule --
+	// the log grows and commitIndex sits at zero forever.
+	//
+	// A no-op for any larger cluster: one replica is not a majority, so the
+	// count fails and this returns immediately.
+	n.advanceCommitIndex()
+
 	n.mu.Unlock()
 
 	// Push it out now rather than waiting for the heartbeat tick.

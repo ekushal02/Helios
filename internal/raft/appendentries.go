@@ -47,11 +47,36 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	// --- Receiver rules 3 and 4: conflict handling and append ---
 	n.mergeEntries(args.PrevLogIndex, args.Entries)
 
-	// TODO (C-11): rule 5, if LeaderCommit > commitIndex set commitIndex to
-	// min(LeaderCommit, index of last new entry). The second half of that min
-	// matters and is easy to drop: this node may hold entries beyond what the
-	// message covered, and must not treat them as committed on the strength of
-	// a LeaderCommit that was never about them.
+	// --- Receiver rule 5: adopt the leader's commit index ---
+	//
+	// commitIndex is not replicated state. A follower has no way to work out
+	// which of its entries reached a majority, so it is simply told, on every
+	// message. That is why entries and the permission to apply them usually
+	// arrive SEPARATELY: the leader appends, waits for a majority, and only the
+	// next message carries the higher LeaderCommit.
+	//
+	// THE min IS THE WHOLE RULE. lastNewIndex is derived from the MESSAGE --
+	// where the consistency check landed, plus what this message carried -- and
+	// never from n.lastLogIndex().
+	//
+	// The two differ exactly in Figure 7's cases (c) and (d), where the follower
+	// holds a private tail the leader never had. A heartbeat carrying no entries
+	// passes the check at PrevLogIndex and says LeaderCommit 8. Committing to 8
+	// would commit that private tail, the state machine would apply it, and the
+	// leader's next real message would truncate it. An entry that was applied
+	// and then vanished is precisely what Raft exists to prevent, and the client
+	// was told it succeeded.
+	//
+	// Reading it the safe way: this message proves agreement up to
+	// PrevLogIndex+len(Entries) and says nothing whatsoever about the indices
+	// beyond. LeaderCommit is a fact about the leader's log; lastNewIndex is the
+	// prefix of that log this node can vouch for. Commit the smaller.
+	//
+	// commitTo (C-12) owns the rest: it refuses to move backwards, which is what
+	// makes a reordered message carrying a stale LeaderCommit harmless, and it
+	// wakes the applier.
+	lastNewIndex := args.PrevLogIndex + len(args.Entries)
+	n.commitTo(min(args.LeaderCommit, lastNewIndex))
 
 	reply.Success = true
 }
@@ -102,6 +127,11 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 		// was replicated to a majority and any leader elected afterwards must
 		// have held it (§5.4.1). If this fires, the bug is upstream in the
 		// election restriction or the commit rule, not here.
+		//
+		// As of C-11 this check has teeth on followers too: commitIndex is no
+		// longer always zero here, it is whatever the leader last said. A
+		// LeaderCommit that was not capped by lastNewIndex would show up as this
+		// line firing, one message later.
 		if idx <= n.commitIndex {
 			n.lg().Error("truncating at or below commitIndex",
 				"index", idx, "commitIndex", n.commitIndex,
@@ -117,7 +147,8 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 	// Falling out means every entry in the message was already present with a
 	// matching term. The log is untouched -- INCLUDING entries beyond what this
 	// message covered, which stay put. They are uncommitted and get truncated
-	// when the leader eventually sends something at their indices.
+	// when the leader eventually sends something at their indices. Rule 5 above
+	// is careful not to commit them in the meantime.
 }
 
 // logMatchesAt reports whether this node holds an entry at index whose term is
