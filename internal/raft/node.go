@@ -51,11 +51,20 @@ type Node struct {
 	nextIndex  map[int]int // guess: where to send next. Optimistic.
 	matchIndex map[int]int // proven: replicated up to here. Pessimistic.
 
+	// lastContact records, per peer, the SEND time of the most recent message
+	// that peer answered. It is the raw material for the read lease: a majority
+	// of these being recent is what entitles this node to answer a read from
+	// local state without a round trip. See read.go.
+	//
+	// Reinitialised with the other two on every election, so a lease is never
+	// inherited from a term this node no longer holds.
+	lastContact map[int]time.Time
+
 	electionDeadline time.Time     //election starting timer
 	rng              *rand.Rand    //randomised election timeout
 	stopCh           chan struct{} //shut ticker down
 
-	// --- apply path (C-12). Only applier() sends on applyCh; see apply.go. ---
+	// --- apply path. Only applier() sends on applyCh; see apply.go. ---
 	//
 	// None of these are guarded by mu, which is the point: applyNotify is
 	// written under mu but never blocks, and applyCh is only ever touched by
@@ -87,9 +96,9 @@ func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 	}
 
 	// The applier starts here rather than on becoming leader, because followers
-	// apply too: they commit on LeaderCommit (C-11) and must reach the same
-	// state machine state as the leader. It cannot go in the composite literal
-	// above -- it launches a goroutine that reads n, so n has to exist first.
+	// apply too: they commit on LeaderCommit and must reach the same state
+	// machine state as the leader. It cannot go in the composite literal above
+	// -- it launches a goroutine that reads n, so n has to exist first.
 	n.initApplier()
 
 	return n

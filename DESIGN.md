@@ -2,10 +2,11 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.3 — leader election, log replication, the apply path and linearizable
-reads are implemented. Entries commit on a majority, apply in order on every node,
-and can be read back through a barrier. Verified under crashes, network partitions,
-message loss and reordering. Nothing is persisted to stable storage yet.
+**Status:** v1.4 — leader election, log replication, the apply path and linearizable
+reads are implemented. Entries commit on a majority, apply in order on every node, and
+can be read back either through a barrier or, under a bounded-clock assumption, from a
+leader's lease. Verified under crashes, network partitions, message loss and reordering.
+Nothing is persisted to stable storage yet.
 
 ---
 
@@ -242,6 +243,7 @@ conservatively reinitialised.
 |---|---|
 | `nextIndex[peer]` | Next log index to send. Optimistically initialised to leader's last index + 1. |
 | `matchIndex[peer]` | Highest index known replicated on that peer. Initialised to 0. |
+| `lastContact[peer]` | Send time of the most recent message that peer answered. The raw material for the read lease (§9). Empty on election, so a lease is never inherited from a term this node no longer holds. |
 
 The optimistic/pessimistic split is deliberate: `nextIndex` guesses high and backs
 off on rejection, while `matchIndex` claims nothing it has not proven. Initialising
@@ -458,21 +460,93 @@ that does nothing but apply, and serves reads from others. That is the same sepa
 apply channel already requires for a different reason (exactly one consumer, so delivery
 order becomes application order), which is why it costs nothing to honour.
 
-### Cost, and what would make it cheaper
+### Lease reads
 
-This barrier is a real log write: an append, a round trip to a majority, and an apply, per
-read. The paper's `ReadIndex` is cheaper — record the commit index, confirm leadership with
-a heartbeat round, wait for the applied index to reach the recorded one, never touch the
-log. That version depends on the leader already knowing its commit index is current, which
-is only true once it has committed something in its own term: the no-op on election this
-implementation does not have (§7).
+A leader that completed a round trip with a majority at time *T* knows every node in that
+majority reset its election timer at or after *T*. None can campaign for a full election
+timeout, an election needs a majority, and any two majorities intersect — so no other
+leader can exist, and this node's state is authoritative without any network round trip
+at all.
 
-So the log write is not a naive first draft; it is what is correct *without* the no-op, and
-it performs the current-term flush for free.
+`ReadLease` grants that permission and returns the instant it expires. It is a pure
+optimisation: every reason it can refuse is answered by the barrier, so the client
+protocol is lease-first with the barrier as fallback.
 
-*Rejected for now:* lease-based reads, which trade the network round for an assumption about
-clock drift and are unsafe if that assumption breaks. Revisit when there is a measurement
-saying the barrier costs too much.
+**It removes one of the three objections above, not three.** The other two are structural
+and are checked explicitly. The caller still waits for the state machine to reach the
+returned index, because the applied index trails the commit index. And the lease is
+refused outright until this leader has committed an entry in its own term — without that,
+§5.4.2 means its commit index does not yet cover the entries its predecessor committed,
+and its state machine is missing acknowledged writes. That second gate is the same
+dependency the paper's cheaper `ReadIndex` has on the no-op at election; because Helios
+has no such no-op, a write-idle cluster simply has no lease and every read pays for a
+barrier.
+
+**The lease dates from the send, not from the reply.** A follower resets its timer when it
+*receives* a message, which is at or after the send, so its deadline is at or after
+`sentAt + electionTimeoutMin`. Dating the contact from the send understates the lease by
+one one-way latency, which is the only direction it is safe to be wrong in. It also means
+a log *rejection* counts as contact: a failed consistency check resets the timer before
+running the check, so a rejection proves exactly what the lease needs. The only rejection
+that withholds the reset is the stale-term case, which deposes this node before the
+question can be asked.
+
+**The lease runs from the *k*th most recent contact.** One peer answering is not a
+majority. With five nodes a leader needs two peers besides itself, so the lease dates from
+the older of the two that make up the quorum.
+
+**The safety assumption, stated plainly: clock rates are bounded.** Nothing compares
+timestamps across machines, so absolute offset is irrelevant — what matters is that no two
+nodes' clocks run at rates differing by more than the drift allowance. The lease is
+discounted accordingly. If the leader's clock is slow by *d* a lease of *L* takes
+*L*/(1−*d*) real time; if a follower's is fast by *d* a timeout of *E* takes *E*/(1+*d*).
+Safety requires *L* < *E*(1−*d*)/(1+*d*), which at 10% gives a 123ms lease against a 150ms
+floor.
+
+**The assumption is not only about clocks.** A descheduled process — a stop-the-world
+pause, a throttled container, a suspended VM — advances wall-clock time without advancing
+its own progress, and is indistinguishable from a slow clock. The read protocol re-checks
+the lease after waiting for the state machine, which closes the window between the check
+and the read. It cannot close the window between that check and the value reaching the
+client, and nothing local can. That residue is the cost, not a defect to be fixed.
+
+**When not to use it.** Any caller that cannot accept a hardware assumption in its
+correctness argument calls the barrier directly. The barrier's guarantee is structural — a
+deposed leader *cannot* obtain a majority — and that is a different kind of claim from
+*this machine's clock is behaving*.
+
+### Cost, measured
+
+Five nodes, fifty reads down each path, the race detector off. The link setting is charged
+once per RPC rather than per direction.
+
+| link | RPC | barrier p50 | barrier p95 | lease p50 | lease p95 |
+|---|---|---|---|---|---|
+| loopback | 0 | 1.13ms | 1.18ms | 2.8µs | 4.9µs |
+| LAN | 5ms | 5.56ms | 5.66ms | 1.3µs | 3.6µs |
+| cross-zone | 25ms | 25.78ms | 26.35ms | 4.8µs | 7.8µs |
+
+Two things the shape shows.
+
+**The lease line is flat.** Its cost does not track the link, which is the evidence that it
+does no network work at all — the variation between the three rows is scheduling noise, not
+latency. The comparison asserts this rather than leaving it to be read off a chart: a lease
+p95 above one one-way delay fails the measurement.
+
+**A barrier read is the RPC plus about a millisecond.** Subtracting the link leaves 1.13 /
+0.56 / 0.78ms of local work, most of which is the 1ms polling granularity of the test's
+wait rather than anything in the implementation.
+
+That second observation settles a question the paper leaves open. The cheaper `ReadIndex`
+variant skips the log write and confirms leadership with a heartbeat round instead — but it
+still pays the round trip, so against these numbers it would save under a millisecond out of
+25.8ms across zones. **The append is not what a barrier read costs; the RPC is.** The
+argument for the no-op on election therefore rests on log growth and throughput, not on
+latency: a read-heavy workload appending an entry per read grows the log at write rates.
+That cost is real and is not measured here.
+
+The measurement is reproducible with `-measure`, and writes a CSV and per-link histograms
+alongside the election-time data.
 
 ---
 
@@ -803,13 +877,18 @@ Deliberately unresolved. Each is answered by later work.
   win. **Pre-vote** is the proper fix: a candidate first asks whether it *could* win,
   without incrementing anyone's term. Current behaviour is pinned by a test that should be
   inverted when pre-vote lands.
-- **No-op entry on election.** Would release inherited entries immediately (§7) and is the
-  last thing standing between the current read path and the paper's cheaper one (§9).
-  Deferred because it shifts every index by one and every path that reports an index to a
-  client must account for it. Decide before the client session layer, not during.
-- **Read barrier cost.** Every read is a log write. The heartbeat-only variant needs the
-  no-op above; lease reads need a clock assumption. Neither moves until there is a
-  measurement.
+- **No-op entry on election.** Would release inherited entries immediately (§7) and would
+  let a leader serve lease reads from the moment it wins rather than from its first client
+  write. Measurement has weakened the other argument for it: the heartbeat-only variant it
+  enables is barely cheaper than the barrier in latency terms (§9), because the cost is the
+  round trip and not the append. Still deferred because it shifts every index by one and
+  every path that reports an index to a client must account for it. Decide before the client
+  session layer, not during.
+- **Read throughput, as distinct from read latency.** Latency is measured and answered by
+  the lease (§9). What is not measured is that every *barrier* read appends an entry, so a
+  read-heavy workload on a cluster with no usable lease grows the log at write rates. This
+  is now the strongest argument for the no-op on election, and it needs a number before it
+  is an argument at all.
 - **Duplicate commands.** A client that retries after a leader change can land the same
   command twice, since the retry is issued without knowing whether the original committed.
   Both copies apply — invisible for an idempotent write, wrong for anything else. Closed by
@@ -847,3 +926,4 @@ Deliberately unresolved. Each is answered by later work.
 | v1.1 | Majority-intersection argument for the up-to-date check; implementation decisions; the election-timer reset deviation recorded as an open question; volatile state expanded to match the implementation |
 | v1.2 | Commit rules and the Figure 8 argument; leader bookkeeping; the fast-backup hint recorded as a deviation with measured round-trip savings; implementation decisions reorganised into log / timing / replication / bookkeeping; testing conventions added |
 | v1.3 | The apply path documented for the first time; linearizable reads and the argument against local reads; the no-op entry flag recorded as a departure from Figure 2; AppendEntries rule 5 and the same-term refusal written up; believed-impossible guards collected as a single principle; fault injection, fixture-inertness and test-goroutine conventions added; duplicate commands and read-barrier cost promoted to open questions |
+| v1.4 | Lease-based reads, with the clock-rate assumption and the process-pause residue documented; the send-time and quorum-ordering rules for deriving a lease; read latency measured across three link speeds, and the argument for the no-op on election revised in light of it from latency to log growth |

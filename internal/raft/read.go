@@ -1,5 +1,10 @@
 package raft
 
+import (
+	"sort"
+	"time"
+)
+
 // ReadIndex begins a linearizable read.
 //
 // It appends a barrier entry in the current term and returns the index that
@@ -23,13 +28,40 @@ package raft
 // derivations would eventually disagree -- the same argument that keeps the
 // state machine out of n.log.
 //
+// This is the SAFE path and the fallback for the lease path below. It costs a
+// log write and a round trip; ReadLease costs nothing and is correct only under
+// an assumption about clocks.
+//
+// =============================================================================
+// THE ONE WAY TO DEADLOCK THIS
+// =============================================================================
+//
+// NEVER PERFORM A READ ON THE GOROUTINE THAT CONSUMES ApplyCh.
+//
+// Step two of the protocol waits for the state machine to reach an index, and
+// the state machine only reaches indices because some goroutine is draining
+// ApplyCh. If that is the same goroutine, it is waiting for a delivery it is
+// itself responsible for making, and neither ever happens. The applier upstream
+// parks on an unbuffered send, so the stall is silent and total: no error, no
+// timeout, nothing in the log.
+//
+// The rule for the server layer: one goroutine owns ApplyCh and does nothing
+// but apply. Reads are served from other goroutines, which read the state
+// machine under its own lock. That is the same separation ApplyCh's doc comment
+// already requires for a different reason -- exactly one consumer, so that
+// delivery order becomes application order -- and it happens to make this
+// deadlock unreachable too.
+//
+// It applies to the lease path identically. ReadLease itself never blocks, but
+// step two of ITS protocol is the same wait.
+//
 // =============================================================================
 // WHY A BARRIER, AND WHY LOCAL STATE IS NOT AN ANSWER
 // =============================================================================
 //
 // The tempting implementation is: if n.state == Leader, read the map. It is one
 // comparison, it needs no network, and it is wrong three separate ways. The
-// long version is DESIGN.md §8; the short version is here because this is where
+// long version is DESIGN.md §9; the short version is here because this is where
 // someone will be standing when they decide to delete this function.
 //
 // 1. LEADERSHIP IS NOT A LOCAL FACT. A leader partitioned into a minority does
@@ -62,26 +94,166 @@ package raft
 // from a follower, see the old value. That is not a race to be narrowed; it is
 // the design.
 //
-// =============================================================================
-// COST, AND WHAT WOULD MAKE IT CHEAPER
-// =============================================================================
-//
-// This barrier is a real log write: an append, a round trip to a majority, and
-// an apply, per read. The paper's ReadIndex is cheaper -- record commitIndex,
-// confirm leadership with a heartbeat round, wait for lastApplied to reach the
-// recorded index, and never touch the log. That version depends on the leader
-// already knowing its commitIndex is current, which is only true once it has
-// committed something in its own term. Which is the no-op-on-election this
-// implementation does not have (DESIGN.md §10).
-//
-// So the log write is not a naive first draft; it is what is correct without
-// the no-op. It also does the §5.4.2 flush for free, which is why the read path
-// and the no-op are one decision rather than two.
-//
-// Lease-based reads are cheaper still and are a different bargain entirely:
-// they trade a network round for an assumption about clock drift, and are
-// unsafe if that assumption breaks. Not on the roadmap until there is a
-// measurement saying the barrier costs too much.
+// NOTE WHICH OF THE THREE THE LEASE REMOVES. Only the first, and only under an
+// assumption. Two and three are structural and ReadLease gates on them
+// explicitly.
 func (n *Node) ReadIndex() (index int, term int, isLeader bool) {
 	return n.appendAndReplicate(LogEntry{NoOp: true})
+}
+
+// =============================================================================
+// Lease reads
+// =============================================================================
+
+const (
+	// maxClockDriftPercent bounds how far any two nodes' clocks may differ in
+	// RATE -- not in absolute offset, which is irrelevant here because nothing
+	// compares timestamps across machines. Ten percent is enormously
+	// conservative for NTP-synchronised hardware, where drift is measured in
+	// parts per million. It is not conservative at all against a descheduled
+	// process, which is the real hazard; see the note on pauses below.
+	maxClockDriftPercent = 10
+
+	// leaseDuration is how long a completed majority round entitles this node
+	// to answer reads from local state.
+	//
+	// THE DERIVATION, because the factor is the whole safety argument.
+	//
+	// A follower resets its election timer when it RECEIVES a message, and will
+	// not campaign until electionTimeoutMin has elapsed ON ITS OWN CLOCK. This
+	// node must therefore stop trusting the lease before that instant, measured
+	// on ITS clock, in the worst case where its own clock is slow by the drift
+	// bound and the follower's is fast by the same.
+	//
+	// Leader's clock slow by d: a lease of L takes L/(1-d) real time.
+	// Follower's clock fast by d: a timeout of E takes E/(1+d) real time.
+	// Safe when L/(1-d) < E/(1+d), i.e. L < E * (1-d)/(1+d).
+	//
+	// With d = 10%, that is electionTimeoutMin * 90/110 ~= 123ms against a
+	// 150ms floor. Integer arithmetic rather than a float expression, because a
+	// float conversion of a Duration is not a constant expression in Go.
+	leaseDuration = electionTimeoutMin * (100 - maxClockDriftPercent) / (100 + maxClockDriftPercent)
+)
+
+// ReadLease reports whether this node may serve a read from local state without
+// a round trip.
+//
+// Returns the index the state machine must reach first, the instant the
+// permission expires, and whether it was granted at all. A false third return
+// is not an error: it means fall back to ReadIndex, which is always available.
+//
+// =============================================================================
+// WHAT IT IS SAFE TO CONCLUDE FROM A COMPLETED ROUND
+// =============================================================================
+//
+// If a majority of the cluster answered this node's AppendEntries, then every
+// one of those nodes received it, and every one of them reset its election
+// timer at or after the moment it was SENT. None of them can campaign for a
+// full election timeout after that. An election needs a majority of votes, and
+// any two majorities intersect, so no candidate can assemble one without a vote
+// from a node whose timer this leader just reset. Therefore no other leader can
+// exist during the lease, and this node's state is authoritative.
+//
+// The whole argument is contingent on the two clocks agreeing about how long
+// "a full election timeout" is. See DESIGN.md §9 for what that costs.
+//
+// =============================================================================
+// THE TWO GATES THE LEASE DOES NOT REMOVE
+// =============================================================================
+//
+// The lease answers ReadIndex's objection 1 and nothing else. Objections 2 and
+// 3 are structural, so both are checked here rather than assumed away:
+//
+//   - The caller must still wait for the state machine to reach the returned
+//     index. commitIndex moves in a reply handler, lastApplied when the applier
+//     hands over; between them sits an acknowledged write that has not run.
+//
+//   - This node must have committed an entry in its OWN term, or the read is
+//     refused outright. §5.4.2 means a fresh leader has not yet committed the
+//     entries its predecessor committed, so its commitIndex does not cover
+//     them and its state machine is missing acknowledged writes. Once ANY
+//     current-term entry commits, the whole prefix commits with it by Log
+//     Matching -- and every inherited entry sits below any current-term entry,
+//     so that single condition covers all of them.
+//
+// That second gate is the same dependency the paper's cheaper ReadIndex has on
+// the no-op entry appended at election. Helios does not have that no-op, so a
+// leader cannot serve lease reads until a client write happens to land. On a
+// write-idle cluster the lease is simply unavailable and every read pays for a
+// barrier, which is correct and is the price of the deferral.
+//
+// Caller must hold nothing.
+func (n *Node) ReadLease() (readIndex int, until time.Time, ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return 0, time.Time{}, false
+	}
+
+	// Gate two: nothing committed, or the newest committed entry is inherited.
+	if n.commitIndex == 0 || n.log[n.commitIndex].Term != n.currentTerm {
+		return 0, time.Time{}, false
+	}
+
+	until = n.leaseExpiry()
+	if !time.Now().Before(until) {
+		return 0, time.Time{}, false
+	}
+
+	return n.commitIndex, until, true
+}
+
+// leaseExpiry returns the instant this node must stop trusting its own state,
+// or the zero time if it has not heard from enough peers to have a lease at
+// all.
+//
+// THE kTH MOST RECENT CONTACT, not the most recent. One peer answering does not
+// make a majority; the lease runs from the moment the majority was last
+// complete. With five nodes a leader needs two peers, so the lease is dated
+// from the SECOND most recent contact -- the older of the two that make up the
+// quorum.
+//
+// Caller must hold mu.
+func (n *Node) leaseExpiry() time.Time {
+	// Peers needed besides this node, which always agrees with itself.
+	need := n.quorumSize() - 1
+
+	// A single-node cluster is its own majority and nobody else can be elected,
+	// so there is nothing to wait to hear from. The lease is always live.
+	if need <= 0 {
+		return time.Now().Add(leaseDuration)
+	}
+
+	heard := make([]time.Time, 0, len(n.peers))
+	for _, p := range n.peers {
+		if t, ok := n.lastContact[p]; ok {
+			heard = append(heard, t)
+		}
+	}
+	if len(heard) < need {
+		return time.Time{}
+	}
+
+	sort.Slice(heard, func(i, j int) bool { return heard[i].After(heard[j]) })
+	return heard[need-1].Add(leaseDuration)
+}
+
+// noteContact records that peer answered a message sent at sentAt.
+//
+// DATED FROM THE SEND, NOT THE REPLY, and the direction matters. The follower
+// reset its timer when it received the message, which is at or after sentAt, so
+// its deadline is at or after sentAt + electionTimeoutMin. Dating the contact
+// from the send therefore understates how long this node may trust the lease,
+// which is the only direction it is safe to be wrong in. Dating it from the
+// reply would overstate it by a full one-way latency.
+//
+// Monotonic, for the same reason matchIndex is: replies arrive out of order, and
+// a late answer to an older message must not drag the lease backwards.
+//
+// Caller must hold mu.
+func (n *Node) noteContact(peer int, sentAt time.Time) {
+	if sentAt.After(n.lastContact[peer]) {
+		n.lastContact[peer] = sentAt
+	}
 }

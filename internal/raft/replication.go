@@ -1,5 +1,7 @@
 package raft
 
+import "time"
+
 // replicateAll fans one AppendEntries out to every follower.
 //
 // term is the leadership term this fan-out belongs to, passed in rather than
@@ -79,6 +81,12 @@ func (n *Node) sendAppendEntries(peer int, term int, args *AppendEntriesArgs) {
 	// read as though they came off the wire.
 	var reply AppendEntriesReply
 
+	// Stamped BEFORE the send, for the read lease. The follower resets its
+	// election timer when it receives this, which is at or after now, so dating
+	// the contact from here understates the lease rather than overstating it.
+	// See noteContact.
+	sentAt := time.Now()
+
 	if !n.transport.SendAppendEntries(peer, args, &reply) {
 		return // dropped, partitioned or dead: the next tick tries again
 	}
@@ -96,6 +104,16 @@ func (n *Node) sendAppendEntries(peer int, term int, args *AppendEntriesArgs) {
 	if n.state != Leader || n.currentTerm != term {
 		return
 	}
+
+	// ANY reply counts as contact, including a log rejection.
+	//
+	// The lease cares whether the follower's election timer was reset, not
+	// whether its log agreed. A failed consistency check resets the timer
+	// before running the check -- that is deliberate, so a lagging follower does
+	// not campaign mid-repair -- so a rejection proves exactly what the lease
+	// needs. The one rejection that withholds the reset is the stale-term case,
+	// and that one deposes this node on the line above, so it cannot reach here.
+	n.noteContact(peer, sentAt)
 
 	if reply.Success {
 		n.advanceFollower(peer, args)
