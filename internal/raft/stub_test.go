@@ -27,6 +27,16 @@ func newStubTransport(answer func(to int, args *RequestVoteArgs) (RequestVoteRep
 	return &stubTransport{answer: answer}
 }
 
+// setAppendAnswer installs the AppendEntries responder under the lock it is read
+// under. Assigning the field directly is safe only while the write happens-before
+// the node exists, which is true of every current caller and is not a property
+// worth relying on.
+func (s *stubTransport) setAppendAnswer(f func(to int, args *AppendEntriesArgs) (AppendEntriesReply, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appendAnswer = f
+}
+
 func (s *stubTransport) SendRequestVote(to int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	s.mu.Lock()
 	s.calls = append(s.calls, to)

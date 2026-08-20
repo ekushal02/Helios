@@ -144,7 +144,6 @@ func (n *Node) becomeLeader() {
 
 	go n.heartbeatLoop(n.currentTerm)
 
-	// TODO (C-2): initialise nextIndex[] and matchIndex[] for every peer.
 }
 
 // runElection asks every peer for a vote in parallel and counts the answers.

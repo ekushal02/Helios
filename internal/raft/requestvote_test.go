@@ -42,6 +42,7 @@ func (r *argsRecorder) all() []RequestVoteArgs {
 func TestElectionContactsAllPeers(t *testing.T) {
 	stub := newStubTransport(denyAll(1))
 	n := NewNode(0, []int{1, 2, 3, 4}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -63,6 +64,7 @@ func TestElectionSendsCorrectArgs(t *testing.T) {
 	})
 
 	n := NewNode(7, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 	n.mu.Lock()
 	n.log = append(n.log, LogEntry{Term: 3}, LogEntry{Term: 4})
 	n.currentTerm = 4
@@ -97,6 +99,7 @@ func TestElectionSendsCorrectArgs(t *testing.T) {
 func TestElectionWinsWithMajority(t *testing.T) {
 	stub := newStubTransport(grantAll(1))
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -109,6 +112,7 @@ func TestElectionWinsWithMajority(t *testing.T) {
 func TestSingleNodeElectsItself(t *testing.T) {
 	stub := newStubTransport(denyAll(1))
 	n := NewNode(0, nil, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -127,6 +131,7 @@ func TestSingleNodeElectsItself(t *testing.T) {
 func TestElectionLosesAndStaysCandidate(t *testing.T) {
 	stub := newStubTransport(denyAll(1))
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -143,6 +148,7 @@ func TestElectionLosesAndStaysCandidate(t *testing.T) {
 func TestElectionWithAllPeersUnreachable(t *testing.T) {
 	stub := newStubTransport(unreachable())
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -161,6 +167,7 @@ func TestElectionStepsDownOnHigherTerm(t *testing.T) {
 		return RequestVoteReply{Term: 99, VoteGranted: false}, true
 	})
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -178,6 +185,7 @@ func TestElectionIsParallel(t *testing.T) {
 
 	stub := newStubTransport(slowPeer(1, slowDelay, 1))
 	n := NewNode(0, []int{1, 2, 3}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	start := time.Now()
 	n.mu.Lock()
@@ -201,6 +209,7 @@ func TestStaleVoteRepliesAreIgnored(t *testing.T) {
 	})
 
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate() // term 1: replies are now in flight and blocked

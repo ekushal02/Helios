@@ -22,6 +22,7 @@ func silentPeers() *stubTransport {
 
 func TestBecomeCandidateFromFollower(t *testing.T) {
 	n := NewNode(1, []int{0, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.resetElectionTimer()
@@ -55,6 +56,7 @@ func TestBecomeCandidateFromFollower(t *testing.T) {
 // A candidate whose election does not resolve retries at a HIGHER term.
 func TestBecomeCandidateFromCandidateIncrementsTerm(t *testing.T) {
 	n := NewNode(1, []int{0, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()
@@ -78,6 +80,7 @@ func TestBecomeCandidateFromCandidateIncrementsTerm(t *testing.T) {
 // Terms must never move backwards.
 func TestTermIsMonotonic(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	prev := 0
 	for i := 0; i < 50; i++ {
@@ -111,6 +114,7 @@ func TestMajority(t *testing.T) {
 			peers[i] = i + 1
 		}
 		n := NewNode(0, peers, silentPeers(), 1)
+		t.Cleanup(n.Stop)
 
 		if got := n.majority(); got != c.want {
 			t.Errorf("cluster of %d: majority = %d, want %d", c.peers+1, got, c.want)
@@ -175,6 +179,7 @@ func TestElectionTimerResetPreventsCandidacy(t *testing.T) {
 // A leader never times itself out.
 func TestLeaderDoesNotTimeOut(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.state = Leader
@@ -193,6 +198,7 @@ func TestLeaderDoesNotTimeOut(t *testing.T) {
 
 func TestElectionTimeoutIsRandomised(t *testing.T) {
 	n := NewNode(0, nil, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	seen := make(map[time.Duration]bool)
 	n.mu.Lock()
@@ -215,6 +221,7 @@ func TestElectionTimeoutIsRandomised(t *testing.T) {
 func TestElectionTimeoutIsDeterministic(t *testing.T) {
 	draw := func(seed int64) []time.Duration {
 		n := NewNode(0, nil, silentPeers(), seed)
+		t.Cleanup(n.Stop)
 		var out []time.Duration
 		n.mu.Lock()
 		for i := 0; i < 20; i++ {
@@ -239,6 +246,7 @@ func TestElectionTimeoutIsDeterministic(t *testing.T) {
 
 func TestStopHaltsTimer(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	
 	n.Start()
 
 	time.Sleep(electionTimeoutMax + 3*tickInterval)

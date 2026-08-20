@@ -45,14 +45,4 @@ func (n *Node) matchIndexFor(p int) int {
 	return n.matchIndex[p]
 }
 
-// TODO (C-6): on a successful AppendEntries, advance both:
-//     matchIndex[p] = args.PrevLogIndex + len(args.Entries)
-//     nextIndex[p]  = matchIndex[p] + 1
-// Derived from what was SENT, never from lastLogIndex() at reply time -- the log
-// may have grown since the RPC left, and never from max() of the old value
-// unless replies can arrive out of order, which over this transport they can.
-//
-// TODO (C-7): on a failed AppendEntries that was not a term rejection, walk
-// nextIndex[p] back and retry. It must never fall below 1: index 0 is the
-// sentinel, and a leader that tries to send from 0 is claiming to replicate an
-// entry that no state machine may ever apply.
+

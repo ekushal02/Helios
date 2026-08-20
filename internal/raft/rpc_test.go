@@ -52,10 +52,19 @@ func fieldNames(rt reflect.Type) []string {
 	return names
 }
 
+// THIS TEST DID ITS JOB. It failed when NoOp was added, which forced the
+// decision to be written down rather than slid in: see LogEntry's own comment
+// for why an explicit flag beat reusing a nil Command, and DESIGN.md §8 for the
+// consequences on the wire.
+//
+// NoOp is a documented departure from Figure 2, listed after the two fields the
+// paper defines, in the same way AppendEntriesReply carries the §5.3 fast-backup
+// hint after its Figure 2 fields.
 func TestLogEntryMatchesFigure2(t *testing.T) {
 	assertFields(t, LogEntry{}, []fieldSpec{
 		{"Term", "int"},
 		{"Command", "[]uint8"},
+		{"NoOp", "bool"},
 	})
 
 	// The absence of an Index field is a design decision, not an oversight:
@@ -138,6 +147,47 @@ func TestAppendEntriesArgsRoundTrips(t *testing.T) {
 	}
 }
 
+// A barrier must survive the wire, and a normal entry must not grow because
+// barriers exist.
+//
+// gob omits zero values, so NoOp false encodes to nothing at all: adding the
+// field cost every existing entry exactly zero bytes. That is the whole reason
+// an explicit flag was affordable where a nil-Command convention would have
+// been free but ambiguous.
+func TestNoOpEntriesRoundTrip(t *testing.T) {
+	orig := AppendEntriesArgs{
+		Term:     9,
+		LeaderID: 1,
+		Entries: []LogEntry{
+			{Term: 9, Command: []byte("set x 1")},
+			{Term: 9, NoOp: true},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(&orig); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got AppendEntriesArgs
+	if err := gob.NewDecoder(&buf).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Entries) != 2 {
+		t.Fatalf("decoded %d entries, want 2", len(got.Entries))
+	}
+	if got.Entries[0].NoOp {
+		t.Error("a client command decoded as a barrier")
+	}
+	if !got.Entries[1].NoOp {
+		t.Error("a barrier decoded as a client command: the follower would " +
+			"hand it to the state machine, which cannot parse it")
+	}
+	if got.Entries[1].Command != nil {
+		t.Errorf("barrier carries a command %q, want none", got.Entries[1].Command)
+	}
+}
+
 // THE GOB TRAP WORTH KNOWING ABOUT.
 //
 // gob omits zero values, so an all-zero message encodes to almost nothing and
@@ -192,6 +242,7 @@ func TestHeartbeatEntriesNormaliseToNil(t *testing.T) {
 // for every place the assumption is baked in.
 func TestFreshLogBaselineIsIndexZero(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, nil, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	defer n.mu.Unlock()

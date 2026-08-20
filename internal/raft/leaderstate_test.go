@@ -155,10 +155,10 @@ func TestLeaderStateReadyBeforeFirstHeartbeat(t *testing.T) {
 	seen := make(chan int, 8)
 
 	stub := newStubTransport(denyAll(3))
-	stub.appendAnswer = func(to int, args *AppendEntriesArgs) (AppendEntriesReply, bool) {
+	stub.setAppendAnswer(func(to int, args *AppendEntriesArgs) (AppendEntriesReply, bool) {
 		seen <- args.PrevLogIndex
 		return AppendEntriesReply{Term: 3, Success: true}, true
-	}
+	})
 
 	n := NewNode(0, []int{1, 2}, stub, 1)
 	defer n.Stop()

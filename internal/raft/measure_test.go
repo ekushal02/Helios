@@ -175,6 +175,9 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 }
 
 func mean(samples []time.Duration) time.Duration {
+	if len(samples) == 0 {
+		return 0
+	}
 	var total time.Duration
 	for _, d := range samples {
 		total += d

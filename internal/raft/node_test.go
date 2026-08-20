@@ -5,6 +5,7 @@ import "testing"
 func TestNewNode(t *testing.T) {
 
 	n := NewNode(1, []int{0, 2}, nil, 1)
+	t.Cleanup(n.Stop)
 
 	if n.state != Follower {
 		t.Errorf("expected follower, got %v", n.state)

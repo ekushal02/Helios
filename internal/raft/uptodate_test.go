@@ -7,6 +7,7 @@ import "testing"
 func withLog(t *testing.T, entryTerms ...int) *Node {
 	t.Helper()
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop) // NewNode starts the applier; without this it outlives the test
 
 	n.mu.Lock()
 	for _, term := range entryTerms {

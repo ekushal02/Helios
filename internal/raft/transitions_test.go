@@ -62,6 +62,7 @@ func TestBecomesLeaderOnlyAtMajority(t *testing.T) {
 			})
 
 			n := NewNode(0, peers, stub, 1)
+			t.Cleanup(n.Stop)
 
 			n.mu.Lock()
 			n.becomeCandidate()
@@ -85,6 +86,7 @@ func TestBecomeLeaderOnlyFromCandidate(t *testing.T) {
 	for _, start := range []State{Follower, Leader} {
 		t.Run("from_"+start.String(), func(t *testing.T) {
 			n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+			t.Cleanup(n.Stop)
 
 			n.mu.Lock()
 			n.state = start
@@ -105,6 +107,7 @@ func TestStepDownOnHigherTerm(t *testing.T) {
 	for _, start := range []State{Follower, Candidate, Leader} {
 		t.Run(start.String(), func(t *testing.T) {
 			n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+			t.Cleanup(n.Stop)
 
 			n.mu.Lock()
 			n.state = start
@@ -135,6 +138,7 @@ func TestStepDownOnHigherTerm(t *testing.T) {
 func TestNoStepDownOnEqualOrLowerTerm(t *testing.T) {
 	for _, incoming := range []int{5, 4, 1} {
 		n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+		t.Cleanup(n.Stop)
 
 		n.mu.Lock()
 		n.state = Leader
@@ -157,6 +161,7 @@ func TestNoStepDownOnEqualOrLowerTerm(t *testing.T) {
 
 func TestSameTermStepDownKeepsVote(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.state = Candidate
@@ -181,6 +186,7 @@ func TestSameTermStepDownKeepsVote(t *testing.T) {
 
 func TestNoSecondVoteAfterSameTermStepDown(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.state = Candidate
@@ -200,6 +206,7 @@ func TestNoSecondVoteAfterSameTermStepDown(t *testing.T) {
 // By contrast, a step-down that DOES advance the term frees the vote.
 func TestHigherTermStepDownFreesVote(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.state = Candidate
@@ -223,6 +230,7 @@ func TestHigherTermStepDownFreesVote(t *testing.T) {
 // A leader that steps down starts timing out again like any follower.
 func TestSteppedDownLeaderGetsAFreshTimer(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.state = Leader
@@ -243,6 +251,7 @@ func TestStepsDownFromVoteReply(t *testing.T) {
 		return RequestVoteReply{Term: 42, VoteGranted: false}, true
 	})
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.becomeCandidate()

@@ -94,6 +94,7 @@ func TestRequestVoteGrantingRules(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+			t.Cleanup(n.Stop)
 
 			n.mu.Lock()
 			n.currentTerm = tc.nodeTerm
@@ -129,6 +130,7 @@ func TestRequestVoteStepsDownOnNewerTerm(t *testing.T) {
 	for _, start := range []State{Candidate, Leader} {
 		t.Run(start.String(), func(t *testing.T) {
 			n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+			t.Cleanup(n.Stop)
 
 			n.mu.Lock()
 			n.state = start
@@ -160,6 +162,7 @@ func TestRequestVoteStepsDownOnNewerTerm(t *testing.T) {
 func TestGrantedVoteResetsElectionTimer(t *testing.T) {
 
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.currentTerm = 1
@@ -178,6 +181,7 @@ func TestGrantedVoteResetsElectionTimer(t *testing.T) {
 // A REJECTED stale request must NOT reset the timer.
 func TestRejectedStaleVoteDoesNotResetTimer(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.currentTerm = 5
@@ -205,6 +209,7 @@ func TestRejectedStaleVoteDoesNotResetTimer(t *testing.T) {
 // Only one candidate can win a given term. This is Election Safety, checked directly at the level of a single voter.
 func TestOnlyOneVotePerTerm(t *testing.T) {
 	n := NewNode(0, []int{1, 2, 3, 4}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.currentTerm = 3
@@ -227,6 +232,7 @@ func TestOnlyOneVotePerTerm(t *testing.T) {
 // Concurrent requests must not both win. Without the mutex, two candidates arriving at once could each see votedFor == None.
 func TestConcurrentVoteRequests(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.currentTerm = 1

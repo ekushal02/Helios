@@ -77,13 +77,19 @@ func TestNextIndexAfterConflict(t *testing.T) {
 func TestBackoffAlwaysMovesBackwards(t *testing.T) {
 	leader := figure7Leader()
 
-	for current := 2; current <= len(leader); current++ {
+		
+	for current := 1; current <= len(leader); current++ {
 		for idx := -3; idx <= len(leader)+3; idx++ {
 			for _, term := range []int{noConflictTerm, 1, 2, 3, 4, 5, 6, 7, 9} {
 				got := nextIndexAfterConflict(leader, current, idx, term)
-				if got >= current {
+
+				if current > 1 && got >= current {
 					t.Fatalf("current=%d idx=%d term=%d gave %d: backoff moved forward",
 						current, idx, term, got)
+				}
+				if current == 1 && got != 1 {
+					t.Fatalf("current=1 idx=%d term=%d gave %d: the floor must "+
+						"hold at the sentinel", idx, term, got)
 				}
 				if got < 1 {
 					t.Fatalf("current=%d idx=%d term=%d gave %d: below the sentinel",

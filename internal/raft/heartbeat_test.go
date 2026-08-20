@@ -90,6 +90,7 @@ func TestFollowersTimeOutWhenHeartbeatsStop(t *testing.T) {
 // A heartbeat must push the election deadline into the future.
 func TestHeartbeatResetsElectionTimer(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.currentTerm = 3
@@ -115,6 +116,7 @@ func TestHeartbeatResetsElectionTimer(t *testing.T) {
 // A heartbeat from a term this node has left is refused, and does NOT reset the timer.
 func TestStaleHeartbeatIsRejected(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.currentTerm = 7
@@ -149,6 +151,7 @@ func TestStaleHeartbeatIsRejected(t *testing.T) {
 // is already spent; forgetting it would allow a second vote in one term.
 func TestCandidateStepsDownOnSameTermHeartbeat(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
+	t.Cleanup(n.Stop)
 
 	n.mu.Lock()
 	n.state = Candidate
@@ -183,11 +186,12 @@ func TestCandidateStepsDownOnSameTermHeartbeat(t *testing.T) {
 func TestLeaderStepsDownFromHeartbeatReply(t *testing.T) {
 	stub := newStubTransport(denyAll(1))
 
-	stub.appendAnswer = func(int, *AppendEntriesArgs) (AppendEntriesReply, bool) {
+	stub.setAppendAnswer(func(int, *AppendEntriesArgs) (AppendEntriesReply, bool) {
 		return AppendEntriesReply{Term: 50, Success: false}, true
-	}
+	})
 
 	n := NewNode(0, []int{1, 2}, stub, 1)
+	
 
 	n.mu.Lock()
 	n.state = Candidate // becomeLeader is guarded to Candidate
@@ -208,13 +212,13 @@ func TestFirstHeartbeatIsImmediate(t *testing.T) {
 	sent := make(chan struct{}, 8)
 
 	stub := newStubTransport(denyAll(1))
-	stub.appendAnswer = func(int, *AppendEntriesArgs) (AppendEntriesReply, bool) {
+	stub.setAppendAnswer(func(int, *AppendEntriesArgs) (AppendEntriesReply, bool) {
 		select {
 		case sent <- struct{}{}:
 		default:
 		}
 		return AppendEntriesReply{Term: 3, Success: true}, true
-	}
+	})
 
 	n := NewNode(0, []int{1, 2}, stub, 1)
 

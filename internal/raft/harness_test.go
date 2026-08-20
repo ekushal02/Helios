@@ -22,19 +22,36 @@ type fakeNetwork struct {
 
 	reachable map[int]map[int]bool //N x N matrix
 
-	dropRate float64       //chance a deliverable message is dropped anyway
-	minDelay time.Duration //lower bound on random per-message delay
-	maxDelay time.Duration //upper bound on random per-message delay
+	dropRate      float64       //chance a deliverable REQUEST is dropped anyway
+	replyDropRate float64       //chance a REPLY is dropped after the handler ran
+	minDelay      time.Duration //lower bound on random per-message delay
+	maxDelay      time.Duration //upper bound on random per-message delay
 
-	rpcCount int //for asserting things like "the minority got no votes"
+	rpcCount  int //for asserting things like "the minority got no votes"
+	dropCount int //requests plus replies actually discarded
+
+	// Reorder accounting, C-15.
+	//
+	// Reordering is not a setting. It is what happens when replicateAll gives
+	// every message its own goroutine and route gives every goroutine its own
+	// random delay: a message overtakes an earlier one to the same peer
+	// whenever it draws a shorter delay than the gap between them. Under client
+	// load that gap is microseconds and inversions are constant; on an idle
+	// cluster with 50ms between heartbeats and a 10ms jitter range they are
+	// impossible. So there is no rate to dial, only a count to observe.
+	nextSeq     map[[2]int]int //next stamp per directed pair, assigned at send
+	lastArrived map[[2]int]int //highest stamp delivered per directed pair
+	reordered   int            //messages that arrived behind a later-sent one
 }
 
 func newFakeNetwork(seed int64) *fakeNetwork {
 	return &fakeNetwork{
-		seed:      seed,
-		rng:       rand.New(rand.NewSource(seed)),
-		nodes:     make(map[int]*Node),
-		reachable: make(map[int]map[int]bool),
+		seed:        seed,
+		rng:         rand.New(rand.NewSource(seed)),
+		nodes:       make(map[int]*Node),
+		reachable:   make(map[int]map[int]bool),
+		nextSeq:     make(map[[2]int]int),
+		lastArrived: make(map[[2]int]int),
 	}
 }
 
@@ -109,6 +126,22 @@ func (fn *fakeNetwork) setDropRate(p float64) {
 	fn.dropRate = p
 }
 
+// setReplyDropRate loses the REPLY after the receiver has already acted on the
+// request.
+//
+// THE CASE setDropRate CANNOT PRODUCE, and the more interesting of the two. A
+// lost request means the follower never saw anything. A lost reply means the
+// follower appended the entries and the leader does not know: nextIndex stays
+// put and the next tick resends entries the follower already holds. That path
+// is the only thing in the suite that puts mergeEntries in front of a duplicate
+// append, and a receiver that truncated on entries matching its own log would
+// pass every other test in this package.
+func (fn *fakeNetwork) setReplyDropRate(p float64) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	fn.replyDropRate = p
+}
+
 func (fn *fakeNetwork) setMaxDelay(d time.Duration) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
@@ -128,6 +161,18 @@ func (fn *fakeNetwork) rpcs() int {
 	return fn.rpcCount
 }
 
+func (fn *fakeNetwork) drops() int {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	return fn.dropCount
+}
+
+func (fn *fakeNetwork) reorderedCount() int {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	return fn.reordered
+}
+
 // endpoint binds the network to one node's perspective, so a Node never has to say who it is on every call.
 type endpoint struct {
 	net  *fakeNetwork
@@ -139,13 +184,14 @@ func (fn *fakeNetwork) endpoint(from int) Transport {
 }
 
 func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	target, delay, ok := e.net.route(e.from, to)
+	target, delay, seq, ok := e.net.route(e.from, to)
 	if !ok {
 		return false
 	}
 	if delay > 0 {
 		time.Sleep(delay)
 	}
+	e.net.arrive(e.from, to, seq)
 
 	//Copy across the wire so sender and receiver never share memory.
 	var argsCopy RequestVoteArgs
@@ -154,7 +200,7 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 	var replyCopy RequestVoteReply
 	target.RequestVote(&argsCopy, &replyCopy)
 
-	if !e.net.deliverable(to, e.from) {
+	if !e.net.replyDeliverable(to, e.from) {
 		return false
 	}
 	mustRoundTrip(&replyCopy, reply)
@@ -162,13 +208,14 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 }
 
 func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	target, delay, ok := e.net.route(e.from, to)
+	target, delay, seq, ok := e.net.route(e.from, to)
 	if !ok {
 		return false
 	}
 	if delay > 0 {
 		time.Sleep(delay)
 	}
+	e.net.arrive(e.from, to, seq)
 
 	var argsCopy AppendEntriesArgs
 	mustRoundTrip(args, &argsCopy)
@@ -176,32 +223,60 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 	var replyCopy AppendEntriesReply
 	target.AppendEntries(&argsCopy, &replyCopy)
 
-	if !e.net.deliverable(to, e.from) {
+	if !e.net.replyDeliverable(to, e.from) {
 		return false
 	}
 	mustRoundTrip(&replyCopy, reply)
 	return true
 }
 
-// route decides whether a message is delivered and returns the target plus any delay to apply.
-func (fn *fakeNetwork) route(from, to int) (*Node, time.Duration, bool) {
+// route decides whether a message is delivered and returns the target, any
+// delay to apply, and a send-order stamp for the reorder accounting.
+func (fn *fakeNetwork) route(from, to int) (*Node, time.Duration, int, bool) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 
 	fn.rpcCount++
 
 	if !fn.reachable[from][to] {
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	if fn.dropRate > 0 && fn.rng.Float64() < fn.dropRate {
-		return nil, 0, false
+		fn.dropCount++
+		return nil, 0, 0, false
 	}
 
 	delay := fn.minDelay
 	if fn.maxDelay > fn.minDelay {
 		delay += time.Duration(fn.rng.Int63n(int64(fn.maxDelay - fn.minDelay)))
 	}
-	return fn.nodes[to], delay, true
+
+	// The stamp is assigned here, under the lock, so it records the order the
+	// messages were SENT. arrive records the order they were delivered. The two
+	// disagreeing is the definition of a reorder.
+	pair := [2]int{from, to}
+	seq := fn.nextSeq[pair]
+	fn.nextSeq[pair] = seq + 1
+
+	return fn.nodes[to], delay, seq, true
+}
+
+// arrive records a delivery and counts it if an earlier-sent message to the
+// same peer has already gone past.
+//
+// A dropped message consumes a stamp it never delivers, which leaves a
+// permanent hole in the sequence. That is harmless: the hole never arrives, so
+// it can neither cause nor mask a count.
+func (fn *fakeNetwork) arrive(from, to, seq int) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+
+	pair := [2]int{from, to}
+	if high, seen := fn.lastArrived[pair]; seen && seq < high {
+		fn.reordered++
+		return
+	}
+	fn.lastArrived[pair] = seq
 }
 
 // deliverable re-checks the return path, since the network may have been cut while the handler was running.
@@ -209,6 +284,22 @@ func (fn *fakeNetwork) deliverable(from, to int) bool {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 	return fn.reachable[from][to]
+}
+
+// replyDeliverable is deliverable plus the reply-loss roll.
+func (fn *fakeNetwork) replyDeliverable(from, to int) bool {
+	if !fn.deliverable(from, to) {
+		return false
+	}
+
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+
+	if fn.replyDropRate > 0 && fn.rng.Float64() < fn.replyDropRate {
+		fn.dropCount++
+		return false
+	}
+	return true
 }
 
 // mustRoundTrip serializes and deserializes to sever pointer sharing between caller and callee, exactly as a real transport would.
@@ -240,6 +331,8 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 
 	net := newFakeNetwork(seed)
 	c := &cluster{t: t, net: net, seed: seed, dead: make(map[int]bool)}
+
+	t.Cleanup(c.stop)
 
 	base := newTestLogger(t, seed)
 
@@ -289,6 +382,9 @@ func (c *cluster) stop() {
 //
 // Cutting the network is what makes the node actually absent. Contrast with
 // B-14, where a node is partitioned but very much alive.
+//
+// heal() undoes the second half. Any test that heals after a kill must re-cut
+// the dead; see healAroundTheDead in leaderfailure_test.go.
 
 func (c *cluster) kill(id int) {
 	c.t.Helper()

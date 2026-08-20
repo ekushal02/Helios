@@ -1,7 +1,7 @@
 package raft
 
-// Submit hands a command to the cluster. It is the only way anything enters the
-// replicated log.
+// Submit hands a command to the cluster. It is the only way a CLIENT COMMAND
+// enters the replicated log.
 //
 // Returns the index the command was placed at, the term it was placed in, and
 // whether this node is the leader. A false third return means the caller must
@@ -22,16 +22,37 @@ package raft
 // must be reported as failed, not retried silently -- a retry could double-apply
 // if the original committed after all. That machinery is Phase F.
 func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
+	// COPIED BEFORE IT REACHES THE LOG. The caller owns the slice it passed and
+	// may reuse it; if the log aliased that memory, a caller recycling a buffer
+	// would rewrite committed history. From here on LogEntry.Command is
+	// immutable, which is what lets outgoing messages copy entries shallowly.
+	return n.appendAndReplicate(LogEntry{
+		Command: append([]byte(nil), command...),
+	})
+}
+
+// appendAndReplicate is the single path by which anything enters this leader's
+// log. Submit puts a client command through it; ReadIndex puts a barrier.
+//
+// Extracted rather than duplicated because of the advanceCommitIndex call
+// below, which is the one line in the function that is not obvious and the one
+// a second copy would omit.
+func (n *Node) appendAndReplicate(entry LogEntry) (index int, term int, isLeader bool) {
 	n.mu.Lock()
 
 	if n.state != Leader {
+		currentTerm := n.currentTerm
 		n.mu.Unlock()
-		return 0, n.currentTerm, false
+		return 0, currentTerm, false
 	}
 
-	cmd := append([]byte(nil), command...)
+	// The term is stamped here, not by the caller. An entry's term is the term
+	// of the leader that created it, and only this critical section knows what
+	// that is -- a caller reading currentTerm beforehand could be stamping an
+	// entry with a term this node no longer holds.
+	entry.Term = n.currentTerm
 
-	n.log = append(n.log, LogEntry{Term: n.currentTerm, Command: cmd})
+	n.log = append(n.log, entry)
 
 	index = n.lastLogIndex()
 	term = n.currentTerm

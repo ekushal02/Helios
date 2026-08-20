@@ -2,10 +2,36 @@ package raft
 
 import (
 	"testing"
+	"time"
 )
 
 // leaderInTerm builds a leader at the given term holding the given entry terms
 // at indices 1..n, with the given number of peers.
+//
+// A LEADER WITH NO HEARTBEAT LOOP, and that is the whole point of the fixture.
+//
+// becomeLeader ends with `go n.heartbeatLoop(n.currentTerm)`, which fans out
+// immediately rather than waiting for the first tick. recordingTransport
+// answers Success to everything. So a fixture built through becomeLeader has,
+// microseconds later, replicated to every peer, advanced every matchIndex to
+// lastLogIndex, and run advanceCommitIndex on its own -- before the test body
+// has set a single matchIndex.
+//
+// That raced every assertion in this file. Most survived by coincidence: the
+// background commit happened to equal the expected answer, or §5.4.2 blocked
+// it. Five did not, and they passed only because the test body usually won a
+// very short race. TestScanStopsBelowTheCurrentTerm lost it first, and reported
+// a §5.4.2 violation that had not occurred.
+//
+// So the leader state is installed directly. These tests exercise the commit
+// DECISION, not the send path -- TestCommitAdvancesThroughReplication covers
+// that, and does it by calling advanceFollower rather than by waiting on a
+// network. A fixture that also replicates is not more realistic here, it is
+// just nondeterministic.
+//
+// The three lines below mirror becomeLeader minus the goroutine. If becomeLeader
+// grows a fourth, TestTheCommitFixtureIsInertUntilTheTestActs will not catch it
+// -- but every test in this file will start failing in ways that point here.
 func leaderInTerm(t *testing.T, term int, peers []int, entryTerms ...int) *Node {
 	t.Helper()
 
@@ -17,11 +43,44 @@ func leaderInTerm(t *testing.T, term int, peers []int, entryTerms ...int) *Node 
 	for _, et := range entryTerms {
 		n.log = append(n.log, LogEntry{Term: et})
 	}
-	n.state = Candidate
-	n.becomeLeader()
+	n.state = Leader
+	n.leaderID = n.id
+	n.initLeaderState()
 	n.mu.Unlock()
 
 	return n
+}
+
+// THE GUARD FOR EVERY OTHER TEST IN THIS FILE.
+//
+// The log here is entirely current-term and would be committed to index 2 by a
+// single fan-out. Nothing sets a matchIndex, so if commitIndex moves at all,
+// something in the fixture is talking to the network and every expectation in
+// this file is a coin flip again.
+//
+// The sleep is three heartbeat intervals rather than one, because the first
+// fan-out happens on entry to the loop and the point is to catch the tick as
+// well.
+func TestTheCommitFixtureIsInertUntilTheTestActs(t *testing.T) {
+	n := leaderInTerm(t, 7, []int{1, 2, 3, 4}, 7, 7)
+
+	time.Sleep(3 * heartbeatInterval)
+
+	if got := commitIndexOf(n); got != 0 {
+		t.Errorf("commitIndex = %d after %v of doing nothing, want 0: the "+
+			"fixture is replicating in the background, so every commit "+
+			"assertion in this file is racing it",
+			got, 3*heartbeatInterval)
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, p := range n.peers {
+		if got := n.matchIndex[p]; got != 0 {
+			t.Errorf("matchIndex[%d] = %d, want 0: a reply handler ran without "+
+				"the test sending anything", p, got)
+		}
+	}
 }
 
 // setMatch installs a matchIndex picture directly, so the commit decision can

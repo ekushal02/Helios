@@ -9,10 +9,16 @@ package raft
 // derivations would eventually disagree.
 //
 // CommandValid exists so the message type can carry things that are not
-// commands. Nothing sends a false one yet; installed snapshots will (Phase F),
-// and they must travel on THIS channel rather than a second one, because a
-// snapshot and the entries after it are a single ordered sequence. Two channels
-// would let the state machine see them interleaved.
+// commands. Read barriers send a false one: the index must reach the state
+// machine so a reader can observe it, but there is nothing to apply. Installed
+// snapshots will be the second case (Phase F), and they must travel on THIS
+// channel rather than a second one, because a snapshot and the entries after it
+// are a single ordered sequence. Two channels would let the state machine see
+// them interleaved.
+//
+// A consumer's obligation: on CommandValid false, advance your own index and
+// apply nothing. Treating it as an error -- which is the natural first draft --
+// makes every linearizable read look like a corrupt log.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      []byte
@@ -193,11 +199,20 @@ func (n *Node) applier() {
 
 		batch := make([]ApplyMsg, 0, max(0, last-first+1))
 		for i := first; i <= last; i++ {
+			e := n.log[i]
+
+			// A BARRIER IS DELIVERED, NOT SKIPPED. It carries no command, so
+			// CommandValid is false and the state machine must not try to
+			// interpret one -- but it must still arrive, because the reader is
+			// waiting for the STATE MACHINE to reach this index, not for Raft
+			// to. Filtering barriers out here would advance lastApplied while
+			// leaving every consumer's own counter behind, and every read would
+			// wait for an index that never shows up.
 			batch = append(batch, ApplyMsg{
-				CommandValid: true,
-				Command:      n.log[i].Command,
+				CommandValid: !e.NoOp,
+				Command:      e.Command,
 				CommandIndex: i,
-				CommandTerm:  n.log[i].Term,
+				CommandTerm:  e.Term,
 			})
 		}
 		n.mu.Unlock()

@@ -288,3 +288,45 @@ func TestNegativePrevLogIndexIsRejectedNotFatal(t *testing.T) {
 		t.Error("accepted a message with a negative PrevLogIndex")
 	}
 }
+
+
+// Two leaders in one term is impossible, so this asserts what happens if the
+// impossible occurs: the log is not touched, and the node does not step down.
+//
+// Falling through would let a rival truncate the log this node is still
+// replicating from, which is the one believed-impossible condition in the
+// package that had no guard.
+func TestALeaderRefusesSameTermAppendEntries(t *testing.T) {
+	n := followerWithLog(t, 5, 5, 5, 5)
+
+	n.mu.Lock()
+	n.state = Leader
+	before := append([]LogEntry(nil), n.log...)
+	n.mu.Unlock()
+
+	var reply AppendEntriesReply
+	n.AppendEntries(&AppendEntriesArgs{
+		Term: 5, LeaderID: 1,
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []LogEntry{{Term: 5, Command: []byte("rival")}},
+	}, &reply)
+
+	if reply.Success {
+		t.Error("a leader accepted entries from a rival in its own term")
+	}
+	if reply.ConflictIndex != 0 || reply.ConflictTerm != 0 {
+		t.Errorf("ConflictIndex=%d ConflictTerm=%d, want both 0: this is not a "+
+			"disagreement about a log", reply.ConflictIndex, reply.ConflictTerm)
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		t.Errorf("state = %v: a same-term message must not depose a leader", n.state)
+	}
+	if !logsEqual(n.log, before) {
+		t.Errorf("the leader's log was rewritten by a same-term message:\n"+
+			"  have %v\n  want %v", termsOf(n.log), termsOf(before))
+	}
+}

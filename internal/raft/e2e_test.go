@@ -92,16 +92,24 @@ func (m *kvMachine) apply(msg ApplyMsg) {
 	}
 	m.lastIdx = msg.CommandIndex
 
-	if !msg.CommandValid && m.fault == "" {
-		m.fault = fmt.Sprintf("index %d arrived with CommandValid false",
-			msg.CommandIndex)
-	}
-
-	// Recorded because Submit's doc comment makes (index, term) the claim
+	// Recorded because Submit and ReadIndex both make (index, term) the claim
 	// ticket: an index that comes back carrying a different term means that
 	// submission was overwritten by a later leader. concurrent_test.go checks
-	// exactly that pair; nothing here needs it yet.
+	// the pair for writes and read_test.go checks it for barriers.
 	m.terms[msg.CommandIndex] = msg.CommandTerm
+
+	// A READ BARRIER. Advance the index, apply nothing.
+	//
+	// This used to be recorded as a fault, on the reasoning that Raft only ever
+	// delivers commands. Read barriers make that false: the index must reach
+	// this machine so a reader can observe it, but there is no command to run.
+	// It still goes in `order`, because every node sees the same barriers at
+	// the same positions and a sequence comparison that skipped them would stop
+	// noticing if one node dropped one.
+	if !msg.CommandValid {
+		m.order = append(m.order, fmt.Sprintf("%d:<barrier>", msg.CommandIndex))
+		return
+	}
 
 	cmd := string(msg.Command)
 	m.order = append(m.order, fmt.Sprintf("%d:%s", msg.CommandIndex, cmd))
@@ -151,6 +159,16 @@ func (m *kvMachine) termAt(idx int) (int, bool) {
 	defer m.mu.Unlock()
 	term, ok := m.terms[idx]
 	return term, ok
+}
+
+// value is the read itself, once the barrier protocol has decided it is safe to
+// perform. Deliberately trivial: everything that makes a read linearizable
+// happens before this is called, never inside it.
+func (m *kvMachine) value(key string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.state[key]
+	return v, ok
 }
 
 func (m *kvMachine) snapshot() (map[string]string, []string, int, string) {
