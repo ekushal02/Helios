@@ -289,7 +289,6 @@ func TestNegativePrevLogIndexIsRejectedNotFatal(t *testing.T) {
 	}
 }
 
-
 // Two leaders in one term is impossible, so this asserts what happens if the
 // impossible occurs: the log is not touched, and the node does not step down.
 //

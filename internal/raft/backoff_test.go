@@ -77,7 +77,6 @@ func TestNextIndexAfterConflict(t *testing.T) {
 func TestBackoffAlwaysMovesBackwards(t *testing.T) {
 	leader := figure7Leader()
 
-		
 	for current := 1; current <= len(leader); current++ {
 		for idx := -3; idx <= len(leader)+3; idx++ {
 			for _, term := range []int{noConflictTerm, 1, 2, 3, 4, 5, 6, 7, 9} {

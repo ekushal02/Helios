@@ -22,7 +22,7 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	// No timer reset, and NO CONFLICT HINT: this rejection is about the sender's
 	// term, not about any log. A leader that read a hint here would back off for
 	// the wrong reason, and it is about to step down anyway.
-		if args.Term < n.currentTerm {
+	if args.Term < n.currentTerm {
 		return
 	}
 

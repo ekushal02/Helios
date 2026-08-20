@@ -246,7 +246,7 @@ func TestElectionTimeoutIsDeterministic(t *testing.T) {
 
 func TestStopHaltsTimer(t *testing.T) {
 	n := NewNode(0, []int{1, 2}, silentPeers(), 1)
-	
+
 	n.Start()
 
 	time.Sleep(electionTimeoutMax + 3*tickInterval)

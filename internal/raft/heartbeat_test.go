@@ -191,7 +191,6 @@ func TestLeaderStepsDownFromHeartbeatReply(t *testing.T) {
 	})
 
 	n := NewNode(0, []int{1, 2}, stub, 1)
-	
 
 	n.mu.Lock()
 	n.state = Candidate // becomeLeader is guarded to Candidate

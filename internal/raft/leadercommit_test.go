@@ -57,7 +57,6 @@ func send(n *Node, prevIndex, prevTerm int, entries []LogEntry, leaderCommit int
 	return reply
 }
 
-
 // The plain case: entries and their commitment arrive together, and the
 // follower's state machine sees them in index order.
 func TestFollowerAppliesWhatTheLeaderCommitted(t *testing.T) {

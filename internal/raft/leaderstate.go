@@ -44,5 +44,3 @@ func (n *Node) nextIndexFor(p int) int {
 func (n *Node) matchIndexFor(p int) int {
 	return n.matchIndex[p]
 }
-
-
