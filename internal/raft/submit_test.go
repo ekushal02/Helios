@@ -59,6 +59,18 @@ func (r *recordingTransport) waitForMessages(t *testing.T, n int, within time.Du
 	return nil
 }
 
+func drainInitialFanOut(t *testing.T, tr *recordingTransport, peers int) int {
+	t.Helper()
+	tr.waitForMessages(t, peers, time.Second)
+	return len(tr.messages())
+}
+
+func (r *recordingTransport) waitForMessagesAfter(t *testing.T, mark, n int, within time.Duration) []*AppendEntriesArgs {
+	t.Helper()
+	all := r.waitForMessages(t, mark+n, within)
+	return all[mark:]
+}
+
 func leaderWithTransport(t *testing.T, tr Transport, term int) *Node {
 	t.Helper()
 
@@ -209,6 +221,8 @@ func TestEachPeerGetsItsOwnMessage(t *testing.T) {
 	tr := newRecordingTransport(5)
 	n := leaderWithTransport(t, tr, 5)
 
+	mark := drainInitialFanOut(t, tr, len(n.peers))
+
 	// Log becomes: [0]=sentinel, [1]=a, [2]=b, [3]=c. lastLogIndex = 3.
 	n.mu.Lock()
 	n.log = append(n.log,
@@ -221,7 +235,7 @@ func TestEachPeerGetsItsOwnMessage(t *testing.T) {
 	n.mu.Unlock()
 
 	n.replicateAll(5)
-	msgs := tr.waitForMessages(t, 2, time.Second)
+	msgs := tr.waitForMessagesAfter(t, mark, 2, time.Second)
 
 	byPrev := map[int]*AppendEntriesArgs{}
 	for _, m := range msgs {
