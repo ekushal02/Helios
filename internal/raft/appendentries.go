@@ -11,6 +11,8 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	defer n.persistIfDirty()
+
 	// --- Rules for Servers, All Servers ---
 	n.stepDownIfStale(args.Term)
 
@@ -121,6 +123,7 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 			// Copies the entry structs out of the message rather than retaining
 			// the message's slice, so the log does not alias transport memory.
 			n.log = append(n.log, entries[i:]...)
+			n.markDirty()
 			return
 		}
 
@@ -147,6 +150,7 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 		// Rule 3: delete the conflicting entry and every one after it, then
 		// append the leader's version over the same backing array.
 		n.log = append(n.log[:idx], entries[i:]...)
+		n.markDirty()
 		return
 	}
 

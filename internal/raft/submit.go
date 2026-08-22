@@ -57,6 +57,9 @@ func (n *Node) appendAndReplicate(entry LogEntry) (index int, term int, isLeader
 	index = n.lastLogIndex()
 	term = n.currentTerm
 
+	n.markDirty()
+	n.persistIfDirty()
+
 	// The append is itself replication evidence, and in a single-node cluster it
 	// is the only evidence there will ever be. Every other call to
 	// advanceCommitIndex hangs off an AppendEntries reply, so a cluster with no

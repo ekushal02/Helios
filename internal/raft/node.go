@@ -35,13 +35,15 @@ const None = -1 //no vote yet
 type Node struct {
 	mu sync.Mutex //guards every field below
 
-	id          int          // Node's ID
-	peers       []int        //ids of all the other nodes in the cluster
-	transport   Transport    //how this node reaches peers
-	logger      *slog.Logger //nil until SetLogger; lg() falls back to discard
-	currentTerm int          //current election term
-	votedFor    int          //current vote
-	log         []LogEntry   //replicated commands
+	id           int          // Node's ID
+	peers        []int        //ids of all the other nodes in the cluster
+	transport    Transport    //how this node reaches peers
+	logger       *slog.Logger //nil until SetLogger; lg() falls back to discard
+	currentTerm  int          //current election term
+	votedFor     int          //current vote
+	log          []LogEntry   //replicated commands
+	storage      Storage      // where currentTerm, votedFor and log survive a restart
+	persistDirty bool         // set by markDirty, cleared by persistIfDirty
 
 	commitIndex int   //last commited
 	lastApplied int   //last executed
@@ -51,25 +53,12 @@ type Node struct {
 	nextIndex  map[int]int // guess: where to send next. Optimistic.
 	matchIndex map[int]int // proven: replicated up to here. Pessimistic.
 
-	// lastContact records, per peer, the SEND time of the most recent message
-	// that peer answered. It is the raw material for the read lease: a majority
-	// of these being recent is what entitles this node to answer a read from
-	// local state without a round trip. See read.go.
-	//
-	// Reinitialised with the other two on every election, so a lease is never
-	// inherited from a term this node no longer holds.
-	lastContact map[int]time.Time
+	lastContact map[int]time.Time // lastContact records, per peer, the SEND time of the most recent message that peer answered.
 
 	electionDeadline time.Time     //election starting timer
 	rng              *rand.Rand    //randomised election timeout
 	stopCh           chan struct{} //shut ticker down
 
-	// --- apply path. Only applier() sends on applyCh; see apply.go. ---
-	//
-	// None of these are guarded by mu, which is the point: applyNotify is
-	// written under mu but never blocks, and applyCh is only ever touched by
-	// the applier goroutine with the lock released. Shutdown reuses stopCh
-	// rather than adding a second stop signal, so Stop needs no change.
 	applyCh     chan ApplyMsg // committed entries, in index order, one consumer
 	applyNotify chan struct{} // capacity 1: "commitIndex moved"
 	applierDone chan struct{} // closed when applier() returns
@@ -88,6 +77,7 @@ func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 		votedFor:    None,
 		leaderID:    None,
 		log:         []LogEntry{{Term: 0}},
+		storage:     NewMemoryStorage(),
 		commitIndex: 0,
 		lastApplied: 0,
 		state:       Follower,

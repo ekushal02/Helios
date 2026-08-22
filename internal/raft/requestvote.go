@@ -18,6 +18,8 @@ func (n *Node) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	defer n.persistIfDirty()
+
 	// --- Rules for Servers, All Servers ---
 	// "If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower."
 	n.stepDownIfStale(args.Term)
@@ -42,6 +44,7 @@ func (n *Node) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	n.votedFor = args.CandidateID
+	n.markDirty()
 	reply.VoteGranted = true
 
 	n.resetElectionTimer()

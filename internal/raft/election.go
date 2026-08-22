@@ -91,9 +91,8 @@ func (n *Node) becomeCandidate() {
 	n.votedFor = n.id // a real vote, counted toward majority()
 	n.resetElectionTimer()
 
-	// TODO (D-1): currentTerm and votedFor are persistent state and must reach
-	// stable storage before this node sends or answers any RPC in the new term.
-	//     n.persist()
+	n.markDirty()
+	n.persistIfDirty()
 
 	// Snapshot everything the election needs WHILE the lock is held, so
 	// runElection never has to touch node state to build its request.
@@ -122,9 +121,7 @@ func (n *Node) becomeFollower(term int) {
 		n.leaderID = None
 		n.votedFor = None
 
-		// TODO (D-1): both fields just changed and must reach stable storage
-		// before this node responds to anything.
-		//     n.persist()
+		n.markDirty()
 	}
 
 	n.state = Follower
