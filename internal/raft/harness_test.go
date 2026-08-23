@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"sync"
@@ -30,15 +31,9 @@ type fakeNetwork struct {
 	rpcCount  int //for asserting things like "the minority got no votes"
 	dropCount int //requests plus replies actually discarded
 
-	// Reorder accounting, C-15.
-	//
-	// Reordering is not a setting. It is what happens when replicateAll gives
-	// every message its own goroutine and route gives every goroutine its own
-	// random delay: a message overtakes an earlier one to the same peer
-	// whenever it draws a shorter delay than the gap between them. Under client
-	// load that gap is microseconds and inversions are constant; on an idle
-	// cluster with 50ms between heartbeats and a 10ms jitter range they are
-	// impossible. So there is no rate to dial, only a count to observe.
+	appendRPCs     int // AppendEntries messages actually delivered
+	entriesShipped int // entries carried across all of them
+
 	nextSeq     map[[2]int]int //next stamp per directed pair, assigned at send
 	lastArrived map[[2]int]int //highest stamp delivered per directed pair
 	reordered   int            //messages that arrived behind a later-sent one
@@ -167,6 +162,26 @@ func (fn *fakeNetwork) drops() int {
 	return fn.dropCount
 }
 
+func (fn *fakeNetwork) countAppend(entries int) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	fn.appendRPCs++
+	fn.entriesShipped += entries
+}
+
+func (fn *fakeNetwork) appendStats() (msgs, entries int) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	return fn.appendRPCs, fn.entriesShipped
+}
+
+func (fn *fakeNetwork) resetCounters() {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	fn.rpcCount, fn.dropCount = 0, 0
+	fn.appendRPCs, fn.entriesShipped = 0, 0
+}
+
 func (fn *fakeNetwork) reorderedCount() int {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
@@ -219,6 +234,8 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 
 	var argsCopy AppendEntriesArgs
 	mustRoundTrip(args, &argsCopy)
+
+	e.net.countAppend(len(argsCopy.Entries))
 
 	var replyCopy AppendEntriesReply
 	target.AppendEntries(&argsCopy, &replyCopy)
@@ -320,7 +337,14 @@ type cluster struct {
 	nodes []*Node
 	seed  int64
 
-	mu   sync.Mutex   //guards dead
+	// Storage belongs to the SLOT, not the Node: it is what survives a crash
+	// and what a restarted Node is built over.
+	storage    []*crashableStorage
+	baseLogger *slog.Logger
+	applyHook  func(node int, msg ApplyMsg)
+	applyWG    sync.WaitGroup
+
+	mu   sync.Mutex   //guards dead and nodes
 	dead map[int]bool //ids killed via kill()
 }
 
@@ -335,6 +359,7 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 	t.Cleanup(c.stop)
 
 	base := newTestLogger(t, seed)
+	c.baseLogger = base
 
 	for i := 0; i < n; i++ {
 		var peers []int
@@ -343,7 +368,14 @@ func newCluster(t *testing.T, n int, seed int64) *cluster {
 				peers = append(peers, j)
 			}
 		}
-		node := NewNode(i, peers, net.endpoint(i), seed*1_000_003+int64(i))
+
+		store := newCrashableStorage()
+		c.storage = append(c.storage, store)
+
+		node, err := OpenNode(i, peers, net.endpoint(i), seed*1_000_003+int64(i), store)
+		if err != nil {
+			t.Fatalf("building node %d: %v", i, err)
+		}
 		node.SetLogger(base)
 		net.register(node)
 		c.nodes = append(c.nodes, node)

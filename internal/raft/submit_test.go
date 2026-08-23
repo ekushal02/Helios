@@ -280,6 +280,17 @@ func TestSentEntriesSurviveLogChanges(t *testing.T) {
 	tr := newRecordingTransport(5)
 	n := leaderWithTransport(t, tr, 5)
 
+	// DRAIN THE FAN-OUT becomeLeader STARTED. It carries no entries, because at
+	// that instant the log is still just the sentinel. Without a mark, the
+	// assertion below can land on one of those instead of on the message this
+	// test is actually about.
+	//
+	// This was always a race. Coalescing only made it likely: while the initial
+	// round holds the peer's slot, the test's own replicateAll becomes a pending
+	// flag rather than a send, so the two empty messages are reliably the first
+	// two recorded.
+	mark := drainInitialFanOut(t, tr, len(n.peers))
+
 	n.mu.Lock()
 	n.log = append(n.log,
 		LogEntry{Term: 5, Command: []byte("a")},
@@ -290,9 +301,21 @@ func TestSentEntriesSurviveLogChanges(t *testing.T) {
 	n.mu.Unlock()
 
 	n.replicateAll(5)
-	msgs := tr.waitForMessages(t, 2, time.Second)
+	msgs := tr.waitForMessagesAfter(t, mark, 1, time.Second)
 
-	sent := msgs[0]
+	// The first message after the mark that carried anything. A heartbeat tick
+	// can still slip in ahead of it, and an empty message would prove nothing
+	// about entries surviving a rewrite.
+	var sent *AppendEntriesArgs
+	for _, m := range msgs {
+		if len(m.Entries) > 0 {
+			sent = m
+			break
+		}
+	}
+	if sent == nil {
+		t.Fatal("no message carried entries after the initial fan-out")
+	}
 	if len(sent.Entries) != 2 {
 		t.Fatalf("test setup wrong: sent %d entries, want 2", len(sent.Entries))
 	}

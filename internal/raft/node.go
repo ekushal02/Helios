@@ -53,6 +53,10 @@ type Node struct {
 	nextIndex  map[int]int // guess: where to send next. Optimistic.
 	matchIndex map[int]int // proven: replicated up to here. Pessimistic.
 
+	replicatingTerm map[int]int  // peer -> term of the round in flight, 0 when idle
+	replPending     map[int]bool // peer -> a trigger arrived while a round was out
+	noCoalesce      bool         // measurement only: one fan-out per Submit, as it was
+
 	lastContact map[int]time.Time // lastContact records, per peer, the SEND time of the most recent message that peer answered.
 
 	electionDeadline time.Time     //election starting timer
@@ -69,20 +73,22 @@ type Node struct {
 // New node returns a node in the state every RAFT server starts in: follower
 func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 	n := &Node{
-		id:          id,
-		peers:       peers,
-		transport:   transport,
-		logger:      discardLogger,
-		currentTerm: 0,
-		votedFor:    None,
-		leaderID:    None,
-		log:         []LogEntry{{Term: 0}},
-		storage:     NewMemoryStorage(),
-		commitIndex: 0,
-		lastApplied: 0,
-		state:       Follower,
-		rng:         rand.New(rand.NewSource(seed)),
-		stopCh:      make(chan struct{}),
+		id:              id,
+		peers:           peers,
+		transport:       transport,
+		logger:          discardLogger,
+		currentTerm:     0,
+		votedFor:        None,
+		leaderID:        None,
+		log:             []LogEntry{{Term: 0}},
+		storage:         NewMemoryStorage(),
+		replicatingTerm: make(map[int]int),
+		replPending:     make(map[int]bool),
+		commitIndex:     0,
+		lastApplied:     0,
+		state:           Follower,
+		rng:             rand.New(rand.NewSource(seed)),
+		stopCh:          make(chan struct{}),
 	}
 
 	// The applier starts here rather than on becoming leader, because followers

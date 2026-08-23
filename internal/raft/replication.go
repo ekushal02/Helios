@@ -10,6 +10,23 @@ import "time"
 //
 // This is the single send path. A heartbeat is not a separate kind of message:
 // it is whatever this produces when a follower happens to be caught up.
+//
+// AT MOST ONE ROUND IS IN FLIGHT PER PEER, and that is what turns a burst of
+// client writes into one message.
+//
+// Submit returns as soon as the entry is appended and persisted, so a thousand
+// concurrent clients put a thousand entries in the log in the time it takes one
+// AppendEntries to reach a follower and come back. One fan-out per Submit means
+// a thousand messages, each rebuilding log[nextIndex:] from a nextIndex that
+// has barely moved -- a thousand messages carrying hundreds of entries each,
+// gob-encoded, to ship a thousand entries. Quadratic work for linear progress.
+//
+// So a trigger that arrives while a round is outstanding sets a flag instead of
+// starting a second round. When the round finishes it looks at the flag and, if
+// set, builds ONE new message from the current nextIndex -- which by then
+// covers everything that accumulated while it was away. The batching window is
+// the round trip itself. There is no interval to tune, and an idle cluster is
+// unaffected because there is never anything pending.
 func (n *Node) replicateAll(term int) {
 	n.mu.Lock()
 
@@ -18,18 +35,73 @@ func (n *Node) replicateAll(term int) {
 		return
 	}
 
+	coalesce := !n.noCoalesce
+
 	// Build every message under the lock, ONE STRUCT PER PEER. Peers sit at
 	// different points in their logs, so sharing an args pointer would send
 	// them each other's consistency checks.
 	msgs := make(map[int]*AppendEntriesArgs, len(n.peers))
 	for _, p := range n.peers {
+		if coalesce && n.replicatingTerm[p] == term {
+			// A round is already out to this peer. Fold this trigger into the
+			// message that round will send when it returns.
+			n.replPending[p] = true
+			continue
+		}
+		if coalesce {
+			n.replicatingTerm[p] = term
+		}
 		msgs[p] = n.buildAppendEntries(p, term)
 	}
 
 	n.mu.Unlock() // never send RPCs holding the lock
 
 	for peer, args := range msgs {
-		go n.sendAppendEntries(peer, term, args)
+		if coalesce {
+			go n.replicateRound(peer, term, args)
+		} else {
+			go n.sendAppendEntries(peer, term, args)
+		}
+	}
+}
+
+// replicateRound sends to one peer and keeps sending for as long as work piled
+// up behind the message it was waiting on.
+//
+// It owns the peer's in-flight slot for the whole time it runs, and it is the
+// only thing that clears it. The slot holds a TERM rather than a bool so that a
+// round left over from a deposed leadership cannot free a slot that a newer
+// term's round is holding.
+//
+// A peer that stops answering therefore stops receiving until its send returns.
+// That is the correct behaviour -- piling messages on an unresponsive follower
+// helps nobody -- but it does mean Transport.SendAppendEntries has to bound how
+// long it can block. The fake network returns immediately when a peer is
+// unreachable; a real transport needs a deadline.
+func (n *Node) replicateRound(peer int, term int, args *AppendEntriesArgs) {
+	for args != nil {
+		n.sendAppendEntries(peer, term, args)
+
+		n.mu.Lock()
+
+		more := n.replPending[peer]
+		n.replPending[peer] = false
+
+		if !more || n.state != Leader || n.currentTerm != term {
+			// Release the slot, but only if it is still ours.
+			if n.replicatingTerm[peer] == term {
+				n.replicatingTerm[peer] = 0
+			}
+			n.mu.Unlock()
+			return
+		}
+
+		// One message for everything that arrived while the last one was out.
+		// Built from the CURRENT nextIndex, so a reply that landed in the
+		// meantime is already accounted for.
+		args = n.buildAppendEntries(peer, term)
+
+		n.mu.Unlock()
 	}
 }
 

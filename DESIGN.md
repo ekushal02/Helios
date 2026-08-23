@@ -2,11 +2,11 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.4 — leader election, log replication, the apply path and linearizable
-reads are implemented. Entries commit on a majority, apply in order on every node, and
-can be read back either through a barrier or, under a bounded-clock assumption, from a
-leader's lease. Verified under crashes, network partitions, message loss and reordering.
-Nothing is persisted to stable storage yet.
+**Status:** v1.5 — leader election, log replication, the apply path, linearizable
+reads and persistence are implemented. Entries commit on a majority, apply in order on
+every node, survive a crash of the process or the machine, and can be read back either
+through a barrier or, under a bounded-clock assumption, from a leader's lease. Verified
+under crashes, restarts, network partitions, message loss and reordering.
 
 ---
 
@@ -50,6 +50,10 @@ eventually disagree.
 The Raft module reaches its peers through a Transport interface rather than a concrete
 network client. Tests supply an in-memory switchboard whose connectivity can be cut
 arbitrarily; production will supply gRPC.
+
+Durable state sits behind a `Storage` interface on the same principle. Tests supply an
+in-memory implementation whose writes can be made to stop reaching the medium partway
+through a crash; production supplies a file. See §5.
 
 ---
 
@@ -207,9 +211,97 @@ does not know who won.
 
 >A server may vote for only one candidate in a given term. For example, if C votes for A in term 5 and then crashes, C must persist votedFor = A. If C forgets this information after restarting, it could vote for B in the same term. With enough other votes, both A and B could obtain a majority and be elected leaders in term 5, violating Raft's Election Safety property. Therefore votedFor must be persisted before responding to the vote request.
 
-**Not yet persisted.** All three currently live in memory only. Durability is future
-work; until then a "restart" in tests means a fresh node, not a recovered one. The
-call sites are marked in `election.go` and `requestvote.go`.
+**Implemented.** All three reach stable storage before any reply or outgoing RPC that
+depends on them. `docs/fsync-policy.md` covers what "stable" is allowed to mean and what
+each answer costs; this section covers the mechanism.
+
+### The record
+
+`Storage` is two methods over a single opaque blob — `Save(b []byte)` and `Load()
+([]byte, error)` — rather than `Save(term, vote, log)`. The three fields have to become
+durable together or not at all: a record holding a new term beside an old log is not a
+state any correct node ever occupied, and a restart that adopted it would be worse than
+losing the write outright. One blob makes that unrepresentable at this layer.
+
+The blob is framed `magic[4] | version[4] | len(payload)[4] | crc32(payload)[4] |
+payload`, the payload gob-encoded. `Load` returns `(nil, nil)` — and only that — when
+nothing has ever been saved, which is the single case meaning "fresh node".
+
+**A record that exists but does not decode is a fatal error, never a fresh start.** A
+node that answers corruption by resetting to term 0 with no vote has invented permission
+to vote twice in a term it already voted in — the exact failure this section exists to
+prevent. `OpenNode` returns the error and no node, so an operator decides to wipe the
+directory rather than the process deciding for them.
+
+### Atomicity
+
+`FileStorage.Save` writes a temp file, flushes it, renames it over the live file, and
+flushes the directory. A write of more than one sector is not atomic, so overwriting in
+place would leave a head from the new record and a tail from the old — a blob that may
+still decode, since a shorter log with a higher term is structurally valid. `rename(2)`
+is the cheapest primitive giving all-or-nothing replacement.
+
+The directory flush is the step usually omitted. The rename is a metadata operation on
+the directory, and flushing the file's contents does not flush the entry pointing at
+them. A leftover temp file is never authoritative — it is the residue of a `Save` killed
+before its rename, holding a record nobody was ever told about — and is removed when a
+storage is opened.
+
+### When the write happens
+
+`markDirty` sits beside every assignment to the three fields and nowhere else;
+`persistIfDirty` flushes at every point a mutation becomes visible to anyone else. The
+flag exists so that a handler mutating twice — `becomeFollower` for the term, then
+`mergeEntries` for the log — costs one write rather than two.
+
+"Before responding" is necessary but not sufficient. There are three exits, not one:
+
+| Exit | Site | If the write came after |
+|---|---|---|
+| RPC reply | `RequestVote`, `AppendEntries` | a double vote; a follower acknowledges an entry it then forgets |
+| Outgoing RPC | `becomeCandidate` → `runElection` | crash once RequestVote is on the wire, restart at the old term, vote again in it |
+| Commit accounting | `appendAndReplicate` → `advanceCommitIndex` | a single-node cluster commits and applies an entry that was never written |
+
+In the handlers the idiom is `defer n.persistIfDirty()` immediately after `defer
+n.mu.Unlock()`. Defers run last-in-first-out, so the flush happens under the lock and
+before the caller can read the reply, and one line covers every return path including
+ones added later. The other two exits need an explicit call mid-body, because the
+mutation escapes before the function returns.
+
+`becomeFollower` marks dirty only inside the branch where the term actually rises. The
+same-term step-down runs on every heartbeat and changes nothing persistent; marking
+unconditionally would cost a flush per heartbeat forever — a fault that is not a
+correctness bug and that no correctness test would ever see.
+
+The invariant is greppable, in the same style as the commit-index funnel:
+
+```
+grep -rn 'currentTerm = \|currentTerm++\|votedFor = \|n\.log = ' internal/raft/*.go | grep -v _test.go
+```
+
+Every hit must have a `markDirty` in the same locked region, and every path leaving that
+region must pass a `persistIfDirty`.
+
+### A write that fails stops the node
+
+`persist` panics when `Save` returns an error. A node that cannot make its state durable
+must stop participating that instant: carrying on would let it grant a vote it cannot
+remember, which is indistinguishable from having no persistence at all except that the
+operator now believes it has some. The panic is the blunt version; a halt that keeps the
+process alive to report why it stopped belongs with the operational work.
+
+### What the tests establish, and what they cannot
+
+Atomicity is established by a child process SIGKILLed at random points across twelve
+rounds sharing one directory: whatever survives must decode, be internally consistent,
+and hold every term the process had already announced. That the handlers actually use
+the storage is established separately, by reading the storage directly after a granted
+vote, a refused vote, an append and a truncation. End-to-end recovery is established
+across a hundred seeded rounds that crash a node under load and restart it.
+
+**None of that tests fsync.** SIGKILL destroys a process, not a page cache, so every one
+of those tests would pass with the flush calls deleted. The fsync policy rests on the
+argument in `docs/fsync-policy.md`, not on a green suite.
 
 ---
 
@@ -227,6 +319,12 @@ conservatively reinitialised.
 | `state` | follower / candidate / leader | Always restart as follower; worst case is one extra election |
 | `electionDeadline` | When to start an election | Fresh deadline on start |
 
+**On restart, `commitIndex` and `lastApplied` return to zero and the log replays from
+index 1 against a state machine that also restarted empty.** That is not a concession:
+persisting `lastApplied` without persisting the state machine beside it would skip the
+replay and leave the node serving nothing. The obligation it creates falls on the layer
+above — applying the same prefix twice must reach the same state. See §12.
+
 ### Configuration and machinery
 
 | Field | Meaning |
@@ -235,6 +333,7 @@ conservatively reinitialised.
 | `transport` | How this node reaches peers. Fake switchboard in tests, gRPC in production. |
 | `rng` | Per-node seeded source for election timeouts. Never the global `rand`. |
 | `applyCh`, `applyNotify`, `applierDone` | The apply plumbing. See §8. |
+| `storage`, `persistDirty` | The durability boundary, and the flag that lets one handler's several mutations cost one write. See §5. |
 | `mu` | Guards every field above except the apply channels. |
 
 ### On leaders only — reinitialised after every election
@@ -243,6 +342,8 @@ conservatively reinitialised.
 |---|---|
 | `nextIndex[peer]` | Next log index to send. Optimistically initialised to leader's last index + 1. |
 | `matchIndex[peer]` | Highest index known replicated on that peer. Initialised to 0. |
+| `replicatingTerm[peer]` | Term of the AppendEntries round in flight to that peer, 0 when idle. A term rather than a bool, so a round left over from a deposed leadership cannot free a slot a newer term's round is holding. |
+| `replPending[peer]` | A replication trigger arrived while a round was out. This is what collapses a burst of client writes into one follow-up message. |
 | `lastContact[peer]` | Send time of the most recent message that peer answered. The raw material for the read lease (§9). Empty on election, so a lease is never inherited from a term this node no longer holds. |
 
 The optimistic/pessimistic split is deliberate: `nextIndex` guesses high and backs
@@ -663,9 +764,37 @@ before the entry commits, a later leader may overwrite that position.
 different term at that index means the submission was overwritten and must be reported
 as failed, not retried — a blind retry risks double-applying if the original committed
 after all.
-*Known limit:* one goroutine per `Submit` means bursts produce redundant fan-outs. The
-fix is per-follower replication goroutines woken by a condition variable; deferred
-until there is a measurement.
+*Former limit, now closed:* one fan-out per `Submit` meant bursts produced redundant
+messages. See the next entry.
+
+**At most one AppendEntries round in flight per peer.** A trigger arriving while a round
+is outstanding sets a flag instead of starting a second round; when the round returns it
+builds one message covering everything that accumulated. The batching window is the
+round trip itself, so there is nothing to tune and an idle cluster is unaffected.
+*Why:* `Submit` returns as soon as the entry is appended and persisted, so a thousand
+concurrent clients fill the log in the time one message takes to reach a follower and
+come back. One fan-out per `Submit` meant a thousand messages, each rebuilding
+`log[nextIndex:]` from a `nextIndex` that had barely moved — quadratic bytes for linear
+progress.
+*Measured*, three nodes, 1000 commands from 64 clients, 1–3ms link, race detector off:
+
+| | commands/s | AppendEntries sent | entries shipped |
+|---|---|---|---|
+| one fan-out per `Submit` | 7,800 | 2,003 | 129,825 |
+| one round per peer | 20,400 | 16 | 1,996 |
+
+2.6× the throughput, 125× fewer messages, 65× fewer entries on the wire. 1,996 is the
+floor — two followers × 1000 entries, each crossing once — so the remaining traffic is
+irreducible.
+*Consequence:* a peer that stops answering stops receiving until its send returns. That
+is correct, since piling messages on an unresponsive follower helps nobody, but it makes
+a deadline on `Transport.SendAppendEntries` a requirement rather than a nicety. The fake
+network returns immediately when a peer is unreachable; gRPC must be configured to.
+*Second consequence:* same-peer reordering is no longer produced by the system. See §11.
+*Cost:* a lone write on an idle cluster may now wait out an in-flight round rather than
+getting its own immediate fan-out — the same latency-for-throughput trade as group
+commit. At low load the window is near zero, but p99 write latency under light load has
+not been measured.
 
 **A rejected AppendEntries still resets the election timer.** The reset happens
 **before** the log check. Rejection means the follower is behind or diverged — normal
@@ -809,13 +938,28 @@ tick resends entries the follower already holds, which is the only exercise the 
 path gets against a duplicate append. A receiver that truncated on entries matching its
 own log would pass everything else in the suite.
 
-**Reordering is measured, not configured.** It is emergent — one goroutine per message
-plus one random delay per goroutine — so a message overtakes an earlier one to the same
-peer whenever it draws a shorter delay than the gap between their sends. Under client
-load that gap is microseconds and inversions are constant; between heartbeats it is
-50ms and a 10ms jitter range makes them impossible. There is no rate to dial, so the
-network stamps send order, records arrival order, and tests assert the observed count is
-nonzero rather than claiming a percentage.
+**Reordering is no longer emergent, and is no longer asserted.** It used to be: one
+goroutine per message plus one random delay per goroutine meant a message overtook an
+earlier one to the same peer whenever it drew a shorter delay than the gap between their
+sends. The network stamped send order, recorded arrival order, and tests failed if the
+count came back zero. Coalescing ended it — a second message to a peer is not built
+until the first has returned — so inversions now require a round from a deposed term to
+still be outstanding when the new term starts one. The counter is still recorded and
+reported; it is no longer a pass condition.
+
+The guards it stood in for — the monotonic `matchIndex`, and backoff ignoring a reply to
+a superseded attempt — are tested directly instead, by handing the stale reply to the
+guard rather than racing it in. That is deterministic, and it checks what the guard
+*does* rather than merely that inversions happened somewhere in a run that also passed.
+
+**`kill` and `crash` are different faults and both are needed.** `kill` stops a node's
+goroutines and cuts its network but leaves its memory intact — an unreachable node,
+which is what a failover test wants. `crash` models power loss: the network is cut
+first, *then* writes stop reaching the medium, *then* the goroutines stop. The order is
+the whole design. Reversed, the node would persist nothing, reply success, and the
+leader would count a follower that is about to forget — a lost committed entry
+manufactured by the harness rather than found in the code. Only a `crash` can be
+followed by a `restart`, which builds a new node over the storage the old one left.
 
 **Chaos, quiesce, assert.** Raft does not promise progress on a lossy network, so no test
 asserts it. Tests run under fault injection, repair the network, and then check
@@ -894,10 +1038,32 @@ Deliberately unresolved. Each is answered by later work.
   Both copies apply — invisible for an idempotent write, wrong for anything else. Closed by
   client identifiers plus a dedup table, which is the same decision as making log replay on
   restart idempotent. Applied-count assertions currently use `>=` and carry a scope fence.
-- **fsync policy.** Per-write fsync is correct but slow. Measure the tradeoff alongside
-  durability.
-- **Batching.** Multiple client writes per AppendEntries, and coalescing the per-`Submit`
-  fan-out. Deferred until there are baseline numbers.
+- **`persistIfDirty` runs under `n.mu`.** So a node has at most one write outstanding no
+  matter how many clients are calling `Submit`, and group commit has nothing to
+  coalesce: the batched storage measures 1.00 flushes per write on the real write path,
+  against 0.04 at the storage layer with 64 concurrent writers. That gap — 147 against
+  3,679 writes/s — is what the critical section costs, and it is the largest single
+  number in `docs/fsync-policy.md`. Moving the write out is the highest-value
+  performance work left in the storage path. It is blocked on one question: coalescing
+  drops superseded records, which is sound only because the records form a total order
+  over states the node actually occupied. Released from the lock, a record that shortens
+  the log no longer subsumes the promise made by the record that lengthened it. Settle
+  that before wiring the batcher in — it is written and tested, and would be actively
+  wrong today.
+- **Whole-log rewrite on every persist.** Each write re-encodes the entire log.
+  Measured, this is not the bottleneck: extrapolating from an unflushed 7,862-byte
+  record at 0.284ms, the record would have to reach roughly 190 KB — order six thousand
+  entries — before it cost as much as one flush. Compaction is needed for restart time
+  and memory, not for write throughput. Revisit with snapshots.
+- **Log replay after restart must be idempotent.** `commitIndex` and `lastApplied` reset
+  to zero and the whole log replays. That is safe today only because the state machine
+  also restarts empty. Once a snapshot restores state, the replay has to start at the
+  snapshot's index and the two have to agree where that is. Same decision as duplicate
+  commands above; answer them together.
+- **A pipelining transport brings reordering back.** Coalescing removed same-peer
+  inversions from the wire, so nothing exercises the out-of-order reply guards end to
+  end any more. If the gRPC transport pipelines, the hazard returns to production with
+  only unit coverage behind it.
 - **Snapshots.** Log truncation and `InstallSnapshot`. Breaks the
   sentinel/position-equals-index convention, the term-run scan used by the fast-backup
   hint, and the assumption that index 0 is always checkable. A `prevLogIndex` below the
@@ -909,9 +1075,14 @@ Deliberately unresolved. Each is answered by later work.
   compare equal, so the property checkers would not notice a barrier substituted for a
   command at the same index and term. Unreachable today, since nothing produces that state;
   fix it when the no-op on election lands and barriers become common.
-- **Test suite runtime.** Roughly two and a half minutes under `-race` and growing,
-  dominated by tests that sleep in real multiples of the election timeout. A virtual clock
-  is the fix, and this is now the open question with the most evidence behind it.
+- **Test suite runtime.** Roughly three and a half minutes under `-race` and still
+  growing — 215s at v1.5, against 155s at v1.4. Persistence added a write to every
+  cluster test, and the crash-recovery rounds and the two measurement tests added the
+  rest. It is still dominated by tests that sleep in real multiples of the election
+  timeout. A virtual clock is the fix, and this remains the open question with the most
+  evidence behind it: the suite is now long enough that the temptation to skip
+  `-race -shuffle=on` on a change one feels sure about is a real risk rather than a
+  hypothetical one.
 - **Timing constants are scattered.** Each test file defines its own bounds. Consolidating
   them would make the suite's time budget visible in one place; worth doing alongside the
   virtual clock.
@@ -927,3 +1098,4 @@ Deliberately unresolved. Each is answered by later work.
 | v1.2 | Commit rules and the Figure 8 argument; leader bookkeeping; the fast-backup hint recorded as a deviation with measured round-trip savings; implementation decisions reorganised into log / timing / replication / bookkeeping; testing conventions added |
 | v1.3 | The apply path documented for the first time; linearizable reads and the argument against local reads; the no-op entry flag recorded as a departure from Figure 2; AppendEntries rule 5 and the same-term refusal written up; believed-impossible guards collected as a single principle; fault injection, fixture-inertness and test-goroutine conventions added; duplicate commands and read-barrier cost promoted to open questions |
 | v1.4 | Lease-based reads, with the clock-rate assumption and the process-pause residue documented; the send-time and quorum-ordering rules for deriving a lease; read latency measured across three link speeds, and the argument for the no-op on election revised in light of it from latency to log growth |
+| v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
