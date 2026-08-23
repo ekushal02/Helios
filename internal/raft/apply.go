@@ -8,24 +8,41 @@ package raft
 // be re-deriving an order this file has already established, and the two
 // derivations would eventually disagree.
 //
-// CommandValid exists so the message type can carry things that are not
-// commands. Read barriers send a false one: the index must reach the state
-// machine so a reader can observe it, but there is nothing to apply. Installed
-// snapshots will be the second case (Phase F), and they must travel on THIS
-// channel rather than a second one, because a snapshot and the entries after it
-// are a single ordered sequence. Two channels would let the state machine see
-// them interleaved.
+// THREE SHAPES, and exactly one of them applies to any given message.
 //
-// A consumer's obligation: on CommandValid false, advance your own index and
-// apply nothing. Treating it as an error -- which is the natural first draft --
-// makes every linearizable read look like a corrupt log.
+//   - CommandValid: a client command. Apply it and advance your index.
+//   - SnapshotValid: a state-machine image. Replace your state with it and set
+//     your index to SnapshotIndex.
+//   - Neither: a read barrier. Advance your index and apply nothing. Treating
+//     this as an error -- which is the natural first draft -- makes every
+//     linearizable read look like a corrupt log.
+//
+// Snapshots travel on THIS channel rather than a second one because an image
+// and the entries after it are a single ordered sequence. Two channels would
+// let the state machine see them interleaved, and a machine that applied entry
+// 41 before the image covering 1..40 would be wrong in a way neither side
+// could detect.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      []byte
 	CommandIndex int
 	CommandTerm  int
 
-	// TODO (F-*): SnapshotValid, Snapshot, SnapshotIndex, SnapshotTerm.
+	// SnapshotValid marks a state-machine image sent down from a leader that
+	// had already discarded the entries this node was missing.
+	//
+	// A consumer's obligation: REPLACE your state with Snapshot and set your
+	// own applied index to SnapshotIndex. Not merge -- the image is the whole
+	// state as of that index, and anything you had above it cannot exist,
+	// because Raft only sends an image a node has not already reached.
+	//
+	// It travels on THIS channel rather than a second one because a snapshot
+	// and the entries after it are one ordered sequence. Two channels would let
+	// the state machine see them interleaved.
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex int
+	SnapshotTerm  int
 }
 
 // -----------------------------------------------------------------------------
@@ -156,21 +173,61 @@ func (n *Node) applier() {
 	defer close(n.applyCh)
 
 	for {
+		n.mu.Lock()
+
+		// AN IMAGE JUMPS THE QUEUE, AND MUST BE HANDLED BEFORE THE BATCH IS
+		// COMPUTED.
+		//
+		// An installed snapshot moves the floor above lastApplied, because
+		// lastApplied only advances once the image has actually been handed
+		// over. So lastApplied+1 points at an index the log no longer holds,
+		// and building a batch from it would ask entryAt for the very entries
+		// the image exists to replace.
+		//
+		// The handler cannot deliver this itself: it holds mu, and sending on
+		// an unbuffered channel under the lock is the deadlock this whole
+		// design exists to prevent. It parks the image and signals; this is
+		// where it is picked up.
+		if snap := n.pendingSnapshot; snap != nil {
+			n.pendingSnapshot = nil
+			msg := ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snap.Data,
+				SnapshotIndex: snap.LastIncludedIndex,
+				SnapshotTerm:  snap.LastIncludedTerm,
+			}
+			n.mu.Unlock()
+
+			select {
+			case n.applyCh <- msg:
+			case <-n.stopCh:
+				return
+			}
+
+			// Past tense, exactly as for entries: the index moves only after
+			// the state machine has been given the image.
+			n.mu.Lock()
+			if msg.SnapshotIndex > n.lastApplied {
+				n.lastApplied = msg.SnapshotIndex
+			}
+			n.mu.Unlock()
+			continue
+		}
+
 		// COPY THE ENTRIES OUT UNDER THE LOCK. This is the reason a batch exists
-		// rather than reading n.log[i] just before each send.
+		// rather than reading the log just before each send.
 		//
 		// The instant mu is released, this node may receive an AppendEntries
-		// that truncates the log (C-5) or reallocates its backing array by
-		// appending. Reading n.log at send time would be a race in the plain
-		// sense and a correctness bug in the interesting sense: the entry
-		// delivered would not be the entry that was committed.
+		// that truncates the log (C-5), reallocate its backing array by
+		// appending, or compact away the front of it. Reading at send time
+		// would be a race in the plain sense and a correctness bug in the
+		// interesting sense: the entry delivered would not be the entry that
+		// was committed.
 		//
 		// Only the ApplyMsg structs are copied, so Command still aliases the
 		// log's bytes. That is safe under the invariant in DESIGN.md, pinned by
 		// TestSentEntryBytesAliasTheLogDeliberately: LogEntry.Command is
-		// immutable once appended. Truncation drops an entry, it never edits one
-		// in place.
-		n.mu.Lock()
+		// immutable once appended.
 		first, last := n.lastApplied+1, n.commitIndex
 
 		// THE LOG MUST COVER EVERYTHING COMMITTED, and if it does not, this
@@ -179,17 +236,11 @@ func (n *Node) applier() {
 		// Two invariants make this unreachable. commitTo refuses to raise
 		// commitIndex past lastLogIndex, and no rule in Figure 2 truncates an
 		// entry that some node has committed -- receiver rule 3 only ever
-		// removes a conflicting tail, which by the Log Matching property is
-		// uncommitted. So a shorter log than commitIndex means one of those two
-		// is broken.
+		// removes a conflicting tail, which by Log Matching is uncommitted.
 		//
 		// Clamping rather than indexing anyway is the difference between a
 		// logged fault on one node and a panic that takes down the process, in
-		// a goroutine nobody owns and nobody can recover. The Error line is what
-		// makes it a bug report rather than a silent swallow: search the log for
-		// it, and the fault is in whoever moved commitIndex or shortened the
-		// log, never in this file. Compare commitTo, which refuses the same
-		// impossible state at the other end.
+		// a goroutine nobody owns and nobody can recover.
 		if last > n.lastLogIndex() {
 			n.lg().Error("commitIndex is past the end of the log",
 				"commitIndex", last, "lastLogIndex", n.lastLogIndex(),
@@ -199,7 +250,11 @@ func (n *Node) applier() {
 
 		batch := make([]ApplyMsg, 0, max(0, last-first+1))
 		for i := first; i <= last; i++ {
-			e := n.log[i]
+			// Through the accessor, never n.log[i]. Position is not index once
+			// a snapshot floor exists, and a raw read here would deliver an
+			// entry from the wrong place in history while looking entirely
+			// plausible. See log.go.
+			e := n.entryAt(i)
 
 			// A BARRIER IS DELIVERED, NOT SKIPPED. It carries no command, so
 			// CommandValid is false and the state machine must not try to
@@ -218,12 +273,9 @@ func (n *Node) applier() {
 		n.mu.Unlock()
 
 		if len(batch) == 0 {
-			// Nothing to do. Wait for a commit or for shutdown.
-			//
-			// A spurious wake is possible and harmless: the token may have been
-			// left by a commit whose entries this goroutine already picked up on
-			// the previous pass. The loop finds an empty batch and comes back
-			// here.
+			// Nothing to do. Wait for a commit or for shutdown. A spurious wake
+			// is harmless: the token may have been left by a commit whose
+			// entries this goroutine already picked up on the previous pass.
 			select {
 			case <-n.applyNotify:
 			case <-n.stopCh:
@@ -238,31 +290,42 @@ func (n *Node) applier() {
 			case <-n.stopCh:
 				// Shutdown wins over delivery. The entries are still committed
 				// and still in the log; a restarted node reapplies them from
-				// index 1 (or from the snapshot, in Phase F). Blocking here for
-				// a consumer that may never arrive would make Stop hang, and a
-				// test suite that cannot stop a node cannot run the next test.
+				// the snapshot floor. Blocking here for a consumer that may
+				// never arrive would make Stop hang.
 				return
 			}
 
 			// lastApplied advances only AFTER the message has been handed over.
-			//
-			// The cheaper alternative -- set lastApplied = last before dropping
-			// the lock -- is a lie that surfaces two phases from now. lastApplied
-			// is what a linearizable read consults to decide the state machine is
-			// caught up (Phase D), and what a snapshot consults to decide which
-			// entries may be discarded (Phase F). Both need the Figure 2 meaning:
-			// applied, past tense. Reacquiring the lock per entry costs a mutex
-			// hop against a channel send that already cost a scheduler round
-			// trip.
+			// It is what a linearizable read consults to decide the state
+			// machine is caught up, and what Snapshot consults to decide which
+			// entries may be discarded. Both need the Figure 2 meaning:
+			// applied, past tense.
 			n.mu.Lock()
-			if msg.CommandIndex != n.lastApplied+1 {
-				// Believed impossible: this goroutine is the only writer of
-				// lastApplied and it walks the batch in order. If this fires, a
-				// second applier is running -- look for a duplicate initApplier.
-				n.lg().Error("apply order broken",
+
+			// EQUALITY IS EXPECTED, not a fault. A state machine that receives
+			// this message and immediately calls Snapshot has already told Raft
+			// it applied this index, before this goroutine got the lock back --
+			// the caller is authoritative about delivery, so Snapshot moves
+			// lastApplied forward on its behalf. Only a gap or a step backwards
+			// means something is genuinely wrong, and a step backwards means a
+			// second applier is running.
+			switch {
+			case msg.CommandIndex > n.lastApplied+1:
+				n.lg().Error("apply order broken: gap",
+					"delivered", msg.CommandIndex, "lastApplied", n.lastApplied)
+			case msg.CommandIndex < n.lastApplied:
+				n.lg().Error("apply order broken: delivered below lastApplied",
 					"delivered", msg.CommandIndex, "lastApplied", n.lastApplied)
 			}
-			n.lastApplied = msg.CommandIndex
+
+			if msg.CommandIndex > n.lastApplied {
+				n.lastApplied = msg.CommandIndex
+			}
+
+			// The only moment the compaction answer can change in the direction
+			// that matters: an image may only cover entries the state machine
+			// has actually applied.
+			n.maybeSignalSnapshot()
 			n.mu.Unlock()
 		}
 	}
@@ -273,9 +336,10 @@ func (n *Node) applier() {
 // -- an index that reappears carrying a different term means the submission was
 // overwritten. concurrent_test.go uses exactly that pair.
 //
-// TODO (D-*): a restarted node replays the log from index 1 through this same
-// channel. The state machine must therefore apply the same prefix twice with the
-// same result, or commands need identifiers so it can deduplicate. Whichever it
-// is, decide it before the restart path exists. The same identifiers close the
-// duplicate-command hole the concurrent test currently tolerates, which is why
-// they are one decision and not two.
+// RESOLVED (was: "a restarted node replays the log from index 1, so the state
+// machine must be idempotent or commands need identifiers"). Neither, in the
+// end. A restarted node replays from the SNAPSHOT FLOOR: the image is delivered
+// first and lastApplied starts at its index, so no prefix is ever applied twice.
+// The duplicate-command hole the concurrent test tolerates is a separate
+// question -- a client retrying across a leader change, not replay -- and still
+// wants request identifiers.

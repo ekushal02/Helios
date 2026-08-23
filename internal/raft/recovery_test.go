@@ -26,6 +26,7 @@ import (
 // about to forget -- a lost committed entry manufactured by the harness rather
 // than found in the code.
 type crashableStorage struct {
+	noSnapshots
 	mu        sync.Mutex
 	data      []byte
 	crashed   bool

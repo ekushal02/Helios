@@ -95,12 +95,12 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 // THE THING THIS FUNCTION EXISTS TO AVOID.
 //
 // Having passed the consistency check, it is tempting to truncate outright --
-// n.log = n.log[:prevLogIndex+1] -- and append. That is wrong, because RPCs
+// drop everything past prevLogIndex -- and append. That is wrong, because RPCs
 // arrive out of order.
 //
 // A leader sends entries 1..5, then 1..8. The 1..8 message lands first and this
 // node stores eight entries. The stale 1..5 message then arrives carrying
-// PrevLogIndex 0, which passes the consistency check because the sentinel always
+// PrevLogIndex 0, which passes the consistency check because the floor always
 // matches. Blind truncation would cut the log back to five and destroy 6, 7 and
 // 8 -- entries the leader may already have counted toward a majority and
 // committed. Nothing repairs that afterwards: the leader believes this node has
@@ -122,13 +122,24 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 		if idx > n.lastLogIndex() {
 			// Copies the entry structs out of the message rather than retaining
 			// the message's slice, so the log does not alias transport memory.
+			// Appending is a position operation and needs no translation.
 			n.log = append(n.log, entries[i:]...)
 			n.markDirty()
 			return
 		}
 
+		// AT OR BELOW THE FLOOR. Defensive: the consistency check passed, so
+		// prevLogIndex is at least the floor and idx is at least firstLogIndex.
+		// If it ever is not, the entry is one a snapshot already accounts for --
+		// committed, therefore identical by Log Matching -- and the only safe
+		// thing is to skip it. Truncating there would cut into committed
+		// history, which truncateFrom refuses anyway.
+		if idx < n.firstLogIndex() {
+			continue
+		}
+
 		// Same index, same term: by Log Matching this is the same entry.
-		if n.log[idx].Term == e.Term {
+		if n.termAt(idx) == e.Term {
 			continue
 		}
 
@@ -144,12 +155,14 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 		if idx <= n.commitIndex {
 			n.lg().Error("truncating at or below commitIndex",
 				"index", idx, "commitIndex", n.commitIndex,
-				"haveTerm", n.log[idx].Term, "wantTerm", e.Term)
+				"haveTerm", n.termAt(idx), "wantTerm", e.Term)
 		}
 
 		// Rule 3: delete the conflicting entry and every one after it, then
-		// append the leader's version over the same backing array.
-		n.log = append(n.log[:idx], entries[i:]...)
+		// append the leader's version. Through truncateFrom, which owns the
+		// index-to-position translation and refuses to cut into the floor.
+		n.truncateFrom(idx)
+		n.log = append(n.log, entries[i:]...)
 		n.markDirty()
 		return
 	}
@@ -164,24 +177,30 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 // logMatchesAt reports whether this node holds an entry at index whose term is
 // term. It is the whole of Figure 2's receiver rule 2.
 //
+// THE FLOOR IS CHECKABLE; ANYTHING BELOW IT IS NOT.
+//
+// Before compaction, index 0 was the sentinel: present on every node at term 0,
+// so a leader backing all the way off ALWAYS found agreement, which is what
+// guaranteed repair terminates. After compaction the same role is played by
+// lastIncludedIndex, whose term survives in the snapshot header precisely so
+// this check can still be answered at the boundary -- that is why the field
+// exists.
+//
+// An index BELOW the floor cannot be answered at all: the entry is gone. It is
+// rejected here, the hint sends the leader backwards, and the leader discovers
+// on its next attempt that it must send an image instead. That detour costs one
+// round trip and is the honest answer; claiming a match would be a lie and
+// claiming a mismatch at a specific term would be a guess.
+//
 // Caller must hold mu.
 func (n *Node) logMatchesAt(index int, term int) bool {
-	// A negative index cannot arise from a correct leader, but a malformed
-	// message must not panic the receiver.
-	if index < 0 {
+	// Out of range in either direction. Checked explicitly rather than left to
+	// termAt, whose out-of-range arm logs an Error -- a stale message reaching
+	// below the floor is ordinary, not a fault.
+	if index < n.lastIncludedIndex || index > n.lastLogIndex() {
 		return false
 	}
 
-	if index > n.lastLogIndex() {
-		return false
-	}
-
-	// Index 0 is the sentinel, present on every node at term 0, so a leader
-	// that has backed all the way off ALWAYS finds agreement here. That is what
-	// guarantees log repair terminates.
-	//
-	// TODO (Phase D): after snapshotting, index 0 is gone and the floor becomes
-	// lastIncludedIndex. A PrevLogIndex below that floor cannot be checked at
-	// all and must be answered with InstallSnapshot rather than a rejection.
-	return n.log[index].Term == term
+	// At the floor this returns lastIncludedTerm; above it, the entry's own.
+	return n.termAt(index) == term
 }

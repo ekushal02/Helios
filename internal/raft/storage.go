@@ -34,7 +34,34 @@ type Storage interface {
 	// saved. That is a fresh node. Every other failure is an error, including
 	// a blob that exists but cannot be read: see the note on decodeState.
 	Load() ([]byte, error)
+
+	// SaveSnapshot makes a state-machine image durable, replacing any earlier
+	// one. Same atomicity contract as Save: a crash leaves the whole previous
+	// image or the whole new one.
+	//
+	// SEPARATE FROM Save BECAUSE OF SIZE, not because the two are independent.
+	// The Figure 2 record is rewritten on every term change and every append;
+	// an image folded into it would make granting a vote cost a state-machine
+	// rewrite. What one blob gave for free the caller now owes:
+	//
+	//   ORDERING OBLIGATION. SaveSnapshot must complete before the Save that
+	//   discards the entries it covers. The two crash windows are not
+	//   symmetric. A snapshot written without the log yet truncated is
+	//   redundant and recovery drops the overlap; a log truncated without a
+	//   snapshot to cover it has lost committed state with nothing left that
+	//   knows. The write that ADDS information goes first.
+	//
+	// A snapshot must also never move backwards. This layer cannot check that
+	// -- the bytes are opaque here -- so the node enforces it before calling.
+	SaveSnapshot(b []byte) error
+
+	// LoadSnapshot returns the stored image, or (nil, nil) when none has ever
+	// been written.
+	LoadSnapshot() ([]byte, error)
 }
+
+// =============================================================================
+// MemoryStorage}
 
 // =============================================================================
 // MemoryStorage
@@ -51,6 +78,7 @@ type Storage interface {
 type MemoryStorage struct {
 	mu   sync.Mutex
 	data []byte
+	snap []byte
 }
 
 func NewMemoryStorage() *MemoryStorage { return &MemoryStorage{} }
@@ -71,6 +99,22 @@ func (s *MemoryStorage) Load() ([]byte, error) {
 		return nil, nil
 	}
 	return append([]byte(nil), s.data...), nil
+}
+
+func (s *MemoryStorage) SaveSnapshot(b []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap = append([]byte(nil), b...)
+	return nil
+}
+
+func (s *MemoryStorage) LoadSnapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.snap == nil {
+		return nil, nil
+	}
+	return append([]byte(nil), s.snap...), nil
 }
 
 // =============================================================================
@@ -119,6 +163,9 @@ func (p SyncPolicy) String() string {
 const (
 	stateFileName = "state.raft"
 	tempFileName  = "state.raft.tmp"
+
+	snapshotFileName = "snapshot.raft"
+	snapshotTempName = "snapshot.raft.tmp"
 )
 
 // FileStorage writes state to a single file in a directory, using the
@@ -142,6 +189,8 @@ type FileStorage struct {
 	dir    string
 	path   string
 	tmp    string
+	snap   string
+	snapT  string
 	policy SyncPolicy
 }
 
@@ -165,10 +214,15 @@ func NewFileStorageWithPolicy(dir string, policy SyncPolicy) (*FileStorage, erro
 		dir:    dir,
 		path:   filepath.Join(dir, stateFileName),
 		tmp:    filepath.Join(dir, tempFileName),
+		snap:   filepath.Join(dir, snapshotFileName),
+		snapT:  filepath.Join(dir, snapshotTempName),
 		policy: policy,
 	}
-	if err := os.Remove(s.tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
+	// Both temp files, for the same reason: neither is ever authoritative.
+	for _, tmp := range []string{s.tmp, s.snapT} {
+		if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -183,8 +237,26 @@ func (s *FileStorage) Policy() SyncPolicy { return s.policy }
 func (s *FileStorage) Save(b []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeAtomic(s.tmp, s.path, b)
+}
 
-	f, err := os.OpenFile(s.tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+// SaveSnapshot writes the state-machine image through the same sequence.
+//
+// It shares the mutex with Save even though the two touch different files.
+// They are never concurrent in practice -- the node writes the snapshot and
+// then the truncated log, in that order and from one goroutine -- and sharing
+// the lock makes it impossible for a future caller to interleave them by
+// accident.
+func (s *FileStorage) SaveSnapshot(b []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeAtomic(s.snapT, s.snap, b)
+}
+
+// writeAtomic is the write-temp / fsync / rename / fsync-dir sequence, shared
+// by both records because both need exactly the same guarantee. Caller holds mu.
+func (s *FileStorage) writeAtomic(tmp, path string, b []byte) error {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -193,7 +265,7 @@ func (s *FileStorage) Save(b []byte) error {
 		return err
 	}
 	// Contents durable before the name is switched. Doing these in the other
-	// order would let a crash expose an empty state.raft.
+	// order would let a crash expose an empty file.
 	if s.policy == SyncAlways {
 		if err := f.Sync(); err != nil {
 			f.Close()
@@ -205,7 +277,7 @@ func (s *FileStorage) Save(b []byte) error {
 	}
 	// The rename happens under every policy. Atomicity is not the thing being
 	// traded away here; durability is.
-	if err := os.Rename(s.tmp, s.path); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
 	if s.policy == SyncAlways {
@@ -217,10 +289,21 @@ func (s *FileStorage) Save(b []byte) error {
 func (s *FileStorage) Load() ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return readIfPresent(s.path)
+}
 
-	b, err := os.ReadFile(s.path)
+func (s *FileStorage) LoadSnapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return readIfPresent(s.snap)
+}
+
+// readIfPresent returns (nil, nil) for a file that has never been written,
+// which is the one condition callers are allowed to read as "fresh".
+func readIfPresent(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil // never saved: a genuinely fresh node
+		return nil, nil
 	}
 	if err != nil {
 		return nil, err
@@ -343,6 +426,13 @@ func (s *batchedStorage) Save(b []byte) error {
 }
 
 func (s *batchedStorage) Load() ([]byte, error) { return s.base.Load() }
+
+// Snapshots pass straight through. There is nothing to coalesce: they are
+// written on a log-length threshold rather than per RPC, so two are never in
+// flight at once, and a superseded image is not cheap to drop the way a
+// superseded 8 KB state record is.
+func (s *batchedStorage) SaveSnapshot(b []byte) error   { return s.base.SaveSnapshot(b) }
+func (s *batchedStorage) LoadSnapshot() ([]byte, error) { return s.base.LoadSnapshot() }
 
 // flusher is the only goroutine that touches the underlying storage.
 //

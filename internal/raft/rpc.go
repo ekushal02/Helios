@@ -4,6 +4,7 @@ package raft
 type Transport interface {
 	SendRequestVote(to int, args *RequestVoteArgs, reply *RequestVoteReply) bool
 	SendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool
+	SendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool
 }
 
 // It is the request for the RequestVote RPC, invoked by candidates

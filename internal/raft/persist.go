@@ -27,6 +27,22 @@ type persistentState struct {
 	CurrentTerm int
 	VotedFor    int
 	Log         []LogEntry
+
+	// LastIncludedIndex is the Raft index that Log[0] stands for.
+	//
+	// WITHOUT IT THE LOG IS AMBIGUOUS. Once compaction can shorten the log, the
+	// slice is relative: position 0 is the floor, not index 0. A four-entry
+	// record could be the full log of a node that has never snapshotted, or the
+	// tail of one whose floor sits at 6, and nothing else on disk distinguishes
+	// them. Reading the second as the first silently renumbers every entry.
+	//
+	// The floor's TERM needs no field of its own: Log[0] is the floor entry and
+	// already carries it.
+	//
+	// A record written before this field existed decodes it as zero, which is
+	// exactly "nothing discarded" -- the correct reading of an absolute log.
+	// That is why the record version does not change.
+	LastIncludedIndex int
 }
 
 const (
@@ -158,9 +174,10 @@ func (n *Node) persistIfDirty() {
 // Callers must hold n.mu.
 func (n *Node) persist() {
 	b, err := encodeState(persistentState{
-		CurrentTerm: n.currentTerm,
-		VotedFor:    n.votedFor,
-		Log:         n.log,
+		CurrentTerm:       n.currentTerm,
+		VotedFor:          n.votedFor,
+		Log:               n.log,
+		LastIncludedIndex: n.lastIncludedIndex,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("raft: node %d cannot encode its own state: %v", n.id, err))
@@ -213,17 +230,26 @@ func (n *Node) adoptState(ps persistentState) {
 	n.currentTerm = ps.CurrentTerm
 	n.votedFor = ps.VotedFor
 	n.log = ps.Log
+
+	// THE FLOOR GOES IN BEFORE ANYTHING READS THE LOG BY INDEX. Every accessor
+	// in log.go translates through lastIncludedIndex, so installing the log
+	// while the floor still says 0 would renumber every entry for as long as
+	// that window lasted.
+	n.lastIncludedIndex = ps.LastIncludedIndex
+
 	if len(n.log) == 0 {
-		// Defensive: the sentinel at index 0 should always have been saved,
-		// but lastLogTerm indexes log[len-1] unguarded, and an empty slice
-		// there is a panic rather than a wrong answer.
+		// Defensive: the floor entry should always have been saved, but
+		// lastLogTerm indexes log[len-1] unguarded and an empty slice there is
+		// a panic rather than a wrong answer. A log with no floor cannot be
+		// positioned, so it is treated as a fresh one.
 		n.log = []LogEntry{{Term: 0}}
+		n.lastIncludedIndex = 0
 	}
 
-	// state, commitIndex and lastApplied are left alone. Leadership is
-	// volatile -- a restarted leader is a follower until it wins another
-	// election -- and the two indices are volatile by Figure 2. The applier
-	// replays from zero against a state machine that also restarted empty.
+	// log[0] IS the floor entry, so its term is the floor's term. Deriving it
+	// rather than storing it twice means the two can never disagree.
+	n.lastIncludedTerm = n.log[0].Term
+
 	n.persistDirty = false
 }
 
@@ -242,6 +268,14 @@ func OpenNode(id int, peers []int, transport Transport, seed int64, storage Stor
 		return nil, fmt.Errorf("raft: node %d: %w", id, err)
 	}
 
+	// The snapshot is read here too, so that an unreadable one fails before a
+	// Node exists rather than after. Both records are validated in isolation
+	// first; they are reconciled below, once the log is positioned.
+	snap, hasSnap, err := loadSnapshot(storage)
+	if err != nil {
+		return nil, fmt.Errorf("raft: node %d: %w", id, err)
+	}
+
 	n := NewNode(id, peers, transport, seed)
 
 	// NewNode has already started the applier, so every field write from here
@@ -252,6 +286,23 @@ func OpenNode(id int, peers []int, transport Transport, seed int64, storage Stor
 	if found {
 		n.adoptState(ps)
 	}
+	if hasSnap {
+		// The two records are written separately and carry their own floors.
+		// Only their combination says whether this node's history is intact.
+		if err := n.reconcileSnapshot(snap); err != nil {
+			n.mu.Unlock()
+			n.Stop()
+			return nil, fmt.Errorf("raft: node %d: %w", id, err)
+		}
+		n.pendingSnapshot = &snap
+	}
+
+	// Everything at or below the floor is committed and applied by definition:
+	// that is what taking a snapshot means. With no snapshot the floor is 0 and
+	// this is the behaviour it always had.
+	n.commitIndex = n.lastIncludedIndex
+	n.lastApplied = n.lastIncludedIndex
+
 	n.mu.Unlock()
 
 	return n, nil

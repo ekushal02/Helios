@@ -59,6 +59,12 @@ func (n *Node) advanceCommitIndex() {
 	// The replica count is non-increasing as the index rises -- a node holding
 	// index N holds everything below it -- so there is nothing better further
 	// down.
+	//
+	// The scan cannot run past the floor. commitIndex is never below
+	// lastIncludedIndex (a snapshot only covers committed entries, and both
+	// Snapshot and InstallSnapshot raise commitIndex to the floor), so the loop
+	// condition already stops there. termAt would fail closed anyway, returning
+	// -1 and breaking on the §5.4.2 check below rather than matching anything.
 	for idx := n.lastLogIndex(); idx > n.commitIndex; idx-- {
 
 		// --- §5.4.2, THE FIGURE 8 CONDITION ---
@@ -81,7 +87,7 @@ func (n *Node) advanceCommitIndex() {
 		// A CURRENT-term entry on a majority closes that hole: every node in
 		// that majority now has a last-log term of at least currentTerm, so no
 		// candidate carrying an older tail can out-rank them.
-		if n.log[idx].Term != n.currentTerm {
+		if n.termAt(idx) != n.currentTerm {
 			break
 		}
 

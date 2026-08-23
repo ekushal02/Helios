@@ -28,6 +28,7 @@ import (
 // block inside Save, which is how a test observes what happens BEFORE a write
 // completes rather than after.
 type recordingStorage struct {
+	noSnapshots
 	mu    sync.Mutex
 	data  []byte
 	saves int

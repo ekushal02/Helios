@@ -60,7 +60,7 @@ func TestNextIndexAfterConflict(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := nextIndexAfterConflict(leader, tc.current, tc.conflictIndex, tc.conflictTerm)
+			got := nextIndexAfterConflict(leader, 0, tc.current, tc.conflictIndex, tc.conflictTerm)
 			if got != tc.want {
 				t.Errorf("nextIndexAfterConflict(current=%d, idx=%d, term=%d) = %d, want %d\n  %s",
 					tc.current, tc.conflictIndex, tc.conflictTerm, got, tc.want, tc.why)
@@ -80,7 +80,7 @@ func TestBackoffAlwaysMovesBackwards(t *testing.T) {
 	for current := 1; current <= len(leader); current++ {
 		for idx := -3; idx <= len(leader)+3; idx++ {
 			for _, term := range []int{noConflictTerm, 1, 2, 3, 4, 5, 6, 7, 9} {
-				got := nextIndexAfterConflict(leader, current, idx, term)
+				got := nextIndexAfterConflict(leader, 0, current, idx, term)
 
 				if current > 1 && got >= current {
 					t.Fatalf("current=%d idx=%d term=%d gave %d: backoff moved forward",
@@ -363,7 +363,7 @@ func naiveBackoff(current int, _ AppendEntriesReply) int {
 func TestFastBackupRoundTripSaving(t *testing.T) {
 	leaderLog := figure7Leader()
 	hinted := func(current int, reply AppendEntriesReply) int {
-		return nextIndexAfterConflict(leaderLog, current, reply.ConflictIndex, reply.ConflictTerm)
+		return nextIndexAfterConflict(leaderLog, 0, current, reply.ConflictIndex, reply.ConflictTerm)
 	}
 
 	want := map[string]struct{ naive, fast int }{
@@ -415,7 +415,7 @@ func TestFastBackupRoundTripSaving(t *testing.T) {
 func TestBothStrategiesConvergeIdentically(t *testing.T) {
 	leaderLog := figure7Leader()
 	hinted := func(current int, reply AppendEntriesReply) int {
-		return nextIndexAfterConflict(leaderLog, current, reply.ConflictIndex, reply.ConflictTerm)
+		return nextIndexAfterConflict(leaderLog, 0, current, reply.ConflictIndex, reply.ConflictTerm)
 	}
 
 	for _, spec := range figure7Followers() {

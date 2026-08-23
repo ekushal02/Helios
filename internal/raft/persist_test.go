@@ -9,6 +9,7 @@ import (
 
 // failingStorage lets a test watch what a node does when the disk says no.
 type failingStorage struct {
+	noSnapshots
 	inner Storage
 	fail  error
 	saves int

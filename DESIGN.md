@@ -2,11 +2,14 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.5 — leader election, log replication, the apply path, linearizable
-reads and persistence are implemented. Entries commit on a majority, apply in order on
-every node, survive a crash of the process or the machine, and can be read back either
-through a barrier or, under a bounded-clock assumption, from a leader's lease. Verified
-under crashes, restarts, network partitions, message loss and reordering.
+**Status:** v1.6 — leader election, log replication, the apply path, linearizable
+reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
+in order on every node, survive a crash of the process or the machine, and can be read
+back either through a barrier or, under a bounded-clock assumption, from a leader's
+lease. The log is compacted behind a state-machine image, and a follower that falls
+below the resulting floor is repaired with `InstallSnapshot` rather than entries.
+Verified under crashes, restarts, network partitions, message loss, reordering, and a
+node offline for ten thousand entries.
 
 ---
 
@@ -160,7 +163,7 @@ Sent by the leader. Does **two** jobs: log replication, and — with an empty
 |---|---|
 | `term` | Receiver's current term |
 | `success` | True if the follower contained an entry matching `prevLogIndex`/`prevLogTerm` |
-| `conflictIndex`, `conflictTerm` | Fast-backup hint. **Not Figure 2** — see §10. Set only on a log rejection. |
+| `conflictIndex`, `conflictTerm` | Fast-backup hint. **Not Figure 2** — see §10. Set only on a log rejection. A `prevLogIndex` below the snapshot floor takes the "too short" shape, because the entries are gone and this node cannot say what term they carried. |
 
 **Receiver rules**
 1. Reply false if `term < currentTerm`.
@@ -192,6 +195,62 @@ Helios refuses it anyway and logs an error, on the same principle as the other
 believed-impossible guards (§8). The damage from trusting the invariant here is silent
 and asymmetric — a rival's message would truncate the log this node is still
 replicating from, while its heartbeat loop carried on telling followers it leads.
+
+### 4.3 InstallSnapshot
+
+Sent by the leader when a follower's `nextIndex` has fallen to or below the leader's log
+floor — the entries it is owed no longer exist, so there is nothing to replicate and the
+image goes instead. See §5 for what the floor is and §10 for how the leader detects it.
+
+**Request**
+
+| Field | Meaning |
+|---|---|
+| `term` | Leader's term |
+| `leaderId` | So followers can redirect clients |
+| `lastIncludedIndex` | The last log index the image accounts for |
+| `lastIncludedTerm` | That entry's term |
+| `data` | The state-machine image, opaque to Raft |
+
+**Response**
+
+| Field | Meaning |
+|---|---|
+| `term` | Receiver's current term |
+
+**No `success` field, deliberately.** A follower that rejects on term deposes the leader,
+and the leader learns that from `term`. A follower that accepts has nothing to negotiate:
+the image is not a proposal. Any other failure is the follower's own and a retry on the
+next round is the whole remedy.
+
+**Receiver rules**
+1. Reply immediately if `term < currentTerm`.
+2. Discard an image at or below `commitIndex` — this node has already passed it, and
+   installing it would rewind the state machine. A leader can send one quite
+   legitimately, having decided to send before a burst of AppendEntries it had already
+   put on the wire arrived.
+3. Write the image to stable storage **before** discarding anything.
+4. If this node holds an entry at `lastIncludedIndex` with a matching term, keep
+   everything after it; otherwise discard the whole log.
+5. Hand the image to the state machine, and raise `commitIndex` to the floor.
+
+**Rule 4 is an optimisation, and it matters more than it looks.** If the entry matches,
+then by Log Matching everything before it agrees too, and the entries *after* it are as
+valid as they were a moment ago. Discarding them would throw away a tail the leader must
+then resend, turning a cheap repair into a full image plus a full retransmission.
+
+**A DEVIATION FROM FIGURE 13: no `offset` or `done`.** The paper chunks the image so a
+receiver can bound how much it buffers. Helios sends it whole, because the transport
+already materialises a whole message and chunking would add a reassembly state machine —
+with its own partial-transfer and leader-change-mid-transfer cases — to buy nothing at
+the sizes this system currently reaches. It becomes necessary when an image stops
+fitting comfortably in one RPC. That limit is real and is not measured.
+
+**Delivery to the state machine is deferred to the applier.** The handler holds `mu`, and
+sending on an unbuffered channel under the lock is the deadlock the single-applier design
+exists to prevent (§8). It parks the image and signals; the applier picks it up, delivers
+it, and only then advances `lastApplied`. That keeps one goroutine as the only sender on
+the apply channel, which is what makes delivery ordering mean anything.
 
 ---
 
@@ -226,6 +285,16 @@ losing the write outright. One blob makes that unrepresentable at this layer.
 The blob is framed `magic[4] | version[4] | len(payload)[4] | crc32(payload)[4] |
 payload`, the payload gob-encoded. `Load` returns `(nil, nil)` — and only that — when
 nothing has ever been saved, which is the single case meaning "fresh node".
+
+**The record also carries `lastIncludedIndex`, the Raft index that `Log[0]` stands for.**
+Without it the log is ambiguous once compaction can shorten it: the slice is relative,
+position 0 is the floor rather than index 0, and a four-entry record could equally be the
+whole log of a node that has never snapshotted or the tail of one whose floor sits at
+6,000. Reading the second as the first silently renumbers every entry. The floor's *term*
+needs no field of its own — `Log[0]` is the floor entry and already carries it, and
+deriving it means the two can never disagree. A record written before this field existed
+decodes it as zero, which is exactly "nothing discarded", so the record version did not
+need to change.
 
 **A record that exists but does not decode is a fatal error, never a fresh start.** A
 node that answers corruption by resetting to term 0 with no vote has invented permission
@@ -303,6 +372,71 @@ across a hundred seeded rounds that crash a node under load and restart it.
 of those tests would pass with the flush calls deleted. The fsync policy rests on the
 argument in `docs/fsync-policy.md`, not on a green suite.
 
+### The snapshot record
+
+A second durable object, in the same directory and under the same `Storage` interface:
+
+| Field | Meaning |
+|---|---|
+| `lastIncludedIndex` | The last log index the image accounts for |
+| `lastIncludedTerm` | That entry's term |
+| `data` | The state-machine image, opaque to Raft |
+
+Framed like the state record — magic, version, length, CRC32 — but by hand rather than
+through gob, because the payload is three fixed fields and a byte run that may be
+megabytes, and gob would reflect over the image and copy it again for nothing.
+
+**Why `lastIncludedTerm` is stored and not derived.** A leader may send AppendEntries
+with `prevLogIndex` equal to the floor, and the receiver has to answer the consistency
+check at that boundary — but the entry whose term the check needs was discarded when the
+snapshot was taken. The header is the only surviving record of it. Without the field a
+follower would reject every check at the floor and could never be repaired past it.
+
+**Why it is a separate record when §5 argues so hard for one blob.** Size. The state
+record is rewritten on every term change and every append; folding a multi-megabyte image
+into it would make granting a vote cost a full state-machine rewrite. The atomicity that
+one blob gave for free is replaced by an explicit ordering rule.
+
+**A record that exists but does not decode is fatal here too.** A node that treats an
+unreadable image as no image has silently rewound its own state machine to empty while
+continuing to claim the identity that promised otherwise.
+
+### The ordering rule
+
+**The image must be durable before the truncated log is.** The two crash windows are not
+symmetric:
+
+| Crash point | Result |
+|---|---|
+| Image written, log not yet truncated | The log still holds everything the image covers. Redundant, not wrong; recovery drops the overlap. |
+| Log truncated, image not yet written | Entries are gone and nothing accounts for them. Committed state lost, with nothing left on disk that knows. |
+
+One is a wasted write and the other is data loss, so the write that *adds* information
+goes first. `Node.Snapshot` and the `InstallSnapshot` receiver both follow it: image
+durable, then truncate in memory, then write the shortened log.
+
+### What a restart does with the two records
+
+Both carry a floor, written at different moments, and only their combination says whether
+the node's history is intact. `OpenNode` positions the log from the state record's floor,
+then reconciles:
+
+| Snapshot floor vs log floor | Meaning | Response |
+|---|---|---|
+| Behind | The log was compacted past the image meant to cover it | Impossible from correct writes — refuse to start |
+| Equal | A clean compaction | Check the two independently written terms agree |
+| Ahead | Crashed between the two writes | Finish the interrupted job: compact in memory |
+
+The image is then parked for the applier, which delivers it before any entry. The state
+machine restarted empty too, so it has to be rebuilt from the image and the tail — and
+`lastApplied` stays where it was until the applier has actually handed it over, which is
+the same past-tense rule the entry path follows (§8).
+
+**This answers the replay question that §6 used to defer.** A restarted node does not
+replay from index 1; it replays from the snapshot floor. No prefix is ever applied twice,
+so the state machine needs no idempotence for *replay*. Duplicate commands from a client
+retrying across a leader change remain a separate, open problem (§12).
+
 ---
 
 ## 6. Volatile state
@@ -315,15 +449,16 @@ conservatively reinitialised.
 | Field | Meaning | Why losing it is safe |
 |---|---|---|
 | `commitIndex` | Highest entry known committed | Re-learned from the next AppendEntries |
-| `lastApplied` | Highest entry applied to the state machine | Re-derived by replaying the log, or from a snapshot once snapshotting lands |
+| `lastApplied` | Highest entry applied to the state machine | Re-derived by replaying the log from the snapshot floor |
 | `state` | follower / candidate / leader | Always restart as follower; worst case is one extra election |
 | `electionDeadline` | When to start an election | Fresh deadline on start |
 
-**On restart, `commitIndex` and `lastApplied` return to zero and the log replays from
-index 1 against a state machine that also restarted empty.** That is not a concession:
-persisting `lastApplied` without persisting the state machine beside it would skip the
-replay and leave the node serving nothing. The obligation it creates falls on the layer
-above — applying the same prefix twice must reach the same state. See §12.
+**On restart both return to the snapshot floor — zero on a node that has never
+compacted — and the log replays from there.** `commitIndex` goes straight to the floor,
+because everything an image covers is committed by definition. `lastApplied` does not:
+it waits until the applier has actually handed the image to the state machine, which
+also restarted empty. Persisting `lastApplied` without persisting the state machine
+beside it would skip the rebuild and leave the node serving nothing.
 
 ### Configuration and machinery
 
@@ -334,6 +469,9 @@ above — applying the same prefix twice must reach the same state. See §12.
 | `rng` | Per-node seeded source for election timeouts. Never the global `rand`. |
 | `applyCh`, `applyNotify`, `applierDone` | The apply plumbing. See §8. |
 | `storage`, `persistDirty` | The durability boundary, and the flag that lets one handler's several mutations cost one write. See §5. |
+| `lastIncludedIndex`, `lastIncludedTerm` | The snapshot floor. Persistent, not volatile — listed here because every accessor in the log seam reads them. `(0, 0)` is not a sentinel for "none": it is exactly `log[0]`'s index and term, so a node that has never compacted has its floor at the original sentinel. |
+| `snapshotThreshold`, `snapshotNotify` | How many discardable entries trigger a compaction request, and the capacity-1 channel that carries it. See §10. |
+| `pendingSnapshot` | An image received from a leader, or read from disk on restart, waiting for the applier to hand it up. |
 | `mu` | Guards every field above except the apply channels. |
 
 ### On leaders only — reinitialised after every election
@@ -343,6 +481,7 @@ above — applying the same prefix twice must reach the same state. See §12.
 | `nextIndex[peer]` | Next log index to send. Optimistically initialised to leader's last index + 1. |
 | `matchIndex[peer]` | Highest index known replicated on that peer. Initialised to 0. |
 | `replicatingTerm[peer]` | Term of the AppendEntries round in flight to that peer, 0 when idle. A term rather than a bool, so a round left over from a deposed leadership cannot free a slot a newer term's round is holding. |
+| `snapshotSentAt[peer]` | When an image was last *attempted* for that peer. Throttles rebuilds to one per heartbeat interval. See §10. |
 | `replPending[peer]` | A replication trigger arrived while a round was out. This is what collapses a burst of client writes into one follow-up message. |
 | `lastContact[peer]` | Send time of the most recent message that peer answered. The raw material for the read lease (§9). Empty on election, so a lease is never inherited from a term this node no longer holds. |
 
@@ -818,6 +957,70 @@ claimed indices. They are truncated when the leader sends something at those pos
 *Consequence for tests:* asserting "follower log == leader log" straight after repair
 is wrong.
 
+### Snapshots and compaction
+
+**The log is a slice whose element 0 is the floor, and every index-to-position
+translation lives in one file.** `log.go` owns `firstLogIndex`, `lastLogIndex`,
+`entryAt`, `termAt`, `entriesFrom`, `truncateFrom` and `compactTo`; nothing else may
+index the slice directly. A raw `n.log[i]` is silently wrong the moment the floor moves,
+and wrong in the worst direction — a small positive offset still lands on a real entry
+and returns a plausible term. The invariant is greppable:
+
+```
+grep -n 'n\.log\[' internal/raft/*.go | grep -v _test.go
+```
+
+Every hit must be inside `log.go`, with one documented exception: `adoptState` reads
+`n.log[0].Term` to derive the floor's term, which is a position operation by definition
+rather than an index translation. Appending and taking the length are position operations
+too and are fine anywhere.
+
+**`termAt` fails closed.** Out of range it returns −1, which no real term can equal, so a
+consistency check run against a bug rejects and triggers repair rather than matching
+something it should not. Returning 0 would be far worse: 0 is the original sentinel's
+term, so a bug would read as agreement at the bottom of the log.
+
+**`compactTo` rebuilds the slice rather than reslicing it.** `n.log = n.log[k:]` keeps the
+whole original backing array alive behind the new header, so the memory the compaction
+was taken to release stays held until the log next grows past its old capacity — which is
+the entire point of doing it.
+
+**The compaction trigger measures what compaction can remove, not what the log holds.**
+`lastApplied - lastIncludedIndex`, never `len(log)`. A snapshot may only cover applied
+entries, so a compaction removes exactly that many; measuring the whole log instead looks
+equivalent and thrashes. If the unapplied tail is by itself longer than the threshold,
+then after compacting to `lastApplied` the log is *still* over the line, the next applied
+entry signals again, and the node takes one complete image per entry for as long as the
+write load lasts. *Measured*, on ten thousand entries at a threshold of 200: 59 images
+with the right metric, 9,453 with the wrong one, and 1.2 seconds against 69. Neither
+correctness testing nor a short-log test can see this; only a long run can.
+
+**`Snapshot`'s guard is `commitIndex`, not `lastApplied`.** What must never happen is an
+image covering uncommitted entries — those can still be overwritten, and an image
+containing one makes the overwrite unrecoverable. `lastApplied` cannot serve as that
+guard because it lags the caller by a mutex acquisition: the applier hands a message to
+the state machine and only *then* reacquires `mu` to record the delivery, so a machine
+that snapshots the moment it applies is routinely one index ahead of Raft's own
+bookkeeping. Refusing there rejects a correct caller on stale information, and every state
+machine written against this API would hit it. The caller is authoritative about what it
+applied — it could only have obtained the entry from this node — so `Snapshot` accepts and
+drags `lastApplied` up to the floor. The applier's order check tolerates the equality that
+results, and complains only about a gap or a step backwards.
+
+**Building an image is throttled to one attempt per heartbeat per peer.**
+`buildInstallSnapshot` reads the whole image back from storage and checksums it, under
+`mu`. `replicateAll` runs on every client write and not just on the tick, so a follower
+that is down while the cluster is under load would have a full image rebuilt for it once
+per submitted command. The throttle is on the *attempt* rather than on success, because an
+unreachable peer fails instantly and it is precisely that instant retry which makes the
+storm.
+
+**The leader keeps no copy of the image in memory.** `Snapshot` hands the bytes to the
+storage layer and lets go; holding one would double the memory the compaction was taken
+to release. The cost is a read and a decode on the send path, bounded by the throttle
+above. If that stops being affordable the fix is a cache beside the floor, not a read
+outside the lock — the floor can move between the read and the send.
+
 ### Leader bookkeeping
 
 **`matchIndex` is derived from what was sent.** `prevLogIndex + len(entries)`, never
@@ -1055,34 +1258,40 @@ Deliberately unresolved. Each is answered by later work.
   record at 0.284ms, the record would have to reach roughly 190 KB — order six thousand
   entries — before it cost as much as one flush. Compaction is needed for restart time
   and memory, not for write throughput. Revisit with snapshots.
-- **Log replay after restart must be idempotent.** `commitIndex` and `lastApplied` reset
-  to zero and the whole log replays. That is safe today only because the state machine
-  also restarts empty. Once a snapshot restores state, the replay has to start at the
-  snapshot's index and the two have to agree where that is. Same decision as duplicate
-  commands above; answer them together.
 - **A pipelining transport brings reordering back.** Coalescing removed same-peer
   inversions from the wire, so nothing exercises the out-of-order reply guards end to
   end any more. If the gRPC transport pipelines, the hazard returns to production with
   only unit coverage behind it.
-- **Snapshots.** Log truncation and `InstallSnapshot`. Breaks the
-  sentinel/position-equals-index convention, the term-run scan used by the fast-backup
-  hint, and the assumption that index 0 is always checkable. A `prevLogIndex` below the
-  snapshot floor must be answered with `InstallSnapshot`, not a rejection.
-- **Membership changes.** Single-server add and remove. Note that the consistency check is
+- **Chunking `InstallSnapshot`.** The image is sent whole, so it must fit in one RPC.
+  Figure 13's `offset`/`done` exist to bound what a receiver buffers, and chunking would
+  add a reassembly state machine with its own partial-transfer and
+  leader-change-mid-transfer cases. The size at which a single message stops being
+  reasonable is not measured; a snapshot benchmark analogous to the fsync one would say.
+- **A snapshot arriving while entries are in flight.** The leader decides to send an image
+  and, separately, has AppendEntries already on the wire. The receiver's ordering rules
+  cover each message individually, but the interleaving is only argued, not tested — the
+  ten-thousand-entry run happens to deliver exactly one image to an idle follower. This is
+  the next task.
+- **`kvMachine` ignores `SnapshotValid`.** The fixture used by every cluster test handles
+  commands and barriers but not images, so it would silently ignore one rather than
+  complaining. Unreachable today because those tests never compact, but it is a trap armed
+  for whoever raises a threshold. Give it a `fault` line.
+- **Membership changes.**- **Membership changes.** Single-server add and remove. Note that the consistency check is
   only correct because of one-leader-per-term, which is exactly what joint consensus exists
   to preserve.
 - **Log Matching checkers ignore the no-op flag.** Two entries differing only in that flag
   compare equal, so the property checkers would not notice a barrier substituted for a
   command at the same index and term. Unreachable today, since nothing produces that state;
   fix it when the no-op on election lands and barriers become common.
-- **Test suite runtime.** Roughly three and a half minutes under `-race` and still
-  growing — 215s at v1.5, against 155s at v1.4. Persistence added a write to every
+- **Test suite runtime.** Roughly four minutes under `-race` and still growing — 232s at
+  v1.6, 215s at v1.5, 155s at v1.4. Persistence added a write to every
   cluster test, and the crash-recovery rounds and the two measurement tests added the
   rest. It is still dominated by tests that sleep in real multiples of the election
   timeout. A virtual clock is the fix, and this remains the open question with the most
   evidence behind it: the suite is now long enough that the temptation to skip
   `-race -shuffle=on` on a change one feels sure about is a real risk rather than a
-  hypothetical one.
+  hypothetical one. Worth noting the counter-example — the ten-thousand-entry snapshot
+  test runs in 1.2 seconds, because it is bounded by work rather than by sleeping.
 - **Timing constants are scattered.** Each test file defines its own bounds. Consolidating
   them would make the suite's time budget visible in one place; worth doing alongside the
   virtual clock.
@@ -1099,3 +1308,4 @@ Deliberately unresolved. Each is answered by later work.
 | v1.3 | The apply path documented for the first time; linearizable reads and the argument against local reads; the no-op entry flag recorded as a departure from Figure 2; AppendEntries rule 5 and the same-term refusal written up; believed-impossible guards collected as a single principle; fault injection, fixture-inertness and test-goroutine conventions added; duplicate commands and read-barrier cost promoted to open questions |
 | v1.4 | Lease-based reads, with the clock-rate assumption and the process-pause residue documented; the send-time and quorum-ordering rules for deriving a lease; read latency measured across three link speeds, and the argument for the no-op on election revised in light of it from latency to log growth |
 | v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
+| v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened |

@@ -31,8 +31,10 @@ type fakeNetwork struct {
 	rpcCount  int //for asserting things like "the minority got no votes"
 	dropCount int //requests plus replies actually discarded
 
-	appendRPCs     int // AppendEntries messages actually delivered
-	entriesShipped int // entries carried across all of them
+	installSnapshotRPCs int
+	snapshotBytes       int
+	appendRPCs          int // AppendEntries messages actually delivered
+	entriesShipped      int // entries carried across all of them
 
 	nextSeq     map[[2]int]int //next stamp per directed pair, assigned at send
 	lastArrived map[[2]int]int //highest stamp delivered per directed pair
@@ -180,6 +182,7 @@ func (fn *fakeNetwork) resetCounters() {
 	defer fn.mu.Unlock()
 	fn.rpcCount, fn.dropCount = 0, 0
 	fn.appendRPCs, fn.entriesShipped = 0, 0
+	fn.installSnapshotRPCs, fn.snapshotBytes = 0, 0
 }
 
 func (fn *fakeNetwork) reorderedCount() int {

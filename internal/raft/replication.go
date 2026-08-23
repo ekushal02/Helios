@@ -41,6 +41,7 @@ func (n *Node) replicateAll(term int) {
 	// different points in their logs, so sharing an args pointer would send
 	// them each other's consistency checks.
 	msgs := make(map[int]*AppendEntriesArgs, len(n.peers))
+	snaps := make(map[int]*InstallSnapshotArgs)
 	for _, p := range n.peers {
 		if coalesce && n.replicatingTerm[p] == term {
 			// A round is already out to this peer. Fold this trigger into the
@@ -48,10 +49,25 @@ func (n *Node) replicateAll(term int) {
 			n.replPending[p] = true
 			continue
 		}
+		args := n.buildAppendEntries(p, term)
+		if args == nil {
+			// Compacted past this follower: the entries it needs are gone, so
+			// the image goes instead. Same slot, same coalescing rule -- a
+			// snapshot send is a round like any other.
+			snapArgs := n.buildInstallSnapshot(p, term)
+			if snapArgs == nil {
+				continue
+			}
+			if coalesce {
+				n.replicatingTerm[p] = term
+			}
+			snaps[p] = snapArgs
+			continue
+		}
 		if coalesce {
 			n.replicatingTerm[p] = term
 		}
-		msgs[p] = n.buildAppendEntries(p, term)
+		msgs[p] = args
 	}
 
 	n.mu.Unlock() // never send RPCs holding the lock
@@ -62,6 +78,9 @@ func (n *Node) replicateAll(term int) {
 		} else {
 			go n.sendAppendEntries(peer, term, args)
 		}
+	}
+	for peer, args := range snaps {
+		go n.sendInstallSnapshot(peer, term, args)
 	}
 }
 
@@ -89,9 +108,7 @@ func (n *Node) replicateRound(peer int, term int, args *AppendEntriesArgs) {
 
 		if !more || n.state != Leader || n.currentTerm != term {
 			// Release the slot, but only if it is still ours.
-			if n.replicatingTerm[peer] == term {
-				n.replicatingTerm[peer] = 0
-			}
+			n.releaseReplicationSlot(peer, term)
 			n.mu.Unlock()
 			return
 		}
@@ -99,7 +116,22 @@ func (n *Node) replicateRound(peer int, term int, args *AppendEntriesArgs) {
 		// One message for everything that arrived while the last one was out.
 		// Built from the CURRENT nextIndex, so a reply that landed in the
 		// meantime is already accounted for.
+		//
 		args = n.buildAppendEntries(peer, term)
+		if args == nil {
+			// The follower fell below the floor while this round was in flight.
+			// Hand the slot straight to a snapshot send rather than releasing
+			// it and waiting for a tick to notice.
+			snapArgs := n.buildInstallSnapshot(peer, term)
+			if snapArgs == nil {
+				n.releaseReplicationSlot(peer, term)
+				n.mu.Unlock()
+				return
+			}
+			n.mu.Unlock()
+			n.sendInstallSnapshot(peer, term, snapArgs)
+			return
+		}
 
 		n.mu.Unlock()
 	}
@@ -112,30 +144,48 @@ func (n *Node) replicateRound(peer int, term int, args *AppendEntriesArgs) {
 func (n *Node) buildAppendEntries(peer int, term int) *AppendEntriesArgs {
 	next := n.nextIndexFor(peer)
 
-	// Defensive clamp. nextIndex should always be in [1, lastLogIndex+1]. This
-	// is a bug indicator, not a design feature: if it ever fires, the fault is
-	// in whoever wrote nextIndex.
-	if next < 1 {
-		next = 1
+	// THE REFUSAL COMES BEFORE THE CLAMP, and the order is the whole point.
+	//
+	// next at or below the floor means the entries this follower is owed have
+	// been compacted away. Clamping first would raise next to firstLogIndex and
+	// then find nothing wrong -- converting a real, actionable condition into a
+	// message claiming a PrevLogIndex the follower has never reached, which it
+	// can only reject, forever.
+	//
+	// The same expression carries a second, older meaning when nothing has been
+	// compacted: next <= 0 is malformed and cannot come from correct code. Both
+	// readings want the same answer here, which is to say so rather than paper
+	// over it.
+	//
+	// Returning nil is not a failure: it is how this function says "this one
+	// needs an image". replicateAll and replicateRound both read it that way and
+	// hand the peer's slot to sendInstallSnapshot. The Info line is what makes a
+	// follower falling this far behind visible in the log, since it means the
+	// cluster is now paying for a full image rather than a few entries.
+	if next <= n.lastIncludedIndex {
+		n.lg().Info("follower is below the log floor; sending a snapshot",
+			"peer", peer, "nextIndex", next, "floor", n.lastIncludedIndex)
+		return nil
 	}
+
+	// Clamping upward is still just a bug indicator: nextIndex should never
+	// exceed lastLogIndex+1, and if it does the fault is in whoever wrote it.
 	if next > n.lastLogIndex()+1 {
 		next = n.lastLogIndex() + 1
 	}
 
 	prevIndex := next - 1
 
-	// Copy the entries out of n.log. A subslice would hand the network
-	// goroutine a window into the live log, which a later append can reallocate
-	// and a truncation can rewrite. Shallow on purpose: Command bytes are
-	// immutable once appended, so sharing them is safe. See DESIGN.md.
-	entries := append([]LogEntry(nil), n.log[next:]...)
-
 	return &AppendEntriesArgs{
 		Term:         term,
 		LeaderID:     n.id,
 		PrevLogIndex: prevIndex,
-		PrevLogTerm:  n.log[prevIndex].Term,
-		Entries:      entries,
+		PrevLogTerm:  n.termAt(prevIndex),
+
+		// Copied out of the log rather than sliced: a subslice would hand the
+		// network goroutine a window into the live log, which a later append
+		// can reallocate and a truncation can rewrite. See entriesFrom.
+		Entries: n.entriesFrom(next),
 
 		// Followers learn what is committed from here; they never derive it.
 		// Because this is read at build time, a commit decided just after this
@@ -235,6 +285,8 @@ func (n *Node) backOffFollower(peer int, args *AppendEntriesArgs, reply *AppendE
 		return
 	}
 
+	// The floor travels with the slice: nextIndexAfterConflict is pure, so it
+	// cannot ask the Node where position 0 sits and has to be told.
 	n.nextIndex[peer] = nextIndexAfterConflict(
-		n.log, current, reply.ConflictIndex, reply.ConflictTerm)
+		n.log, n.lastIncludedIndex, current, reply.ConflictIndex, reply.ConflictTerm)
 }

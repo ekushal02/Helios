@@ -11,7 +11,9 @@ package raft
 
 // noConflictTerm marks a rejection caused by the follower's log being too short
 // rather than by a term mismatch. Zero is safe as a sentinel because it is the
-// term of the log's index-0 sentinel, which no real entry ever carries.
+// term of the index-0 sentinel, which no real entry ever carries -- and after
+// compaction the floor inherits a real term, so this stays unambiguous only
+// because it is never used to describe the floor. See conflictHint.
 const noConflictTerm = 0
 
 // conflictHint describes WHY this node rejected an AppendEntries, so the leader
@@ -29,27 +31,35 @@ const noConflictTerm = 0
 // contiguous in any log, so reporting where the run starts lets the leader
 // discard the whole run in one step instead of one entry at a time.
 //
+// BELOW THE FLOOR TAKES THE FIRST SHAPE, deliberately. Those entries are gone,
+// so this node cannot say which term they carried and must not guess. Reporting
+// "too short, resume from the end of what I have" is true -- everything below
+// the floor IS held, in the image -- and it sends the leader backwards, which
+// is where it needs to go to discover that an image is required.
+//
 // Caller must hold mu. Only meaningful when the consistency check failed.
 func (n *Node) conflictHint(prevLogIndex int) (conflictIndex, conflictTerm int) {
-	// Too short, including the malformed-negative case.
-	if prevLogIndex < 0 || prevLogIndex > n.lastLogIndex() {
+	// Nothing inspectable here: too short, malformed, or compacted away.
+	if prevLogIndex < n.firstLogIndex() || prevLogIndex > n.lastLogIndex() {
 		return n.lastLogIndex() + 1, noConflictTerm
 	}
 
-	term := n.log[prevLogIndex].Term
+	term := n.termAt(prevLogIndex)
 	return n.firstIndexOfTerm(prevLogIndex, term), term
 }
 
 // firstIndexOfTerm walks back from index to the start of the contiguous run of
 // entries carrying term.
 //
-// Never returns 0. Index 0 is the sentinel, and a leader told to resume from
-// there would be claiming to replicate an entry no state machine may apply.
+// Never returns anything at or below the floor. The floor is a term, not an
+// entry, and a leader told to resume from there would be claiming to replicate
+// something no state machine may apply. Before compaction that bound is index
+// 1, which is exactly what this used to say.
 //
 // Caller must hold mu.
 func (n *Node) firstIndexOfTerm(index int, term int) int {
 	i := index
-	for i > 1 && n.log[i-1].Term == term {
+	for i > n.firstLogIndex() && n.termAt(i-1) == term {
 		i--
 	}
 	return i
@@ -59,7 +69,9 @@ func (n *Node) firstIndexOfTerm(index int, term int) int {
 // that rejected with the given hint.
 //
 // Pure, so the decision can be tested exhaustively without a Node, a transport
-// or a lock. current is the leader's existing nextIndex for that follower.
+// or a lock. log is the leader's log slice and floor is the index its element 0
+// stands for -- the pair that log.go's accessors carry implicitly. current is
+// the leader's existing nextIndex for that follower.
 //
 // The two branches:
 //
@@ -71,11 +83,17 @@ func (n *Node) firstIndexOfTerm(index int, term int) int {
 //	The leader has NONE. That term never entered the winning history: its
 //	entries come from a leader deposed before committing anything. Discard the
 //	follower's whole run of it and resume at the index the follower reported.
-func nextIndexAfterConflict(log []LogEntry, current int, conflictIndex, conflictTerm int) int {
+//
+// THE RESULT IS DELIBERATELY ALLOWED TO LAND AT OR BELOW THE FLOOR. Clamping it
+// up to firstLogIndex would look tidier and would hang the cluster: the leader
+// would build a message the follower cannot check, get the same rejection, and
+// clamp again, forever. Letting nextIndex fall to the floor is precisely the
+// signal buildAppendEntries reads to send an image instead.
+func nextIndexAfterConflict(log []LogEntry, floor, current, conflictIndex, conflictTerm int) int {
 	next := conflictIndex
 
 	if conflictTerm != noConflictTerm {
-		if last := lastIndexOfTerm(log, conflictTerm); last > 0 {
+		if last := lastIndexOfTerm(log, floor, conflictTerm); last > 0 {
 			next = last + 1
 		}
 	}
@@ -84,7 +102,7 @@ func nextIndexAfterConflict(log []LogEntry, current int, conflictIndex, conflict
 	// these -- the leader's last index of conflictTerm is necessarily below
 	// prevLogIndex, since log terms are non-decreasing and the leader's term at
 	// prevLogIndex differs from conflictTerm -- but a malformed or malicious
-	// reply must not stall repair in a loop or send it past the sentinel.
+	// reply must not stall repair in a loop or drive nextIndex below 1.
 	if next >= current {
 		next = current - 1
 	}
@@ -94,19 +112,26 @@ func nextIndexAfterConflict(log []LogEntry, current int, conflictIndex, conflict
 	return next
 }
 
-// lastIndexOfTerm returns the highest index in log carrying term, or 0 if the
-// term is absent. Zero doubles as "not found" because index 0 is the sentinel
-// at term 0, which no caller asks about.
-func lastIndexOfTerm(log []LogEntry, term int) int {
+// lastIndexOfTerm returns the highest RAFT INDEX in log carrying term, or 0 if
+// the term is absent from what the log still holds.
+//
+// Position 0 is skipped because it is the floor: a term, not an entry. So a
+// found result is always at least floor+1, which keeps 0 unambiguous as "not
+// found" exactly as it was when the floor was the index-0 sentinel.
+//
+// A term that has been compacted away reads as absent, which is the safe
+// direction: the leader then resumes at the index the follower reported, backs
+// off further, and eventually reaches the floor and sends an image.
+func lastIndexOfTerm(log []LogEntry, floor, term int) int {
 	// Backwards: the terms being asked about are recent far more often than not,
 	// and a log is scanned here only on the rejection path.
-	for i := len(log) - 1; i > 0; i-- {
-		if log[i].Term == term {
-			return i
+	for pos := len(log) - 1; pos > 0; pos-- {
+		if log[pos].Term == term {
+			return floor + pos
 		}
 		// Terms are non-decreasing along a log, so once past the run there is
 		// nothing further back to find.
-		if log[i].Term < term {
+		if log[pos].Term < term {
 			return 0
 		}
 	}

@@ -45,6 +45,12 @@ type Node struct {
 	storage      Storage      // where currentTerm, votedFor and log survive a restart
 	persistDirty bool         // set by markDirty, cleared by persistIfDirty
 
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
+	snapshotThreshold int           // entries above the floor before a signal
+	snapshotNotify    chan struct{} // capacity 1: "the log has outgrown the threshold"
+
 	commitIndex int   //last commited
 	lastApplied int   //last executed
 	state       State //current role
@@ -53,9 +59,10 @@ type Node struct {
 	nextIndex  map[int]int // guess: where to send next. Optimistic.
 	matchIndex map[int]int // proven: replicated up to here. Pessimistic.
 
-	replicatingTerm map[int]int  // peer -> term of the round in flight, 0 when idle
-	replPending     map[int]bool // peer -> a trigger arrived while a round was out
-	noCoalesce      bool         // measurement only: one fan-out per Submit, as it was
+	replicatingTerm map[int]int       // peer -> term of the round in flight, 0 when idle
+	replPending     map[int]bool      // peer -> a trigger arrived while a round was out
+	snapshotSentAt  map[int]time.Time // peer -> when an image was last attempted
+	noCoalesce      bool              // measurement only: one fan-out per Submit, as it was
 
 	lastContact map[int]time.Time // lastContact records, per peer, the SEND time of the most recent message that peer answered.
 
@@ -67,28 +74,33 @@ type Node struct {
 	applyNotify chan struct{} // capacity 1: "commitIndex moved"
 	applierDone chan struct{} // closed when applier() returns
 
+	pendingSnapshot *Snapshot
+
 	stopOnce sync.Once //stopOnce makes Stop safe to call more than once.
 }
 
 // New node returns a node in the state every RAFT server starts in: follower
 func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 	n := &Node{
-		id:              id,
-		peers:           peers,
-		transport:       transport,
-		logger:          discardLogger,
-		currentTerm:     0,
-		votedFor:        None,
-		leaderID:        None,
-		log:             []LogEntry{{Term: 0}},
-		storage:         NewMemoryStorage(),
-		replicatingTerm: make(map[int]int),
-		replPending:     make(map[int]bool),
-		commitIndex:     0,
-		lastApplied:     0,
-		state:           Follower,
-		rng:             rand.New(rand.NewSource(seed)),
-		stopCh:          make(chan struct{}),
+		id:                id,
+		peers:             peers,
+		transport:         transport,
+		logger:            discardLogger,
+		currentTerm:       0,
+		votedFor:          None,
+		leaderID:          None,
+		log:               []LogEntry{{Term: 0}},
+		storage:           NewMemoryStorage(),
+		replicatingTerm:   make(map[int]int),
+		replPending:       make(map[int]bool),
+		snapshotSentAt:    make(map[int]time.Time), // measurement only: one fan-out per Submit, as it was
+		commitIndex:       0,
+		lastApplied:       0,
+		state:             Follower,
+		rng:               rand.New(rand.NewSource(seed)),
+		stopCh:            make(chan struct{}),
+		snapshotThreshold: defaultSnapshotThreshold,
+		snapshotNotify:    make(chan struct{}, 1),
 	}
 
 	// The applier starts here rather than on becoming leader, because followers
@@ -98,14 +110,4 @@ func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 	n.initApplier()
 
 	return n
-}
-
-// lastLogIndex returns the index of the final entry
-func (n *Node) lastLogIndex() int {
-	return len(n.log) - 1
-}
-
-// lastLogTerm return the term of the final entry
-func (n *Node) lastLogTerm() int {
-	return n.log[n.lastLogIndex()].Term
 }
