@@ -134,6 +134,7 @@ func (n *Node) commitTo(idx int) {
 
 	n.commitIndex = idx
 	n.signalApplier()
+	n.stepDownIfRemoved()
 }
 
 // signalApplier drops a token in the notify channel, or does nothing if one is
@@ -264,7 +265,7 @@ func (n *Node) applier() {
 			// leaving every consumer's own counter behind, and every read would
 			// wait for an index that never shows up.
 			batch = append(batch, ApplyMsg{
-				CommandValid: !e.NoOp,
+				CommandValid: !e.NoOp && !e.isConfig(),
 				Command:      e.Command,
 				CommandIndex: i,
 				CommandTerm:  e.Term,

@@ -124,6 +124,7 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 			// the message's slice, so the log does not alias transport memory.
 			// Appending is a position operation and needs no translation.
 			n.log = append(n.log, entries[i:]...)
+			n.adoptConfigFromAppended(idx, entries[i:])
 			n.markDirty()
 			return
 		}
@@ -163,6 +164,7 @@ func (n *Node) mergeEntries(prevLogIndex int, entries []LogEntry) {
 		// index-to-position translation and refuses to cut into the floor.
 		n.truncateFrom(idx)
 		n.log = append(n.log, entries[i:]...)
+		n.refreshConfiguration()
 		n.markDirty()
 		return
 	}

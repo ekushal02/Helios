@@ -74,6 +74,11 @@ type Node struct {
 	applyNotify chan struct{} // capacity 1: "commitIndex moved"
 	applierDone chan struct{} // closed when applier() returns
 
+	servers     []int // every voter, this node included if it is one
+	inConfig    bool  // whether this node is a member of servers
+	configIndex int   // index of the entry that put servers in force, or the floor
+	baseServers []int // the configuration as of the snapshot floor
+
 	pendingSnapshot *Snapshot
 
 	stopOnce sync.Once //stopOnce makes Stop safe to call more than once.
@@ -103,10 +108,8 @@ func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 		snapshotNotify:    make(chan struct{}, 1),
 	}
 
-	// The applier starts here rather than on becoming leader, because followers
-	// apply too: they commit on LeaderCommit and must reach the same state
-	// machine state as the leader. It cannot go in the composite literal above
-	// -- it launches a goroutine that reads n, so n has to exist first.
+	n.setConfiguration(append(append([]int(nil), peers...), id), 0)
+	n.baseServers = append([]int(nil), n.servers...)
 	n.initApplier()
 
 	return n

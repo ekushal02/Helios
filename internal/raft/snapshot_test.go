@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // =============================================================================
@@ -516,5 +517,61 @@ func TestOpenNodeAdoptsTheSnapshotFloor(t *testing.T) {
 	if n.currentTerm != 3 || n.votedFor != 1 {
 		t.Errorf("term/vote = %d/%d, want 3/1: the state record must still be adopted",
 			n.currentTerm, n.votedFor)
+	}
+}
+
+// A node that comes up with an image on disk hands it to the state machine
+// without anything else prompting it.
+//
+// THE BUG THIS PINS. The applier is started inside NewNode, so it is already
+// running when OpenNode parks the image. If OpenNode advanced commitIndex by
+// assignment rather than through commitTo, the applier's first pass would find
+// nothing, park on applyNotify, and never wake -- a node that is up, holding a
+// loaded image, with a state machine that stays empty. No error and nothing in
+// the log, and entirely dependent on which goroutine wins a scheduling race.
+func TestARestartDeliversTheImageWithoutPrompting(t *testing.T) {
+	store := NewMemoryStorage()
+
+	blob, err := encodeSnapshot(Snapshot{
+		LastIncludedIndex: 12, LastIncludedTerm: 3, Data: []byte("image"),
+	})
+	if err != nil {
+		t.Fatalf("encodeSnapshot: %v", err)
+	}
+	if err := store.SaveSnapshot(blob); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	full := []LogEntry{{Term: 0}}
+	for i := 1; i <= 15; i++ {
+		full = append(full, LogEntry{Term: 3, Command: []byte{byte(i)}})
+	}
+	state, err := encodeState(persistentState{CurrentTerm: 3, VotedFor: 1, Log: full})
+	if err != nil {
+		t.Fatalf("encodeState: %v", err)
+	}
+	if err := store.Save(state); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	n, err := OpenNode(0, []int{1, 2}, newStubTransport(nil), 1, store)
+	if err != nil {
+		t.Fatalf("OpenNode: %v", err)
+	}
+	defer n.Stop()
+
+	select {
+	case msg, ok := <-n.ApplyCh():
+		if !ok {
+			t.Fatal("apply channel closed")
+		}
+		if !msg.SnapshotValid {
+			t.Fatalf("first delivery was index %d, want the image", msg.CommandIndex)
+		}
+		if msg.SnapshotIndex != 12 {
+			t.Errorf("image index = %d, want 12", msg.SnapshotIndex)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the image never arrived: OpenNode parked it without waking the applier")
 	}
 }

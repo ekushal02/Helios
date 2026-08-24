@@ -52,27 +52,23 @@ func fieldNames(rt reflect.Type) []string {
 	return names
 }
 
-// THIS TEST DID ITS JOB. It failed when NoOp was added, which forced the
-// decision to be written down rather than slid in: see LogEntry's own comment
-// for why an explicit flag beat reusing a nil Command, and DESIGN.md §8 for the
-// consequences on the wire.
-//
-// NoOp is a documented departure from Figure 2, listed after the two fields the
-// paper defines, in the same way AppendEntriesReply carries the §5.3 fast-backup
-// hint after its Figure 2 fields.
 func TestLogEntryMatchesFigure2(t *testing.T) {
-	assertFields(t, LogEntry{}, []fieldSpec{
-		{"Term", "int"},
-		{"Command", "[]uint8"},
-		{"NoOp", "bool"},
-	})
+	want := []string{"Term", "Command", "NoOp", "Servers"}
 
-	// The absence of an Index field is a design decision, not an oversight:
-	// position in n.log IS the index. If this ever fails because someone added
-	// Index, the question to answer first is which of the two is authoritative
-	// after a truncation.
-	if _, ok := reflect.TypeOf(LogEntry{}).FieldByName("Index"); ok {
-		t.Error("LogEntry has an Index field: position in the log is the index")
+	typ := reflect.TypeOf(LogEntry{})
+	got := make([]string, 0, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		got = append(got, typ.Field(i).Name)
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("LogEntry has %v, want %v: a field was added or removed without "+
+			"the deviation being recorded here", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("field %d is %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 

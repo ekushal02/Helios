@@ -427,6 +427,7 @@ func (n *Node) Snapshot(index int, data []byte) error {
 
 	// Step 2, then step 3.
 	n.compactTo(index, term)
+	n.baseServers = append([]int(nil), n.servers...)
 
 	// The caller has told us it applied through here, and it is the authority
 	// on that. Raft's own record may still be one behind; leaving it there

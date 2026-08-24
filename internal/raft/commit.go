@@ -10,17 +10,8 @@ package raft
 // See advanceCommitIndex.
 
 // quorumSize is the number of nodes that must hold an entry for it to be safe.
-//
-// Cluster size is len(peers)+1: peers excludes this node. A three-node cluster
-// needs two, a five-node cluster needs three.
-//
-// The whole safety argument rests on the fact that any two majorities of the
-// same cluster intersect. A future leader needs votes from a majority, that
-// majority shares at least one member with the majority holding a committed
-// entry, and §5.4.1 stops that member voting for a candidate whose log is
-// behind. Hence no leader can ever be elected without a committed entry.
 func (n *Node) quorumSize() int {
-	return (len(n.peers)+1)/2 + 1
+	return len(n.servers)/2 + 1
 }
 
 // replicaCount reports how many nodes are known to hold the entry at index.
@@ -32,12 +23,18 @@ func (n *Node) quorumSize() int {
 //
 // Caller must hold mu.
 func (n *Node) replicaCount(index int) int {
-	count := 1
+	count := 0
+
+	if n.inConfig {
+		count = 1
+	}
+
 	for _, p := range n.peers {
 		if n.matchIndex[p] >= index {
 			count++
 		}
 	}
+
 	return count
 }
 

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -254,8 +255,23 @@ func makeImage(size int) []byte {
 // the work is not repeatable at constant cost, and letting the framework scale
 // an iteration count against a gigabyte produces a run nobody intended.
 func TestRecoveryTime(t *testing.T) {
-	if testing.Short() {
-		t.Skip("writes and reads up to a gigabyte")
+	// OPT-IN, AND NOT MERELY BECAUSE IT IS SLOW.
+	//
+	// This reports ALLOCATION, and the race detector adds shadow memory to
+	// every allocation it sees -- so a figure taken in the default suite is not
+	// a distorted version of the answer, it is a different quantity. Publishing
+	// it would be worse than publishing nothing.
+	//
+	// The gigabyte row also peaks around three times the image while building
+	// and twice while recovering, on top of whatever the rest of the suite is
+	// already holding. Under that pressure the numbers measure the machine's
+	// memory pressure rather than Helios, and the row can take minutes.
+	//
+	// So it runs when someone asks for numbers, not on every commit.
+	if testing.Short() || os.Getenv("HELIOS_MEASURE") == "" {
+		t.Skip("measurement, not an assertion: reads and writes up to a gigabyte " +
+			"and reports allocation, which -race distorts. HELIOS_MEASURE=1 to " +
+			"take fresh figures.")
 	}
 
 	for _, c := range recoveryCases {
@@ -319,7 +335,25 @@ func TestRecoveryTime(t *testing.T) {
 			var imageTook time.Duration
 			if c.imageMB > 0 {
 				if !machine.waitFor(floor, 5*time.Minute) {
-					t.Fatalf("the image never reached the state machine")
+					// WHICH FAILURE IS THIS, because the two want opposite
+					// responses and a bare timeout cannot tell them apart.
+					//
+					// Still parked: the applier was never woken, which means
+					// something advanced commitIndex without going through
+					// commitTo. That is a bug, it reproduces at any size, and
+					// OpenNode is where it hid last time.
+					//
+					// Already taken: the image was delivered and something
+					// downstream is slow. At a gigabyte under memory pressure
+					// that is a resource problem, not a defect.
+					n.mu.Lock()
+					parked := n.pendingSnapshot != nil
+					commit, applied := n.commitIndex, n.lastApplied
+					n.mu.Unlock()
+
+					t.Fatalf("the image never reached the state machine in 5m: "+
+						"still parked = %v, commitIndex %d, lastApplied %d, floor %d",
+						parked, commit, applied, floor)
 				}
 				imageTook = time.Since(imageStart)
 			}

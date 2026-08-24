@@ -29,20 +29,8 @@ type persistentState struct {
 	Log         []LogEntry
 
 	// LastIncludedIndex is the Raft index that Log[0] stands for.
-	//
-	// WITHOUT IT THE LOG IS AMBIGUOUS. Once compaction can shorten the log, the
-	// slice is relative: position 0 is the floor, not index 0. A four-entry
-	// record could be the full log of a node that has never snapshotted, or the
-	// tail of one whose floor sits at 6, and nothing else on disk distinguishes
-	// them. Reading the second as the first silently renumbers every entry.
-	//
-	// The floor's TERM needs no field of its own: Log[0] is the floor entry and
-	// already carries it.
-	//
-	// A record written before this field existed decodes it as zero, which is
-	// exactly "nothing discarded" -- the correct reading of an absolute log.
-	// That is why the record version does not change.
 	LastIncludedIndex int
+	BaseServers       []int
 }
 
 const (
@@ -178,6 +166,7 @@ func (n *Node) persist() {
 		VotedFor:          n.votedFor,
 		Log:               n.log,
 		LastIncludedIndex: n.lastIncludedIndex,
+		BaseServers:       append([]int(nil), n.baseServers...),
 	})
 	if err != nil {
 		panic(fmt.Sprintf("raft: node %d cannot encode its own state: %v", n.id, err))
@@ -231,24 +220,19 @@ func (n *Node) adoptState(ps persistentState) {
 	n.votedFor = ps.VotedFor
 	n.log = ps.Log
 
-	// THE FLOOR GOES IN BEFORE ANYTHING READS THE LOG BY INDEX. Every accessor
-	// in log.go translates through lastIncludedIndex, so installing the log
-	// while the floor still says 0 would renumber every entry for as long as
-	// that window lasted.
 	n.lastIncludedIndex = ps.LastIncludedIndex
 
 	if len(n.log) == 0 {
-		// Defensive: the floor entry should always have been saved, but
-		// lastLogTerm indexes log[len-1] unguarded and an empty slice there is
-		// a panic rather than a wrong answer. A log with no floor cannot be
-		// positioned, so it is treated as a fresh one.
 		n.log = []LogEntry{{Term: 0}}
 		n.lastIncludedIndex = 0
 	}
 
-	// log[0] IS the floor entry, so its term is the floor's term. Deriving it
-	// rather than storing it twice means the two can never disagree.
 	n.lastIncludedTerm = n.log[0].Term
+
+	if ps.BaseServers != nil {
+		n.baseServers = append([]int(nil), ps.BaseServers...)
+		n.refreshConfiguration()
+	}
 
 	n.persistDirty = false
 }
@@ -302,6 +286,7 @@ func OpenNode(id int, peers []int, transport Transport, seed int64, storage Stor
 	// this is the behaviour it always had.
 	n.commitIndex = n.lastIncludedIndex
 	n.lastApplied = n.lastIncludedIndex
+	n.commitTo(n.lastIncludedIndex)
 
 	n.mu.Unlock()
 

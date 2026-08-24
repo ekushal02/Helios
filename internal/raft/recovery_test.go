@@ -181,18 +181,23 @@ func (c *cluster) watchNode(n *Node) {
 	}()
 }
 
-// submitToLeader offers a command to whichever live node accepts it.
-//
-// Dead nodes are skipped explicitly. A crashed leader still believes it leads --
-// nothing in Stop touches state -- so Submit would happily append to a log
-// nobody will ever read.
 func (c *cluster) submitToLeader(cmd []byte) bool {
-	for _, n := range c.liveNodes() {
-		if _, _, ok := n.Submit(cmd); ok {
-			return true
+	return c.submitWithin(cmd, 2*time.Second)
+}
+
+func (c *cluster) submitWithin(cmd []byte, within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for {
+		for _, n := range c.liveNodes() {
+			if _, _, ok := n.Submit(cmd); ok {
+				return true
+			}
 		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	return false
 }
 
 func (c *cluster) liveNodes() []*Node {

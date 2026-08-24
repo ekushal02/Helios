@@ -31,49 +31,46 @@ func (n *Node) Submit(command []byte) (index int, term int, isLeader bool) {
 	})
 }
 
-// appendAndReplicate is the single path by which anything enters this leader's
-// log. Submit puts a client command through it; ReadIndex puts a barrier.
-//
-// Extracted rather than duplicated because of the advanceCommitIndex call
-// below, which is the one line in the function that is not obvious and the one
-// a second copy would omit.
-func (n *Node) appendAndReplicate(entry LogEntry) (index int, term int, isLeader bool) {
+func (n *Node) appendAndReplicate(entry LogEntry) (index, term int, isLeader bool) {
+	index, term, isLeader, _ = n.appendChecked(entry, nil)
+	return index, term, isLeader
+}
+
+func (n *Node) appendChecked(entry LogEntry, precondition func() error) (index, term int, isLeader bool, err error) {
 	n.mu.Lock()
 
 	if n.state != Leader {
 		currentTerm := n.currentTerm
 		n.mu.Unlock()
-		return 0, currentTerm, false
+		return 0, currentTerm, false, nil
 	}
 
-	// The term is stamped here, not by the caller. An entry's term is the term
-	// of the leader that created it, and only this critical section knows what
-	// that is -- a caller reading currentTerm beforehand could be stamping an
-	// entry with a term this node no longer holds.
+	// Under the same lock that established leadership. Checking beforehand and
+	// appending afterwards leaves a window for a second configuration change to
+	// slip between the two.
+	if precondition != nil {
+		if err := precondition(); err != nil {
+			currentTerm := n.currentTerm
+			n.mu.Unlock()
+			return 0, currentTerm, true, err
+		}
+	}
+
 	entry.Term = n.currentTerm
-
 	n.log = append(n.log, entry)
-
 	index = n.lastLogIndex()
 	term = n.currentTerm
 
+	// In force from the append. See config.go.
+	if entry.isConfig() {
+		n.setConfiguration(entry.Servers, index)
+	}
+
 	n.markDirty()
 	n.persistIfDirty()
-
-	// The append is itself replication evidence, and in a single-node cluster it
-	// is the only evidence there will ever be. Every other call to
-	// advanceCommitIndex hangs off an AppendEntries reply, so a cluster with no
-	// peers sends nothing, hears nothing, and never evaluates the commit rule --
-	// the log grows and commitIndex sits at zero forever.
-	//
-	// A no-op for any larger cluster: one replica is not a majority, so the
-	// count fails and this returns immediately.
 	n.advanceCommitIndex()
-
 	n.mu.Unlock()
 
-	// Push it out now rather than waiting for the heartbeat tick.
 	go n.replicateAll(term)
-
-	return index, term, true
+	return index, term, true, nil
 }

@@ -675,3 +675,32 @@ func (c *cluster) assertNoLeaderAmong(ids []int, aboveTerm int, during time.Dura
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// addNode builds a server that is not yet in anyone's configuration and
+// registers it with the network. It starts with an empty configuration, so it
+// will not campaign; it becomes a voter when the leader's configuration entry
+// reaches it.
+func (c *cluster) addNode() int {
+	c.t.Helper()
+
+	id := len(c.nodes)
+	store := newCrashableStorage()
+	c.storage = append(c.storage, store)
+
+	node, err := OpenNode(id, nil, c.net.endpoint(id), c.seed*1_000_003+int64(id), store)
+	if err != nil {
+		c.t.Fatalf("building node %d: %v", id, err)
+	}
+	node.SetLogger(c.baseLogger)
+
+	c.mu.Lock()
+	c.nodes = append(c.nodes, node)
+	c.mu.Unlock()
+
+	c.net.register(node)
+	if c.applyHook != nil {
+		c.watchNode(node)
+	}
+	node.Start()
+	return id
+}

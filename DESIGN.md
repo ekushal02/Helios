@@ -372,6 +372,9 @@ across a hundred seeded rounds that crash a node under load and restart it.
 of those tests would pass with the flush calls deleted. The fsync policy rests on the
 argument in `docs/fsync-policy.md`, not on a green suite.
 
+What a restart *costs* is measured separately, at image sizes up to a gigabyte — see
+§10.
+
 ### The snapshot record
 
 A second durable object, in the same directory and under the same `Storage` interface:
@@ -1021,6 +1024,42 @@ to release. The cost is a read and a decode on the send path, bounded by the thr
 above. If that stops being affordable the fix is a cache beside the floor, not a read
 outside the lock — the floor can move between the read and the send.
 
+### Recovery, measured
+
+A restart is three phases, and only the first is bounded by the image. `commitIndex`
+comes back at the floor, so the tail above it is loaded but **not** replayed until a
+leader re-establishes it; the figures below simulate that first message.
+
+Apple M3, APFS on the internal NVMe, Go 1.26.5. Warm page cache — the records are written
+moments before they are read, so a genuinely cold restart adds a disk read of the same
+size. Tail held at 2,000 entries except in the first row.
+
+| Durable state | Take: encode | Take: save | Alloc to take | `OpenNode` | Alloc to open | Tail replay |
+|---|---|---|---|---|---|---|
+| no image, 200k-entry tail | — | — | — | 19 ms | 34 MB | 40 ms |
+| 1 MB image | 0.16 ms | 8 ms | 2 MB | 0.5 ms | 2.4 MB | 1 ms |
+| 100 MB image | 28 ms | 41 ms | 200 MB | 34 ms | 200 MB | 1 ms |
+| 1 GB image | 497 ms | 524 ms | 2,048 MB | 491 ms | 2,048 MB | 1 ms |
+
+**Time is not the constraint.** A gigabyte of state is back to a usable node in 491 ms,
+about 2 GB/s through `OpenNode`. Handing the image to the state machine costs 1 ms at
+every size, because it is a pointer through a channel — the machine's own rebuild is on
+top of that and is entirely the application's. The log tail is cheap in both directions:
+200,000 entries gob-decode in 19 ms and replay at roughly five million entries a second.
+
+**Memory is.** Allocation is exactly twice the image on both paths, to the megabyte.
+Taking one costs a payload buffer and an output buffer, and the caller's own copy is
+still live while both exist — so snapshotting 1 GB of state needs about **3 GB
+resident**. Recovering it needs 2 GB: the `ReadFile` buffer plus `decodeSnapshot`'s copy.
+
+That is a consequence of `Storage.Save` taking a `[]byte`: the encode has to materialise
+the whole blob before anything can be written. An `io.WriterTo`-shaped API would remove
+two of the three copies on the write side, and handing ownership of the read buffer to
+`decodeSnapshot` would remove one of the two on the read side — the buffer `os.ReadFile`
+returns is fresh and nobody else holds it, so the copy is defending against a caller that
+does not exist. Neither is urgent at the sizes measured. Both become urgent the moment a
+node is sized to hold as much state as it has memory.
+
 ### Leader bookkeeping
 
 **`matchIndex` is derived from what was sent.** `prevLogIndex + len(entries)`, never
@@ -1265,8 +1304,16 @@ Deliberately unresolved. Each is answered by later work.
 - **Chunking `InstallSnapshot`.** The image is sent whole, so it must fit in one RPC.
   Figure 13's `offset`/`done` exist to bound what a receiver buffers, and chunking would
   add a reassembly state machine with its own partial-transfer and
-  leader-change-mid-transfer cases. The size at which a single message stops being
-  reasonable is not measured; a snapshot benchmark analogous to the fsync one would say.
+  leader-change-mid-transfer cases. The recovery measurement (§10) gives the shape of the
+  limit: a gigabyte moves through `OpenNode` in half a second, so latency is not the
+  reason to chunk — the receiver holding two copies of it is.
+- **Snapshot encode and decode each allocate a second copy of the image.** Measured at
+  exactly 2× on both paths, so taking a snapshot of 1 GB of state costs about 3 GB
+  resident and recovering it costs 2 GB (§10). `Storage.Save` taking a `[]byte` is what
+  forces the encode to materialise the whole blob; an `io.WriterTo` shape would remove two
+  of the three. `decodeSnapshot`'s copy defends against a caller reusing its read buffer,
+  which `os.ReadFile` never does. Not urgent at the sizes measured, and the first thing to
+  fix if a node is ever sized to hold as much state as it has memory.
 - **A snapshot arriving while entries are in flight.** The leader decides to send an image
   and, separately, has AppendEntries already on the wire. The receiver's ordering rules
   cover each message individually, but the interleaving is only argued, not tested — the
@@ -1308,4 +1355,4 @@ Deliberately unresolved. Each is answered by later work.
 | v1.3 | The apply path documented for the first time; linearizable reads and the argument against local reads; the no-op entry flag recorded as a departure from Figure 2; AppendEntries rule 5 and the same-term refusal written up; believed-impossible guards collected as a single principle; fault injection, fixture-inertness and test-goroutine conventions added; duplicate commands and read-barrier cost promoted to open questions |
 | v1.4 | Lease-based reads, with the clock-rate assumption and the process-pause residue documented; the send-time and quorum-ordering rules for deriving a lease; read latency measured across three link speeds, and the argument for the no-op on election revised in light of it from latency to log growth |
 | v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
-| v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened |
+| v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened; the snapshot/AppendEntries interleavings pinned deterministically, with a same-term leader now refusing an image as it already refuses entries; recovery measured at image sizes up to a gigabyte, showing time is not the constraint and that both the encode and decode paths allocate a second copy of the image |

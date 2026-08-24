@@ -28,7 +28,7 @@ func (n *Node) resetElectionTimer() {
 
 // majority is the number of votes needed to win, counting this node itself.
 func (n *Node) majority() int {
-	return (len(n.peers)+1)/2 + 1
+	return n.quorumSize()
 }
 
 // Start begins the node's background loops.
@@ -56,6 +56,7 @@ func (n *Node) ticker() {
 		select {
 		case <-n.stopCh:
 			return
+
 		case <-t.C:
 			n.mu.Lock()
 
@@ -65,9 +66,17 @@ func (n *Node) ticker() {
 				continue
 			}
 
+			// A server outside the current configuration must not campaign.
+			if !n.inConfig {
+				n.resetElectionTimer()
+				n.mu.Unlock()
+				continue
+			}
+
 			if time.Now().After(n.electionDeadline) {
 				n.becomeCandidate()
 			}
+
 			n.mu.Unlock()
 		}
 	}
