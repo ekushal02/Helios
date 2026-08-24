@@ -74,24 +74,6 @@ func (n *Node) buildInstallSnapshot(peer int, term int) *InstallSnapshotArgs {
 		return nil
 	}
 
-	// ONE ATTEMPT PER HEARTBEAT INTERVAL, PER PEER.
-	//
-	// Everything below reads the whole image back from storage and checksums
-	// it, under n.mu. replicateAll runs on every client write and not just on
-	// the tick, so a follower that is down while the cluster is under load
-	// would have a full image rebuilt for it once per submitted command --
-	// thousands of multi-megabyte reads to feed a peer that is not listening.
-	//
-	// The throttle is on the ATTEMPT rather than on success, because an
-	// unreachable peer fails instantly and it is precisely that instant retry
-	// which makes the storm. One per heartbeat is the cadence ordinary
-	// replication already retries at, so a follower that is merely behind loses
-	// nothing worth measuring.
-	if time.Since(n.snapshotSentAt[peer]) < heartbeatInterval {
-		return nil
-	}
-	n.snapshotSentAt[peer] = time.Now()
-
 	blob, err := n.storage.LoadSnapshot()
 	if err != nil {
 		n.lg().Error("cannot read the snapshot to send", "peer", peer, "err", err)
@@ -201,11 +183,31 @@ func (n *Node) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshot
 		return
 	}
 
+	n.stepDownIfStale(args.Term)
+
+	// A LEADER RECEIVING AN IMAGE AT ITS OWN TERM IS ELECTION SAFETY BROKEN.
+	//
+	// stepDownIfStale has already handled the legitimate case: a HIGHER term
+	// deposes this node before it reaches here. What is left is a second leader
+	// in one term, which one vote per node per term makes impossible -- so this
+	// is refused on the same principle as the other believed-impossible guards
+	// (DESIGN.md §8), and for a sharper reason than the matching guard in
+	// AppendEntries. A rival's entries would truncate a tail; a rival's image
+	// would discard the whole log this node is still replicating from, while
+	// its heartbeat loop carried on telling followers it leads.
+	if n.state == Leader {
+		n.lg().Error("InstallSnapshot from another leader in the same term",
+			"from", args.LeaderID, "term", args.Term)
+		return
+	}
+
 	// A message from a current leader, so this node follows it whatever it
 	// thought it was. The election timer is reset for the same reason
 	// AppendEntries resets it before running its log check: a node being
 	// repaired must not campaign mid-repair.
-	n.stepDownIfStale(args.Term)
+	if n.state == Candidate {
+		n.becomeFollower(args.Term)
+	}
 	n.state = Follower
 	n.leaderID = args.LeaderID
 	n.resetElectionTimer()
