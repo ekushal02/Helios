@@ -210,6 +210,7 @@ func (n *Node) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshot
 	}
 	n.state = Follower
 	n.leaderID = args.LeaderID
+	n.lastLeaderContact = time.Now()
 	n.resetElectionTimer()
 	reply.Term = n.currentTerm
 

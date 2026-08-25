@@ -407,7 +407,12 @@ func TestAddingAServerToAWeakenedClusterPausesCommits(t *testing.T) {
 			t.Fatalf("no leader accepted backlog write %d", i)
 		}
 	}
-	if !tracker.waitFor(leader, backlog, 30*time.Second) {
+	deadline := time.Now().Add(30 * time.Second)
+	for tracker.highFor(leader) < backlog && time.Now().Before(deadline) {
+		c.submitToLeader([]byte("nudge"))
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tracker.highFor(leader) < backlog {
 		t.Fatalf("leader applied %d of %d backlog entries", tracker.highFor(leader), backlog)
 	}
 

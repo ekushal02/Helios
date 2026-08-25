@@ -17,6 +17,8 @@ type stubTransport struct {
 
 	answer func(to int, args *RequestVoteArgs) (RequestVoteReply, bool)
 
+	preVoteAnswer func(to int, args *PreVoteArgs) (PreVoteReply, bool)
+
 	appendAnswer func(to int, args *AppendEntriesArgs) (AppendEntriesReply, bool)
 
 	calls       []int // every peer id contacted, in arrival order
@@ -110,4 +112,26 @@ func slowPeer(slow int, delay time.Duration, term int) func(int, *RequestVoteArg
 		}
 		return RequestVoteReply{Term: term, VoteGranted: true}, true
 	}
+}
+
+func (s *stubTransport) setPreVoteAnswer(f func(to int, args *PreVoteArgs) (PreVoteReply, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.preVoteAnswer = f
+}
+
+func (s *stubTransport) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteReply) bool {
+	s.mu.Lock()
+	answer := s.preVoteAnswer
+	s.mu.Unlock()
+
+	if answer == nil {
+		*reply = PreVoteReply{Term: args.Term - 1, VoteGranted: true}
+		return true
+	}
+	r, ok := answer(to, args)
+	if ok {
+		*reply = r
+	}
+	return ok
 }

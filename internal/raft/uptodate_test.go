@@ -21,98 +21,11 @@ func withLog(t *testing.T, entryTerms ...int) *Node {
 	return n
 }
 
-// The comparison rule itself, in isolation.
-func TestIsUpToDate(t *testing.T) {
-	tests := []struct {
-		name string
-
-		myLog []int // terms of this node's entries
-
-		candidateLastIndex int
-		candidateLastTerm  int
-
-		want bool
-	}{
-		{
-			// Both empty. Bootstrap: nobody has anything, everybody qualifies.
-			name:               "both logs empty",
-			myLog:              nil,
-			candidateLastIndex: 0,
-			candidateLastTerm:  0,
-			want:               true,
-		},
-		{
-			name:               "identical logs",
-			myLog:              []int{1, 1, 2},
-			candidateLastIndex: 3,
-			candidateLastTerm:  2,
-			want:               true,
-		},
-		{
-			// Same term, candidate has more. Strictly ahead.
-			name:               "same last term, candidate log is longer",
-			myLog:              []int{1, 1},
-			candidateLastIndex: 5,
-			candidateLastTerm:  1,
-			want:               true,
-		},
-		{
-			// Same term, candidate has less. It is missing entries we hold.
-			name:               "same last term, candidate log is shorter",
-			myLog:              []int{1, 1, 1, 1},
-			candidateLastIndex: 2,
-			candidateLastTerm:  1,
-			want:               false,
-		},
-		{
-			// THE CASE THAT BREAKS "longest log wins".
-			name:               "candidate has higher last term but SHORTER log",
-			myLog:              []int{1, 1, 1, 1},
-			candidateLastIndex: 2,
-			candidateLastTerm:  2,
-			want:               true,
-		},
-		{
-			// The mirror image. A long log does not rescue a stale term.
-			name:               "candidate has lower last term but LONGER log",
-			myLog:              []int{1, 2},
-			candidateLastIndex: 9,
-			candidateLastTerm:  1,
-			want:               false,
-		},
-		{
-			// Candidate has nothing; we have entries.
-			name:               "candidate log is empty, ours is not",
-			myLog:              []int{1},
-			candidateLastIndex: 0,
-			candidateLastTerm:  0,
-			want:               false,
-		},
-		{
-			// We have nothing; candidate does.
-			name:               "our log is empty, candidate has entries",
-			myLog:              nil,
-			candidateLastIndex: 3,
-			candidateLastTerm:  2,
-			want:               true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			n := withLog(t, tc.myLog...)
-
-			n.mu.Lock()
-			got := n.isUpToDate(tc.candidateLastIndex, tc.candidateLastTerm)
-			n.mu.Unlock()
-
-			if got != tc.want {
-				t.Errorf("isUpToDate(index=%d, term=%d) = %v, want %v",
-					tc.candidateLastIndex, tc.candidateLastTerm, got, tc.want)
-			}
-		})
-	}
-}
+// §5.4.1's comparison now lives in prevote.go as logIsAtLeastAsUpToDate, shared
+// with the pre-vote receiver so the poll answers by the rules the real vote
+// applies. The table-driven test that used to sit here exercised a second copy
+// of that rule in this file; the copy is gone, and the tests below exercise the
+// surviving one through the handler that matters.
 
 func TestStaleCandidateIsRejected(t *testing.T) {
 	// This node holds four entries, the last from term 3.
@@ -200,23 +113,33 @@ func TestRejectedStaleLogDoesNotResetTimer(t *testing.T) {
 	}
 }
 
-// DOCUMENTS A KNOWN GAP, deliberately. This asserts current behaviour rather
-// than ideal behaviour.
+// PRE-VOTE CLOSED THIS, and the test stays to prove the local behaviour is
+// still what it should be.
 //
-// A candidate carrying a higher term makes this node step down and adopt that
-// term, and becomeFollower resets the election timer -- even though the vote is
-// then refused on the log check. So a node with a useless log can delay a
-// healthy cluster's elections simply by campaigning with an inflated term.
+// It used to read: a candidate carrying an inflated term makes this node step
+// down and adopt it, resetting the election timer, even though the vote is then
+// refused on the log check -- so a node with a useless log could delay a healthy
+// cluster's elections just by campaigning. The comment ended "when D-12 lands,
+// invert this".
 //
-// Why the reset stays: without it, a leader stepping down would carry a stale
-// deadline (the ticker never refreshes a leader's) and would instantly campaign
-// against whoever just deposed it. That trades a rare disruption for one on
-// every single failover.
+// What D-12 actually changed is UPSTREAM of here. RequestVote is unchanged and
+// must stay unchanged: a real vote request is evidence, because the sender has
+// already incremented and voted for itself, so adopting the term is the
+// all-servers rule doing its job. Refusing to reset would be worse -- a leader
+// stepping down would carry a stale deadline and immediately campaign against
+// whoever deposed it, on every failover.
 //
-// The real fix is Prevote (task D-12): a candidate first asks whether it COULD
-// win, without incrementing anyone's term. When D-12 lands, this test should
-// start failing -- and that failure is the proof Prevote works. Invert it then.
-func TestHigherTermResetsTimerEvenWhenRefused(t *testing.T) {
+// The disruption is gone because NOBODY SENDS THIS MESSAGE ANY MORE. A
+// partitioned node cannot reach term 99 without winning polls it will never
+// win, so an inflated-term RequestVote has no way to arise. See
+// TestPreVoteStopsAReturningNodeFromDisruptingTheCluster for the measurement,
+// and TestMinorityPartitionCannotElectWithLeaderInMajority for the same
+// property at cluster scale.
+//
+// So the assertion is unchanged and the framing is inverted: this is no longer
+// a documented gap, it is the correct handling of a message that can no longer
+// be produced.
+func TestAnInflatedTermStillResetsTheTimerIfItEverArrives(t *testing.T) {
 	n := withLog(t, 1, 2, 3)
 
 	n.mu.Lock()
@@ -227,7 +150,7 @@ func TestHigherTermResetsTimerEvenWhenRefused(t *testing.T) {
 
 	var reply RequestVoteReply
 	n.RequestVote(&RequestVoteArgs{
-		Term:         99, // inflated by campaigning alone in a partition
+		Term:         99, // unreachable in a running cluster; constructed here
 		CandidateID:  1,
 		LastLogIndex: 1, // log went nowhere
 		LastLogTerm:  1,
@@ -241,8 +164,9 @@ func TestHigherTermResetsTimerEvenWhenRefused(t *testing.T) {
 		t.Fatal("stale-log candidate should still have been refused")
 	}
 	if after.Equal(before) {
-		t.Error("expected the term adoption to reset the timer (see D-12); " +
-			"if Prevote is now implemented, invert this assertion")
+		t.Error("adopting a higher term did not reset the timer: a leader stepping " +
+			"down would keep a stale deadline and campaign against whoever just " +
+			"deposed it")
 	}
 }
 

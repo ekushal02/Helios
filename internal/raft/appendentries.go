@@ -1,12 +1,7 @@
 package raft
 
-// AppendEntries is the receiving side of the AppendEntries RPC (Figure 2, §5.3).
-//
-// Order of operations is load-bearing and is not the order Figure 2 lists the
-// rules in. Legitimacy is settled first (is the sender the leader of a term I
-// accept?), and only then does the log get examined. A message can come from a
-// perfectly valid leader and still be unusable by this follower, and those two
-// judgements must not contaminate each other.
+import "time"
+
 func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -39,6 +34,7 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 
 	n.leaderID = args.LeaderID
+	n.lastLeaderContact = time.Now()
 
 	// Reset BEFORE the log check: a follower that fails the check is behind or
 	// diverged, which is normal and is exactly when the leader is repairing it.

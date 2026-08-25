@@ -32,6 +32,7 @@ type fakeNetwork struct {
 	dropCount int //requests plus replies actually discarded
 
 	installSnapshotRPCs int
+	preVoteRPCs         int
 	snapshotBytes       int
 	appendRPCs          int // AppendEntries messages actually delivered
 	entriesShipped      int // entries carried across all of them
@@ -183,6 +184,7 @@ func (fn *fakeNetwork) resetCounters() {
 	fn.rpcCount, fn.dropCount = 0, 0
 	fn.appendRPCs, fn.entriesShipped = 0, 0
 	fn.installSnapshotRPCs, fn.snapshotBytes = 0, 0
+	fn.preVoteRPCs = 0
 }
 
 func (fn *fakeNetwork) reorderedCount() int {

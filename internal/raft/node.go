@@ -66,9 +66,12 @@ type Node struct {
 
 	lastContact map[int]time.Time // lastContact records, per peer, the SEND time of the most recent message that peer answered.
 
-	electionDeadline time.Time     //election starting timer
-	rng              *rand.Rand    //randomised election timeout
-	stopCh           chan struct{} //shut ticker down
+	electionDeadline  time.Time //election starting timer
+	lastLeaderContact time.Time
+	preVoting         bool          // a poll is in flight
+	noPreVote         bool          // measurement only: campaign without polling first
+	rng               *rand.Rand    //randomised election timeout
+	stopCh            chan struct{} //shut ticker down
 
 	applyCh     chan ApplyMsg // committed entries, in index order, one consumer
 	applyNotify chan struct{} // capacity 1: "commitIndex moved"

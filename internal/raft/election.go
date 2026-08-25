@@ -74,7 +74,7 @@ func (n *Node) ticker() {
 			}
 
 			if time.Now().After(n.electionDeadline) {
-				n.becomeCandidate()
+				n.beginPreVote()
 			}
 
 			n.mu.Unlock()

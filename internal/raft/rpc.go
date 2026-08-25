@@ -3,6 +3,7 @@ package raft
 // Transport is how a Node reaches its peers
 type Transport interface {
 	SendRequestVote(to int, args *RequestVoteArgs, reply *RequestVoteReply) bool
+	SendPreVote(to int, args *PreVoteArgs, reply *PreVoteReply) bool
 	SendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool
 	SendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool
 }

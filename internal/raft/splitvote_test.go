@@ -9,7 +9,12 @@ import (
 
 const splitDelayFloor = 50 * time.Millisecond
 
-const alignLead = 60 * time.Millisecond
+// alignLead is how far ahead the deadlines are aligned.
+//
+// Far enough that LEADER STICKINESS has lapsed. A node refuses a poll within
+// electionTimeoutMin of hearing from a leader (prevote.go), so aligning inside
+// that window produces refusals rather than a simultaneous campaign.
+const alignLead = electionTimeoutMin + 60*time.Millisecond
 
 // A split vote is not a bug and not an error path -- it is a legal outcome of two nodes campaigning at once.
 // This pins down that it can happen at all, with no timing involved: two candidates in the same term, each having voted for itself, and neither will vote for the other.
@@ -145,12 +150,6 @@ func TestForcedSplitVoteResolves(t *testing.T) {
 		}()
 	}
 
-	if forced*10 < trials*8 {
-		t.Errorf("only forced a simultaneous campaign in %d of %d trials — the latency floor "+
-			"(%v) is probably not comfortably above the election ticker's polling interval",
-			forced, trials, splitDelayFloor)
-	}
-
 	worst, sum := 0, 0
 	for _, r := range rounds {
 		sum += r
@@ -161,6 +160,28 @@ func TestForcedSplitVoteResolves(t *testing.T) {
 	if len(rounds) > 0 {
 		t.Logf("resolved %d forced splits: mean %.2f extra terms, worst %d",
 			len(rounds), float64(sum)/float64(len(rounds)), worst)
+	}
+
+	// PRE-VOTING ROUGHLY HALVES THE RATE, and the mechanism is worth knowing.
+	//
+	// Aligning the deadlines used to make every node campaign at the same
+	// instant. Now they all begin POLLING at the same instant, and whichever
+	// assembles a majority first sends RequestVote at term+1 -- which bumps
+	// every other node's currentTerm, so their in-flight runPreVote rounds
+	// abort on the `currentTerm != term-1` check and never campaign at all.
+	//
+	// Measured at 20-25 of 50 against 40-plus before, on the same seeds. That
+	// is pre-vote suppressing split votes rather than the harness failing to
+	// force them, and the property this test exists for -- that a split
+	// RESOLVES -- is still exercised twenty times over.
+	//
+	// The bar is therefore what it takes to notice the harness breaking
+	// outright, not what it took to notice the timing being marginal. The
+	// number to read is the count logged above.
+	if forced*10 < trials*2 {
+		t.Errorf("only forced a simultaneous campaign in %d of %d trials — the latency floor "+
+			"(%v) is probably not comfortably above the election ticker's polling interval",
+			forced, trials, splitDelayFloor)
 	}
 }
 
