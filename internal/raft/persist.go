@@ -284,7 +284,6 @@ func OpenNode(id int, peers []int, transport Transport, seed int64, storage Stor
 	// Everything at or below the floor is committed and applied by definition:
 	// that is what taking a snapshot means. With no snapshot the floor is 0 and
 	// this is the behaviour it always had.
-	n.commitIndex = n.lastIncludedIndex
 	n.lastApplied = n.lastIncludedIndex
 	n.commitTo(n.lastIncludedIndex)
 

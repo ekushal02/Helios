@@ -701,6 +701,11 @@ func (c *cluster) addNode() int {
 	if c.applyHook != nil {
 		c.watchNode(node)
 	}
+	node.mu.Lock()
+	node.setConfiguration(nil, 0)
+	node.baseServers = nil
+	node.mu.Unlock()
+
 	node.Start()
 	return id
 }
