@@ -2,14 +2,17 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.6 — leader election, log replication, the apply path, linearizable
+**Status:** v1.7 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
 lease. The log is compacted behind a state-machine image, and a follower that falls
 below the resulting floor is repaired with `InstallSnapshot` rather than entries.
 Verified under crashes, restarts, network partitions, message loss, reordering, and a
-node offline for ten thousand entries.
+node offline for ten thousand entries. The on-disk formats for the LSM storage engine
+that will back the state machine above the apply channel — write-ahead log record,
+SSTable data block, footer, and index — are now fixed on paper, and the write-ahead log
+itself is implemented and tested.
 
 ---
 
@@ -1342,10 +1345,172 @@ Deliberately unresolved. Each is answered by later work.
 - **Timing constants are scattered.** Each test file defines its own bounds. Consolidating
   them would make the suite's time budget visible in one place; worth doing alongside the
   virtual clock.
+- **The storage engine's `SyncBatch` policy has no driver yet.** `wal.WAL.Sync` is the
+  primitive a ticker or write-batcher would call to coalesce many concurrent appenders
+  behind one fsync (§13.1), on the same principle `persistIfDirty` already applies to
+  Raft's own persistent state — but nothing in the engine calls it on a schedule yet.
+  Wiring one is memtable work, not WAL work, so it waits on the memtable existing.
+- **SSTable block, index, and footer are designed but not built.** §13.2 fixes the byte
+  layout; the block writer, index builder, and reader that turn a flushed memtable into
+  a file on disk are the next task, along with the memtable itself that would produce
+  the input to flush.
 
 ---
 
-## 13. Revision log
+## 13. On-disk formats (storage engine)
+
+The state machine that sits above the apply channel (§2) is going to be an LSM engine
+with its own write-ahead log and its own SSTables, not a consumer of Raft's `Storage`
+interface (§5). The two are separate durability islands answering different questions.
+Raft's persistent state exists so that an agreement, once reached, is never
+re-litigated — it is what keeps `currentTerm` and `votedFor` from moving backwards.
+The engine's write-ahead log exists so that a command the state machine has already
+accepted is not forgotten by the process that accepted it, before that command has
+made it into an SSTable. Committing an entry answers "did the cluster agree to this;"
+the engine's WAL answers "did the layer above consensus actually write this down."
+Treating the first as sufficient evidence of the second — for instance, deciding a
+crashed and rebuilt state machine is fine because Raft's log still has the entry — would
+be the same mistake §2 warns against from the other direction: the state machine
+re-deriving a guarantee that belongs to a layer it must not read.
+
+### 13.1 Write-ahead log record — designed and implemented
+
+```
++-----------+-------------+-----------+------------------------+
+| CRC32(4B) | Length(4B)  | Type(1B)  | Payload (Length bytes) |
++-----------+-------------+-----------+------------------------+
+```
+
+`CRC32` covers `Type` and `Payload` only — never `Length`, and never itself. A reader
+does not need `Length` to be independently verified: a corrupted `Length` either reads
+too few or too many payload bytes, and either way the bytes that land in `Type`+`Payload`
+will not match the checksum. Covering `Length` as well would catch nothing that covering
+`Type`+`Payload` doesn't already catch, at the cost of a second checksum pass.
+
+`Length` is the payload length alone, not payload-plus-type, so a reader sizes its
+allocation before it has even looked at `Type`.
+
+Payload for a **Put**:
+
+```
++-------------+------------+---------------+--------------+
+| KeyLen(4B)  | Key(...)   | ValueLen(4B)  | Value(...)   |
++-------------+------------+---------------+--------------+
+```
+
+Payload for a **Delete**:
+
+```
++-------------+------------+
+| KeyLen(4B)  | Key(...)   |
++-------------+------------+
+```
+
+Both lengths are explicit rather than relying on a separator byte, on the same
+reasoning as the persistent-state blob in §5: a key or value is opaque as far as the
+WAL is concerned, and scanning it for a delimiter would break the moment a legitimate
+key or value happened to contain that byte.
+
+**A DEVIATION FROM LEVELDB'S BLOCK-FRAGMENTED WAL.** LevelDB frames records inside
+fixed 32KB blocks, splitting a record that crosses a block boundary into
+FIRST/MIDDLE/LAST fragments so a reader can bound how much it buffers per block and
+skip a corrupt block without losing the whole file. Helios's WAL records are single
+key/value pairs, not the multi-hundred-KB blocks that scheme exists to bound, and
+Replay already stops rather than skips past a bad record (see below) — so
+fragmentation would add a reassembly state machine, with its own partial-record and
+mid-write-crash cases, to buy nothing at the sizes this system currently produces.
+Revisit if a record ever needs to hold something too large to buffer comfortably in
+one piece; nothing here bounds a single record's size today.
+
+**Replay stops at the first torn or corrupt record, on purpose.** A WAL is written by
+exactly one appender in strictly increasing order, so once a record fails to validate —
+whether the file simply ends mid-record (a crash between two writes) or a record-sized
+span of bytes fails its CRC (corruption within the file) — everything after that point
+is either unwritten or the residue of an interrupted write. Nothing past it can be
+trusted regardless of whether it happens to decode cleanly, so `Replay` treats both
+cases identically: stop, and report how much of the file was valid. Distinguishing
+"torn" from "corrupt" is a diagnostic question, not a recovery one, and is left to an
+operator inspecting the file past the returned offset rather than encoded into the
+replay path itself.
+
+**Sync policy is the same fork `docs/fsync-policy.md` documents for Raft's persistent
+state, one layer up.** `SyncAlways` fsyncs every record and is the correct default for
+anything the caller intends to keep; `SyncNever` flushes to the OS buffer but never
+fsyncs, for tests and throughput measurement only; `SyncBatch` flushes on every append
+and leaves the fsync to an explicit `Sync` call, so a driver external to this package
+can coalesce many concurrent writers behind one flush the way `persistIfDirty`
+coalesces Raft's own writes. This package provides `Sync` as the primitive; wiring a
+ticker or write-batcher that calls it on a schedule is separate work, tracked in §12.
+
+**Implemented** at `internal/storage/wal/`. Round-trip, corrupt-record, and torn-tail
+recovery are exercised directly; the three sync policies are asserted to produce
+byte-identical replayed data, since policy governs only *when* an fsync happens, never
+what gets written or read back.
+
+### 13.2 SSTable block, footer, and index — designed, not yet implemented
+
+Fixed on paper now, alongside the WAL, because a memtable flush turns WAL-shaped
+records into SSTable entries and the two payload layouts are deliberately close in
+shape for that reason.
+
+**Data block** — a run of sorted entries followed by a per-block checksum:
+
+```
++-------------+------------+---------------+--------------+
+| KeyLen(4B)  | Key(...)   | ValueLen(4B)  | Value(...)   |
++-------------+------------+---------------+--------------+
+| ... further entries, sorted by key ...                   |
++------------------------------------------------------------+
+| BlockCRC32 (4B)                                             |
++------------------------------------------------------------+
+```
+
+Entries are sorted so that, once an index exists, a lookup inside a block can binary
+search rather than scan. No restart-point prefix compression yet — that is an open
+question (§12): it saves bytes on disk at the cost of a slightly more involved block
+reader, and nothing here needs the space back yet.
+
+**Index block** — one entry per data block, keyed by that block's last key, so a
+lookup binary-searches the index in memory and then reads exactly one data block off
+disk:
+
+```
++-------------+---------------+-----------------+------------------+
+| KeyLen(4B)  | LastKey(...)  | BlockOffset(8B) | BlockLength(4B)  |
++-------------+---------------+-----------------+------------------+
+| ... one entry per data block, in block order ...                 |
++---------------------------------------------------------------------+
+```
+
+**Footer** — fixed size, at the very end of the file:
+
+```
++--------------------+--------------------+-----------+
+| IndexOffset (8B)    | IndexLength (8B)   | Magic(8B) |
++--------------------+--------------------+-----------+
+```
+
+A reader opens the file, seeks to `len(file) − FooterSize`, and finds everything else
+from there without needing a preceding table of contents. `Magic` plays the same role
+`magic[4]` plays in the persistent-state record (§5): a reader that opens the wrong
+file, or a truncated one, learns that immediately from a magic mismatch instead of
+decoding garbage as a plausible-looking footer.
+
+*Rejected: a footer or table of contents at the front of the file.* An SSTable is
+written once, sequentially, one data block after another; the index and footer can
+only be assembled once every block's final offset is known, which means they are
+necessarily the last things written. Putting them at the front would mean either
+reserving a fixed size for them before the key count is known — wrong the moment it
+varies — or a second pass to backfill placeholder bytes, which a trailing footer
+avoids by construction.
+
+**Not yet implemented.** This is the byte layout, decided so the WAL and the SSTable
+agree on how a key/value pair is framed; the block writer, the index builder, and the
+reader that turns this layout into working code are separate, later work.
+
+---
+
+## 14. Revision log
 
 | Version | Change |
 |---|---|
@@ -1356,3 +1521,4 @@ Deliberately unresolved. Each is answered by later work.
 | v1.4 | Lease-based reads, with the clock-rate assumption and the process-pause residue documented; the send-time and quorum-ordering rules for deriving a lease; read latency measured across three link speeds, and the argument for the no-op on election revised in light of it from latency to log growth |
 | v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
 | v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened; the snapshot/AppendEntries interleavings pinned deterministically, with a same-term leader now refusing an image as it already refuses entries; recovery measured at image sizes up to a gigabyte, showing time is not the constraint and that both the encode and decode paths allocate a second copy of the image |
+| v1.7 | On-disk formats for the LSM storage engine fixed on paper: the write-ahead log record framing and its CRC coverage, with the departure from LevelDB's block-fragmented WAL recorded and reasoned through; the SSTable data block, index block, and trailing footer laid out, with the footer-at-the-end decision argued from the engine's own write order; the boundary between Raft's persistent state (§5) and the engine's write-ahead log stated explicitly, since the two are separate durability islands answering different questions. The write-ahead log itself implemented at `internal/storage/wal/`, with the three sync policies, corrupt-record handling, and torn-tail recovery tested directly; SSTable encoding left as designed-but-not-yet-built. |
