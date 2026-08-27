@@ -1447,6 +1447,41 @@ recovery are exercised directly; the three sync policies are asserted to produce
 byte-identical replayed data, since policy governs only *when* an fsync happens, never
 what gets written or read back.
 
+**Startup calls `Recover`, not `Replay` directly, and `Recover` truncates.** `Replay`
+by itself is read-only and leaves a torn or corrupt tail physically in place — correct
+for a pass that only wants to read, since the bad bytes are inert to a reader that stops
+before them. A boot sequence is not read-only, though: it replays and then resumes
+writing, and resuming into a file that still has the bad tail sitting in the middle
+creates a standing hazard rather than a one-time one. New records would land *after*
+the old corruption, so the file would read good records, then the bad tail, then the
+new records. The next restart's `Replay` stops at the same old corruption it stopped at
+the time before — nothing about those bytes changed — and never reaches anything
+written since. Every record appended after a recovery that did not truncate is lost on
+every restart from then on, silently, because the failure looks identical to a clean
+recovery until a second restart happens to be examined closely.
+
+`Recover` closes this by truncating the file to the valid prefix before handing back an
+open `WAL`, so a resumed writer's new tail begins exactly where the last good record
+ended and nothing appended afterward can ever be shadowed by corruption that record
+already argued past. The truncation is safe to interrupt: `Replay` is a deterministic
+function of the bytes on disk, so a crash between measuring the valid length and
+finishing the truncate just means the next `Recover` call measures the same length
+again, and truncating to a length the file is already at or under is a no-op.
+
+**Proven, not just argued.** A test writes five good records and a sixth that is then
+corrupted on disk by flipping a byte in its payload — the shape of a bad sector or a
+torn write that happened to leave a checksum failure rather than a clean short read.
+Recovery is asserted to (1) return without error, (2) recover exactly the five good
+records and nothing of the sixth, and (3) truncate the file to the offset the sixth
+record started at. A further append and a second, independent recovery pass then
+confirm the file replays *all six* records — the original five plus the new one — which
+is the assertion a truncation-free `Recover` would fail even while passing the first
+two: it would still stop cleanly at the same old corruption on the second pass and never
+reach the record written after the first recovery. A sibling test repeats the proof
+against a torn tail (a truncated file, standing in for a crash between two writes)
+rather than a bit flip, since a node cannot tell which shape of bad tail it is looking
+at without trying, and `Recover` must handle both identically.
+
 ### 13.2 SSTable block, footer, and index — designed, not yet implemented
 
 Fixed on paper now, alongside the WAL, because a memtable flush turns WAL-shaped
@@ -1521,4 +1556,4 @@ reader that turns this layout into working code are separate, later work.
 | v1.4 | Lease-based reads, with the clock-rate assumption and the process-pause residue documented; the send-time and quorum-ordering rules for deriving a lease; read latency measured across three link speeds, and the argument for the no-op on election revised in light of it from latency to log growth |
 | v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
 | v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened; the snapshot/AppendEntries interleavings pinned deterministically, with a same-term leader now refusing an image as it already refuses entries; recovery measured at image sizes up to a gigabyte, showing time is not the constraint and that both the encode and decode paths allocate a second copy of the image |
-| v1.7 | On-disk formats for the LSM storage engine fixed on paper: the write-ahead log record framing and its CRC coverage, with the departure from LevelDB's block-fragmented WAL recorded and reasoned through; the SSTable data block, index block, and trailing footer laid out, with the footer-at-the-end decision argued from the engine's own write order; the boundary between Raft's persistent state (§5) and the engine's write-ahead log stated explicitly, since the two are separate durability islands answering different questions. The write-ahead log itself implemented at `internal/storage/wal/`, with the three sync policies, corrupt-record handling, and torn-tail recovery tested directly; SSTable encoding left as designed-but-not-yet-built. |
+| v1.7 | On-disk formats for the LSM storage engine fixed on paper: the write-ahead log record framing and its CRC coverage, with the departure from LevelDB's block-fragmented WAL recorded and reasoned through; the SSTable data block, index block, and trailing footer laid out, with the footer-at-the-end decision argued from the engine's own write order; the boundary between Raft's persistent state (§5) and the engine's write-ahead log stated explicitly, since the two are separate durability islands answering different questions. The write-ahead log itself implemented at `internal/storage/wal/`, with the three sync policies, corrupt-record handling, and torn-tail recovery tested directly. Startup recovery added as `Recover`, distinct from a bare `Replay`, with the truncate-the-stale-tail step it performs and the reason skipping it would permanently hide every record written after a recovery that didn't truncate; proven with a test that deliberately corrupts a record's payload on disk, asserts recovery stops there cleanly, and then confirms a second, independent recovery pass sees a record appended after the first one — the assertion a truncation-free recovery would fail. SSTable encoding left as designed-but-not-yet-built. |

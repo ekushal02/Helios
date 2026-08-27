@@ -167,6 +167,86 @@ func (w *WAL) Close() error {
 	return w.file.Close()
 }
 
+// Recover performs the startup sequence for a WAL: replay every
+// well-formed record in path, in order, invoking fn for each one, and
+// return a WAL opened and ready to accept new appends.
+//
+// This is the entry point a node's boot path calls, rather than Replay
+// directly, because replaying is only half of startup. The other half is
+// putting the file into a state new writes can safely land in, and that
+// requires truncating away whatever Replay refused to read.
+//
+// Truncation here is not cosmetic, and skipping it is a real bug, not a
+// style choice. Replay leaves a torn or corrupt tail physically in place
+// -- correct for a read-only pass, where the bad bytes are inert. But a
+// writer that reopened the file in append mode without truncating first
+// would place every new record *after* that bad tail rather than in place
+// of it. The file would then read, in order: good records, one corrupt or
+// torn record, and then the new records written since. The next restart's
+// Replay stops at the same old corruption it stopped at before -- because
+// nothing about the bytes changed, only what was appended after them --
+// and every record written after the "recovery" that never actually
+// recovered is silently lost on every subsequent restart, forever. The
+// corruption does not just cost the tail it damaged; left untruncated, it
+// permanently blinds replay to everything appended after it.
+//
+// Truncating first closes that gap: the new tail begins exactly where the
+// last known-good record ended, so nothing appended post-recovery can ever
+// be shadowed by corruption that record already argued past.
+//
+// Truncation is safe to interrupt. If the process dies between measuring
+// validUpTo and finishing the truncate, the next Recover call replays the
+// same file and arrives at the same validUpTo -- Replay is a deterministic
+// function of the bytes on disk, and truncating to a length the file is
+// already at or below is a no-op. There is no window in which a crash
+// mid-truncate can lose a record Replay had already reported as valid.
+func Recover(path string, policy SyncPolicy, fn func(Entry) error) (*WAL, error) {
+	validUpTo, err := Replay(path, fn)
+	if err != nil {
+		return nil, fmt.Errorf("wal: recover %s: replay: %w", path, err)
+	}
+	if err := truncateToValid(path, validUpTo); err != nil {
+		return nil, fmt.Errorf("wal: recover %s: truncate stale tail: %w", path, err)
+	}
+	return Open(path, policy)
+}
+
+// truncateToValid drops any bytes in path beyond validUpTo -- the torn or
+// corrupt tail Replay stopped at, if any. A missing file is not an error:
+// there is nothing to truncate, and Open (called by Recover right after)
+// creates it fresh. Truncating to a length the file is already at or
+// under is deliberately a no-op, which is what makes Recover idempotent
+// across a crash between replay and truncation.
+func truncateToValid(path string, validUpTo int64) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("wal: open for truncate: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("wal: stat before truncate: %w", err)
+	}
+	if info.Size() <= validUpTo {
+		return nil
+	}
+	if err := f.Truncate(validUpTo); err != nil {
+		return fmt.Errorf("wal: truncate: %w", err)
+	}
+	// The truncate is a metadata change on an existing file, not a
+	// rename over one -- there is no directory entry to flush, only the
+	// file's own size. Sync makes that size change durable before this
+	// process starts appending past it.
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("wal: fsync after truncate: %w", err)
+	}
+	return nil
+}
+
 // Entry is one successfully decoded WAL record, surfaced during Replay.
 type Entry struct {
 	Offset int64 // file offset the record started at
