@@ -179,11 +179,14 @@ func (m *Memtable) Len() int {
 	return int(m.length.Load())
 }
 
-// ApplyPut and ApplyDelete satisfy the wal.Sink interface structurally --
-// this package does not import package wal, so a Memtable can be handed
-// straight to wal.RecoverAndOpen as the sink that rebuilds it on startup
-// without creating a dependency in either direction beyond that one call
-// site.
+// ApplyPut and ApplyDelete are what let a Memtable be rebuilt from a WAL
+// without this package ever importing package wal: they are exactly the
+// two operations engine.RecoverMemtable calls from inside the closure it
+// hands to wal.Recover, one per WAL record type, which is the actual
+// wiring described here since v1.12 rather than the "wal.Sink interface"
+// and "wal.RecoverAndOpen" that earlier versions of this comment claimed
+// -- neither of which ever existed in package wal. See
+// engine.RecoverMemtable's own doc for the correction in full.
 func (m *Memtable) ApplyPut(key, value []byte) { m.Put(key, value) }
 func (m *Memtable) ApplyDelete(key []byte)     { m.Delete(key) }
 
