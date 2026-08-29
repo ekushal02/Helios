@@ -2,18 +2,20 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.8 — leader election, log replication, the apply path, linearizable
+**Status:** v1.10 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
 lease. The log is compacted behind a state-machine image, and a follower that falls
 below the resulting floor is repaired with `InstallSnapshot` rather than entries.
 Verified under crashes, restarts, network partitions, message loss, reordering, and a
-node offline for ten thousand entries. The on-disk formats for the LSM storage engine
-that will back the state machine above the apply channel — write-ahead log record,
-SSTable data block, footer, and index — are fixed on paper. The write-ahead log and the
-memtable (a skip list) are both implemented and tested, including concurrent reads
-against a single writer.
+node offline for ten thousand entries. The LSM storage engine that will back the state
+machine above the apply channel is under active development: the write-ahead log, the
+memtable (a skip list, with approximate size tracking for a flush trigger), and
+SSTable read/write (data blocks, an index, a footer, and the flush path that produces
+one from a full memtable) are all implemented and tested. A Bloom filter is implemented
+and measured against its theoretical false-positive curve, not yet wired into the
+SSTable paths that will use it.
 
 ---
 
@@ -1351,16 +1353,54 @@ Deliberately unresolved. Each is answered by later work.
   behind one fsync (§13.1), on the same principle `persistIfDirty` already applies to
   Raft's own persistent state — but nothing in the engine calls it on a schedule yet.
   Wiring one is memtable work, not WAL work, so it waits on the memtable existing.
-- **SSTable block, index, and footer are designed but not built.** §13.2 fixes the byte
+- **SSTable block, index, and footer are designed but not built.** ~~§13.2 fixes the byte
   layout; the block writer, index builder, and reader that turn a flushed memtable into
-  a file on disk are the next task.
-- **Memtable flush trigger is not implemented.** `Len()` reports a distinct-key count,
+  a file on disk are the next task.~~ **Closed in v1.9** — see §13.2.
+- **Memtable flush trigger is not implemented.** ~~`Len()` reports a distinct-key count,
   not an approximate byte size, and nothing yet decides when a memtable is full and
   should be switched out and flushed. The Raft log's own compaction trigger (§10)
   already argues for measuring the right quantity rather than a proxy for it; the same
   argument applies here; a size estimate, not an entry count, is almost certainly the
-  right trigger, and is not yet measured.
-- **The skip list has no `Seek`.** `NewIterator` only walks from the beginning. A range
+  right trigger, and is not yet measured.~~ **Closed in v1.9** — see §13.4.
+- **No multi-memtable or multi-SSTable read path yet.** §13.4's `FlushIfFull` blocks the
+  caller for the duration of one flush and does not swap a fresh memtable into the write
+  path first, so as written a flush would stall writes rather than run underneath them.
+  §13.4's read-path sketch ("checks the active memtable first, then any memtables
+  mid-flush, then SSTables oldest-to-newest") describes the target shape; nothing yet
+  merges more than one source, and nothing yet decides which SSTable, if several exist,
+  is newest. This is the next task the flush trigger sets up.
+- **SSTable file naming and manifest are not designed.** `sstable.Write` and `FlushIfFull`
+  both take a caller-supplied path and do nothing to track which SSTables exist, in what
+  order, or which have been superseded by compaction. `Info.Path`/`Info.Bytes` give a
+  caller enough to build that bookkeeping, but nothing here does yet — needed before more
+  than one SSTable can coexist meaningfully.
+- **SSTable block reads scan linearly rather than binary search.** §13.2's original
+  design already anticipated this ("once an index exists, a lookup inside a block can
+  binary search rather than scan"); the reader implemented in v1.9 scans a block's
+  entries in order instead, bounded by `targetBlockSize` but not yet optimised. Revisit
+  once block reads show up in a measurement, the same way the WAL's sync policy was
+  measured before being tuned rather than guessed at up front.
+- **`targetBlockSize` (4KB) is asserted, not measured.** Chosen as a conservative,
+  page-sized default with no workload behind the number, unlike the compaction trigger
+  and the fsync policy, which were both picked after measuring. The right value trades
+  off index size (smaller blocks, bigger index) against read amplification (bigger
+  blocks, more wasted bytes per point lookup); nothing here has measured either side yet.
+- **Bloom filter is not wired into the SSTable write or read paths.** §13.5 implements
+  and measures the filter itself; `Write` does not build one per file, `Open` does not
+  load one, and `Get` does not consult one before its block read. This is the whole
+  reason the structure exists — skipping a disk read for a key that turns out to be
+  absent — and none of that payoff is realized yet.
+- **No filter serialization format.** A Bloom filter built at flush time has to survive
+  being written to and read back from disk to be useful across a process restart, the
+  same way the index and footer do (§13.2). Nothing here has designed where a filter's
+  bytes would live in the file layout (a fourth section before the footer, most likely)
+  or how a reader would know its size without a length prefix somewhere. Blocked on the
+  wiring question above — no point designing a format for a filter nothing yet builds.
+- **`bitsPerKey` is not chosen for this engine, only measured in the abstract.** §13.5's
+  table shows three settings' actual behavior but does not pick one as Helios's default,
+  the way the fsync policy (`docs/fsync-policy.md`) and `targetBlockSize` (§13.2) still
+  haven't been picked from measurement either. Revisit once real workload numbers exist
+  to trade read-amplification savings against the per-key memory cost.
   scan from an arbitrary start key — which an SSTable read path merging several sources
   will eventually want — needs a seek that reuses `search`'s predecessor-finding walk
   rather than a full scan from the head. Deferred until something needs it.
@@ -1496,28 +1536,52 @@ against a torn tail (a truncated file, standing in for a crash between two write
 rather than a bit flip, since a node cannot tell which shape of bad tail it is looking
 at without trying, and `Recover` must handle both identically.
 
-### 13.2 SSTable block, footer, and index — designed, not yet implemented
+### 13.2 SSTable block, footer, and index — implemented
 
-Fixed on paper now, alongside the WAL, because a memtable flush turns WAL-shaped
-records into SSTable entries and the two payload layouts are deliberately close in
+Fixed on paper alongside the WAL, because a memtable flush turns WAL-shaped records
+into SSTable entries and the two payload layouts are deliberately close in
 shape for that reason.
 
 **Data block** — a run of sorted entries followed by a per-block checksum:
 
 ```
-+-------------+------------+---------------+--------------+
-| KeyLen(4B)  | Key(...)   | ValueLen(4B)  | Value(...)   |
-+-------------+------------+---------------+--------------+
-| ... further entries, sorted by key ...                   |
-+------------------------------------------------------------+
-| BlockCRC32 (4B)                                             |
-+------------------------------------------------------------+
++---------+-------------+------------+---------------+--------------+
+| Type(1B)| KeyLen(4B)  | Key(...)   | ValueLen(4B)  | Value(...)   |    (Put)
++---------+-------------+------------+---------------+--------------+
++---------+-------------+------------+
+| Type(1B)| KeyLen(4B)  | Key(...)   |                                   (Delete)
++---------+-------------+------------+
+| ... further entries, sorted by key ...                              |
++-----------------------------------------------------------------------+
+| BlockCRC32 (4B)                                                       |
++-----------------------------------------------------------------------+
 ```
 
 Entries are sorted so that, once an index exists, a lookup inside a block can binary
 search rather than scan. No restart-point prefix compression yet — that is an open
 question (§12): it saves bytes on disk at the cost of a slightly more involved block
-reader, and nothing here needs the space back yet.
+reader, and nothing here needs the space back yet. The current reader also does not
+binary-search *within* a block once it has located the right one — see §12's note on
+this being a linear scan for now, bounded by `targetBlockSize` but not yet optimised.
+
+**THE TYPE BYTE IS A DEVIATION FROM THE ORIGINAL v1.7 DRAFT OF THIS SECTION**, which
+had no per-entry discriminator and simply mirrored the WAL's Put payload. That was an
+oversight, not a considered simplification: the WAL tells a Put and a Delete apart
+using its own *record-level* Type field (§13.1), because a WAL is a sequence of
+independently framed records each with its own header. A data block has no equivalent
+outer framing once the WAL's record boundary is gone — its entries share one
+`BlockCRC32` and one physical run — so without a discriminator, a tombstone flushed
+out of the memtable would be indistinguishable on disk from a legitimate empty-string
+value. That is exactly the read bug §13.4's three-outcome `Get` contract exists to
+prevent one layer up, reintroduced one layer down. A sentinel encoding (`ValueLen =
+0xFFFFFFFF`, say, in place of a type byte) was considered and rejected on the same
+reasoning the WAL already applied to keys and values themselves: a value is opaque as
+far as this format is concerned, and a sentinel is only safe until something
+legitimately produces the bytes it claimed no one would. One byte per entry, always
+present, rules the ambiguity out structurally instead of by convention. A Delete entry
+carries no value field at all — not a zero-length one — for the same reason the WAL's
+own Delete payload doesn't (§13.1): the two payload shapes were meant to stay close,
+and this keeps them close in the one place the earlier draft had let them drift apart.
 
 **Index block** — one entry per data block, keyed by that block's last key, so a
 lookup binary-searches the index in memory and then reads exactly one data block off
@@ -1531,6 +1595,10 @@ disk:
 +---------------------------------------------------------------------+
 ```
 
+`BlockLength` is the block's full on-disk size, `BlockCRC32` included — a reader that
+has read one index entry can read exactly `BlockLength` bytes at `BlockOffset` and
+hand the whole thing straight to CRC verification without a second seek.
+
 **Footer** — fixed size, at the very end of the file:
 
 ```
@@ -1543,7 +1611,8 @@ A reader opens the file, seeks to `len(file) − FooterSize`, and finds everythi
 from there without needing a preceding table of contents. `Magic` plays the same role
 `magic[4]` plays in the persistent-state record (§5): a reader that opens the wrong
 file, or a truncated one, learns that immediately from a magic mismatch instead of
-decoding garbage as a plausible-looking footer.
+decoding garbage as a plausible-looking footer. The eight bytes chosen are the ASCII
+string `HELIOSST`, for no reason beyond being memorable in a hex dump.
 
 *Rejected: a footer or table of contents at the front of the file.* An SSTable is
 written once, sequentially, one data block after another; the index and footer can
@@ -1553,11 +1622,98 @@ reserving a fixed size for them before the key count is known — wrong the mome
 varies — or a second pass to backfill placeholder bytes, which a trailing footer
 avoids by construction.
 
-**Not yet implemented.** This is the byte layout, decided so the WAL and the SSTable
-agree on how a key/value pair is framed; the block writer, the index builder, and the
-reader that turns this layout into working code are separate, later work.
+**Target block size** is 4KB (`targetBlockSize`), bounding how much a reader buffers
+to satisfy one `Get` — the same reason LevelDB fragments its own log into 32KB blocks
+(§13.1), applied here to reads rather than writes. A block is allowed to exceed the
+target by exactly one entry: the writer only refuses to *start* a new entry in an
+already-over-target block, never closes an empty one to satisfy the budget. Closing an
+empty block on this check would leave any single entry larger than `targetBlockSize`
+unwritable — the same "always make forward progress on the record in hand" argument
+the WAL's own no-fragmentation note already makes (§13.1). The number itself is a
+conservative starting point, not yet measured against this engine's workload; see §12.
 
-### 13.3 Memtable — a skip list, implemented
+**Atomicity.** A complete SSTable — every data block, the index, and the footer — is
+built under a temporary filename and published with the same write-temp / fsync /
+rename / fsync-directory sequence `FileStorage` uses for Raft's own persistent state
+(§5), for the identical reason: a write of more than one sector is not atomic, and a
+crash mid-write must never leave a reader able to open a file at the final path whose
+footer, index, or trailing blocks don't actually exist. This is a sharper requirement
+than the WAL's, and deliberately handled differently. The WAL is append-only and a
+reader already tolerates a torn tail by design (§13.1); an SSTable has no equivalent
+tolerance, because its footer is the only way in and is meaningless until every block
+and the index behind it exist. Publishing an already-complete file with one `rename`
+is exactly the case that primitive exists for. `Write` also refuses outright to
+overwrite a file already at the destination path — an SSTable is immutable once
+published, and silently clobbering one a manifest or another reader might still be
+holding open would violate that guarantee rather than merely bend it.
+
+**Ordering is asserted, not just assumed.** `Write` rejects a source that produces a
+key out of order (or repeated) relative to the one before it, the same
+believed-impossible-conditions-are-guarded-not-assumed posture §8 takes toward Raft's
+apply path. `*memtable.Iterator` can never itself violate this — it walks the skip
+list's own ordered level-0 lane — so in production the guard should never fire; it
+exists for the same reason the memtable's own writer mutex exists for a hypothetical
+second writer (§13.4): correctness for a caller that shouldn't occur, at negligible
+cost to provide.
+
+**Reading.** `Open` reads the footer, then the index, into memory — nothing else —
+and reads exactly one data block per `Get`, found by binary-searching the in-memory
+index for the first block whose `LastKey` is `>=` the key being looked up. `Get`
+carries the same three-outcome contract `(*memtable.Memtable).Get` does: never found,
+found-and-tombstoned, or found-and-live, for the same reason (§13.4) — an SSTable
+sitting underneath one or more memtables in a future read path must be able to tell
+"absent" from "deleted here" without falling through to whatever it holds underneath.
+
+**Implemented** at `internal/storage/sstable/`, across `block.go` (entry framing and
+per-block CRC), `index.go` (the index and footer), `writer.go` (`Write`, the streaming
+block builder, and the atomic publish sequence), and `reader.go` (`Open` and `Get`).
+Correctness is checked by a round-trip test against a 5,000-entry reference map with
+randomly sized values (forcing several data blocks), a dedicated tombstone-preservation
+test, the missing-key contract, block-size bounds, index-sort order, and CRC-corruption
+detection at both the block and footer level — all under `-race -shuffle=on -count=3`.
+
+### 13.3 Memtable flush trigger — implemented
+
+Closes the other half of the open question §13.2 used to end on: something has to
+decide when a memtable is full and act on it. Two things were missing, addressed
+separately because they belong to different packages.
+
+**What "full" means, reported by the memtable itself.** `(*Memtable).ApproxSize()`
+sums the key and value bytes every `Put` and `Delete` has ever added or changed —
+tombstones contribute their key bytes only, matching what a flush actually writes for
+one (§13.2's Delete entry has no value field). `Len()` already existed and was never
+the right signal: it counts distinct keys, so a memtable holding one 10MB value and one
+holding ten thousand one-byte values would look identical to it, but wildly different
+to a flush. This is the same lesson the Raft log's own compaction trigger already
+paid for (§10) — measuring `logLength()` in place of the discardable-entry count it
+actually needed produced roughly 160× more snapshots than necessary — applied a second
+time to a second layer's sizing decision. `ApproxSize` is approximate in one direction
+only: it excludes the skip list's own per-node overhead (pointers, the `entryValue`
+box), which is real but roughly constant per key regardless of value size, so it
+shifts where the true resident size sits without changing where a threshold should.
+
+**Deciding "full enough," left to the caller, same as always.** The memtable's own
+type doc has said since §13.4 was written that switching to a fresh memtable and
+flushing the old one is the caller's job, not this package's. That boundary is kept:
+`ApproxSize` only answers "how big," never "is that big enough." `sstable.FlushIfFull`
+is the thin trigger that makes the decision and acts on it — compare `ApproxSize`
+against a caller-supplied threshold, and if it's reached, call `Flush` (§13.2's
+`Write`, fed from the memtable's own `Iterator`). It is deliberately minimal: it does
+not choose a file path or a sequence number (the caller does, the same way `wal.Open`
+takes a full path rather than inventing a naming scheme), does not swap a fresh
+memtable into the write path, does not clear or reset the memtable it just flushed —
+`Memtable` has no such operation, by design (§13.4) — and does not run in the
+background. All of that is orchestration belonging to a layer above both packages that
+does not exist yet; see §12.
+
+**Implemented** at `internal/storage/memtable/memtable.go` (`ApproxSize`, and the size
+bookkeeping added to `upsert`) and `internal/storage/sstable/flush.go` (`Flush`,
+`FlushIfFull`). Tested: `ApproxSize` against inserts, overwrites in both directions,
+deletes of both new and existing keys, and delete-then-put; `FlushIfFull` below and at
+threshold, and confirmed — with a test, not just the doc comment above — to leave the
+source memtable's `ApproxSize` and contents completely unchanged after flushing it.
+
+### 13.4 Memtable — a skip list, implemented
 
 The memtable is the sorted, in-memory structure every write lands in before it is
 durable in an SSTable: the WAL (§13.1) makes a write crash-safe, and the memtable is
@@ -1658,12 +1814,96 @@ startup path is what wires the two together, by calling
 
 **Implemented** at `internal/storage/memtable/`, across `skiplist.go` (the node type,
 the lock-free `search`, and level selection), `memtable.go` (the public `Put` / `Delete`
-/ `Get` / `Len` surface and the `wal.Sink` methods), and `iterator.go`. Correctness is
-checked against a reference map built alongside 5,000 randomly ordered inserts,
-including duplicate keys and tombstones; concurrency is checked by four dedicated
-tests — concurrent reads alone, concurrent reads against a single writer inserting new
-keys, concurrent reads against a single writer overwriting one hot key (the torn-value
-check above), and concurrent iteration against a writer — all run under `-race
+/ `Get` / `Len` / `ApproxSize` surface and the `wal.Sink` methods), and `iterator.go`.
+Correctness is checked against a reference map built alongside 5,000 randomly ordered
+inserts, including duplicate keys and tombstones; concurrency is checked by four
+dedicated tests — concurrent reads alone, concurrent reads against a single writer
+inserting new keys, concurrent reads against a single writer overwriting one hot key
+(the torn-value check above), and concurrent iteration against a writer — all run under
+`-race -shuffle=on -count=3`. `ApproxSize`, added in v1.9, has its own dedicated tests
+covering inserts, overwrites in both directions, deletes of both new and existing keys,
+and delete-then-put — see §13.3.
+
+### 13.5 Bloom filter — implemented, measured
+
+Built as a standalone data structure, deliberately not yet wired into the SSTable
+write or read paths (§13.2). A point lookup for a key that turns out to be absent from
+a given SSTable currently costs one block read to discover that (§13.2's `Get`); the
+whole reason an LSM engine grows a Bloom filter is to answer "definitely not here"
+for most of those lookups from a small in-memory structure instead, without touching
+disk. Wiring one into `Write` (built once, over the same sorted keys a flush already
+iterates) and `Open`/`Get` (checked before the index search) is real work belonging to
+a later task; this one is the filter itself, built and its own core claim — the
+false-positive rate follows the standard formula — checked against real numbers before
+anything depends on it.
+
+**The structure.** A fixed-size bit array, `Add` and `Test` each touching `k` bits
+derived from a key by Kirsch-Mitzenmacher double hashing: `h_i = h1 + i·h2 (mod
+numBits)`. `k`, the number of probes, is chosen once at construction time from
+`bitsPerKey` — `k = round(bitsPerKey · ln 2)`, clamped to `[1, 30]` — the standard
+result for the `k` that minimizes false-positive rate at a given bits-per-key budget.
+`Test` never produces a false negative: a key's bits, once set by `Add`, are never
+cleared by anything, and there is no remove operation.
+
+**THE FIRST HASH CONSTRUCTION TRIED DID NOT WORK, AND THE MEASUREMENT IS WHAT CAUGHT
+IT.** `h1` and `h2` were originally FNV-1 and FNV-1a — the same algorithm with its
+multiply and XOR steps swapped — on the reasoning that Kirsch-Mitzenmacher double
+hashing only needs `h2` to disagree with `h1` across most inputs, not to be
+cryptographically independent of it. Measuring against the theoretical curve showed
+that reasoning was wrong in practice: observed false-positive rates ran 2×–10× the
+theoretical value, and — the detail that pointed at the actual cause rather than
+generic noise — the excess grew with `k`, worse at higher bits-per-key settings, not
+uniform across all three. FNV-1 and FNV-1a are close enough as transformations of the
+same bytes that their outputs correlate more than the double-hashing proof's
+independence assumption tolerates, and that correlation compounds as more linear
+combinations of `h1` and `h2` get probed. The fix was to stop hashing the key a second
+time and instead derive `h2` from `h1` through `mix64`, the splitmix64 finalizer (also
+used as MurmurHash3's 64-bit finalizer): three xorshift/multiply rounds giving full
+avalanche, so every input bit influences every output bit. This is the same shape
+LevelDB's own Bloom filter takes — one real hash, every other probe derived from it —
+rather than a coincidence. Re-measured after the fix, every setting landed inside its
+tolerance band; see the table below. **The lesson generalizes past this one
+structure**: two hashes being "different algorithms" is not the same claim as two
+hashes being independent enough for a construction that assumes independence, and the
+gap between those two claims is exactly what a passing-looking implementation can hide
+until it's measured against a number with a formula behind it.
+
+**The formula, evaluated at what `New` actually builds, not an idealization of it.**
+`TheoreticalFalsePositiveRate(numKeys, bitsPerKey)` computes `p = (1 − e^(−kn/m))^k`
+at the same `n`, `m`, and `k` a `Filter` for those parameters would actually use —
+`m` rounded up to a whole number of bytes and `k` rounded to an integer, both by the
+same `sizeFor` helper `New` itself calls — rather than the simplified asymptotic
+`p ≈ 0.6185^bitsPerKey` some references quote, which assumes both quantities are
+real-valued. The two roundings are small at the sizes this engine measures at, but
+computing the exact formula costs nothing extra and removes a source of "why doesn't
+my number match the reference" that has nothing to do with the implementation.
+
+**Measured**, 50,000 keys added, 200,000 disjoint keys tested against, three widely
+spread bits-per-key settings — 6 (space-favoring), 10 (LevelDB's and RocksDB's shared
+default), and 14 (accuracy-favoring):
+
+| bits/key | k | bits (array size) | theoretical FPR | observed FPR | ratio |
+|---|---|---|---|---|---|
+| 6  | 4 | 300,000 | 0.05606 | 0.05591 | 0.997 |
+| 10 | 6 | 500,000 | 0.00844 | 0.00842 | 0.998 |
+| 14 | 9 | 700,000 | 0.00121 | 0.00125 | 1.027 |
+
+Every observed rate falls within a tolerance band derived from the sampling
+distribution itself — the count of false positives among 200,000 independent trials
+at the theoretical rate `p` is `Binomial(200000, p)`, so the band is six standard
+deviations (`6·√(p(1−p)/200000)`) plus a 10% relative margin, wide enough to absorb
+FNV-1a-and-`mix64` not being a literal uniform-random oracle without hiding a real
+implementation bug the way the pre-fix numbers were not hidden by it.
+
+**Implemented** at `internal/storage/bloom/`, across `bloom.go` (`New`, `Add`, `Test`,
+`OptimalK`, `TheoreticalFalsePositiveRate`, and the hashing internals above),
+`bloom_test.go` (the never-a-false-negative invariant, checked exhaustively rather
+than sampled; an empty filter matching nothing; sizing always rounding to a whole
+number of bytes; degenerate non-positive inputs clamped rather than rejected; and
+determinism — two identically built filters agreeing on every `Test` call, which is
+what makes the measurement below reproducible run to run), and `measure_test.go` (the
+false-positive measurement above, plus a coarse monotonicity check that the rate never
+gets worse as bits-per-key rises, independent of the exact numbers). All under `-race
 -shuffle=on -count=3`.
 
 ---
@@ -1681,4 +1921,6 @@ check above), and concurrent iteration against a writer — all run under `-race
 | v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
 | v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened; the snapshot/AppendEntries interleavings pinned deterministically, with a same-term leader now refusing an image as it already refuses entries; recovery measured at image sizes up to a gigabyte, showing time is not the constraint and that both the encode and decode paths allocate a second copy of the image |
 | v1.7 | On-disk formats for the LSM storage engine fixed on paper: the write-ahead log record framing and its CRC coverage, with the departure from LevelDB's block-fragmented WAL recorded and reasoned through; the SSTable data block, index block, and trailing footer laid out, with the footer-at-the-end decision argued from the engine's own write order; the boundary between Raft's persistent state (§5) and the engine's write-ahead log stated explicitly, since the two are separate durability islands answering different questions. The write-ahead log itself implemented at `internal/storage/wal/`, with the three sync policies, corrupt-record handling, and torn-tail recovery tested directly. Startup recovery added as `Recover`, distinct from a bare `Replay`, with the truncate-the-stale-tail step it performs and the reason skipping it would permanently hide every record written after a recovery that didn't truncate; proven with a test that deliberately corrupts a record's payload on disk, asserts recovery stops there cleanly, and then confirms a second, independent recovery pass sees a record appended after the first one — the assertion a truncation-free recovery would fail. SSTable encoding left as designed-but-not-yet-built. |
-| v1.8 | The memtable implemented as a skip list (§13.3): lock-free `Get` and iteration against a single mutex-serialized writer, an atomically-swapped value-plus-tombstone pair per key so neither a splice nor an update can ever be observed half-done, and a per-instance seeded RNG for level selection on the same rule as Raft's election timer. Three structures — red-black tree, sorted slice, skip list — compared and the choice argued from which one lets a new node's publication be a single atomic pointer write. `Memtable` satisfies `wal.Sink` structurally, wiring the write-ahead log's recovery path to the memtable without either package importing the other. Concurrency argued from the memory model and then checked directly: concurrent reads alone, concurrent reads against a single inserting writer, concurrent reads against a single updating writer with byte-level torn-value detection, and concurrent iteration against a writer, all under `-race -shuffle=on -count=3`; a fifth test drives sixteen concurrent writers on disjoint keys through the same internal mutex production never contends, on the same "guarded, not assumed" reasoning §8 applies to Raft's own believed-impossible states.
+| v1.8 | The memtable implemented as a skip list (§13.4): lock-free `Get` and iteration against a single mutex-serialized writer, an atomically-swapped value-plus-tombstone pair per key so neither a splice nor an update can ever be observed half-done, and a per-instance seeded RNG for level selection on the same rule as Raft's election timer. Three structures — red-black tree, sorted slice, skip list — compared and the choice argued from which one lets a new node's publication be a single atomic pointer write. `Memtable` satisfies `wal.Sink` structurally, wiring the write-ahead log's recovery path to the memtable without either package importing the other. Concurrency argued from the memory model and then checked directly: concurrent reads alone, concurrent reads against a single inserting writer, concurrent reads against a single updating writer with byte-level torn-value detection, and concurrent iteration against a writer, all under `-race -shuffle=on -count=3`; a fifth test drives sixteen concurrent writers on disjoint keys through the same internal mutex production never contends, on the same "guarded, not assumed" reasoning §8 applies to Raft's own believed-impossible states. |
+| v1.9 | The memtable flush path implemented end to end (§13.2, §13.3). SSTable data blocks, index, and footer built out at `internal/storage/sstable/`, closing the open question v1.7 left behind — including a per-entry type byte the original paper design was missing, added and argued for so a flushed tombstone can't be mistaken for a legitimate empty value once the WAL's own record-level discriminator is no longer available to lean on. `Write` streams a sorted source into 4KB-target data blocks and publishes the finished file with the same write-temp/fsync/rename/fsync-directory sequence `FileStorage` already uses for Raft's own state, refusing outright to overwrite an existing path. `Open`/`Get` binary-search the in-memory index and verify each block's CRC before trusting it, with the binary-search step later factored into its own `findBlock` and given dedicated boundary tests (exact `LastKey` matches, the gap between blocks, before-first and past-last). `(*Memtable).ApproxSize` closes the other half of the open question — key-and-value byte tracking added to `upsert`, replacing `Len`'s distinct-key count as the quantity a flush decision should be based on, on the same measure-the-real-quantity argument the Raft compaction trigger's own fix already established (§10). `sstable.FlushIfFull` is the thin trigger tying the two together: compares `ApproxSize` against a caller-supplied threshold and flushes if reached, deliberately stopping short of choosing a file path, swapping in a fresh memtable, or running in the background — all recorded as still-open work, alongside the block reader's linear in-block scan and the unmeasured 4KB block-size default. |
+| v1.10 | A Bloom filter implemented and measured at `internal/storage/bloom/` (§13.5), standalone and not yet wired into the SSTable write or read paths. Kirsch-Mitzenmacher double hashing derives `k` probe positions from two base hashes; `k` itself chosen from `bitsPerKey` by the standard `k = bitsPerKey · ln 2` result, clamped to `[1, 30]`. The first hash construction tried — FNV-1 and FNV-1a as the two base hashes — measured 2x-10x the theoretical false-positive rate, worse at higher `k`, which is what pointed at correlated hashes rather than generic noise as the cause; fixed by deriving the second hash from the first through `mix64` (the splitmix64/MurmurHash3 finalizer) instead of hashing the key a second time with a related algorithm, the same one-real-hash shape LevelDB's own filter takes. Re-measured after the fix: observed false-positive rate within 3% of the theoretical formula — evaluated at the actual, rounded `n`, `m`, and `k` a filter is built with, not the simplified asymptotic approximation — at three widely spread bits-per-key settings (6, 10, and 14, the last two bracketing LevelDB's and RocksDB's shared default). Wiring the filter into a flush and a lookup, and designing where its bytes would live in the SSTable file format, both recorded as open questions rather than attempted here. |
