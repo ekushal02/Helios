@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.10 — leader election, log replication, the apply path, linearizable
+**Status:** v1.15 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -11,11 +11,21 @@ below the resulting floor is repaired with `InstallSnapshot` rather than entries
 Verified under crashes, restarts, network partitions, message loss, reordering, and a
 node offline for ten thousand entries. The LSM storage engine that will back the state
 machine above the apply channel is under active development: the write-ahead log, the
-memtable (a skip list, with approximate size tracking for a flush trigger), and
-SSTable read/write (data blocks, an index, a footer, and the flush path that produces
-one from a full memtable) are all implemented and tested. A Bloom filter is implemented
-and measured against its theoretical false-positive curve, not yet wired into the
-SSTable paths that will use it.
+memtable (a skip list, with approximate size tracking for a flush trigger), SSTable
+read/write (data blocks, an index, a footer, sequential iteration, a k-way merge, and
+the flush path that produces one from a full memtable), a Bloom filter (implemented and
+measured against its theoretical false-positive curve, not yet wired into the SSTable
+paths that will use it), a merged read/write path (`engine.Reader` across memtables and
+SSTables newest-first; `engine.Writer` durably recording both puts and deletes through
+the WAL before the memtable), and leveled compaction — including a background runner
+(`compaction.Background`) that drains a compaction backlog on its own goroutine, with
+write-latency measured directly against a live `engine.Writer` running concurrently,
+and startup recovery (`compaction.Recover`) that cleans up orphaned files from a crash
+mid-compaction and validates every file the manifest still claims exists actually
+does — are all implemented and tested. Not yet wired into a single engine that swaps
+a full memtable out from under live writes and flushes it into the manifest
+`Background` compacts, so that a live write workload actually feeds the backlog
+`Background` drains rather than the two only having been measured side by side.
 
 ---
 
@@ -1361,19 +1371,84 @@ Deliberately unresolved. Each is answered by later work.
   should be switched out and flushed. The Raft log's own compaction trigger (§10)
   already argues for measuring the right quantity rather than a proxy for it; the same
   argument applies here; a size estimate, not an entry count, is almost certainly the
-  right trigger, and is not yet measured.~~ **Closed in v1.9** — see §13.4.
-- **No multi-memtable or multi-SSTable read path yet.** §13.4's `FlushIfFull` blocks the
+  right trigger, and is not yet measured.~~ **Closed in v1.9** — see §13.3.
+- **No multi-memtable or multi-SSTable read path yet.** ~~`FlushIfFull` (§13.3) blocks the
   caller for the duration of one flush and does not swap a fresh memtable into the write
   path first, so as written a flush would stall writes rather than run underneath them.
   §13.4's read-path sketch ("checks the active memtable first, then any memtables
   mid-flush, then SSTables oldest-to-newest") describes the target shape; nothing yet
   merges more than one source, and nothing yet decides which SSTable, if several exist,
-  is newest. This is the next task the flush trigger sets up.
-- **SSTable file naming and manifest are not designed.** `sstable.Write` and `FlushIfFull`
-  both take a caller-supplied path and do nothing to track which SSTables exist, in what
-  order, or which have been superseded by compaction. `Info.Path`/`Info.Bytes` give a
-  caller enough to build that bookkeeping, but nothing here does yet — needed before more
-  than one SSTable can coexist meaningfully.
+  is newest. This is the next task the flush trigger sets up.~~ **Closed in v1.11** — see
+  §13.6, with one correction: the target shape was written down backwards. SSTables must
+  be checked newest-to-oldest, not oldest-to-newest, or a newer tombstone or overwrite
+  would never shadow an older value sitting in a "more recent" SSTable read first. §13.4
+  and this open question both said it wrong; both are fixed as of v1.11.
+- **The flush trigger still does not swap in a fresh memtable or run in the background.**
+  v1.11 closed the READ side of having more than one memtable and SSTable to search —
+  given an already-assembled, already-ordered list of sources, `engine.Reader` merges
+  them correctly. v1.12 added `engine.Writer`, so a live `Put`/`Delete` now durably
+  reaches a single active memtable through the WAL. What still doesn't exist is the
+  orchestration connecting the two: nothing calls `FlushIfFull`, decides a memtable is
+  "full," swaps a fresh `Writer` target into place, and hands the frozen memtable to a
+  background flush while keeping it visible to `Reader` as an immutable memtable in the
+  meantime. `Reader` and `Writer` are both built to be handed that state once it exists;
+  nothing yet produces it, and nothing yet unifies `Reader` and `Writer` into one type a
+  caller would actually hold.
+- **SSTable file naming and manifest are not designed.** ~~`sstable.Write` and
+  `FlushIfFull` both take a caller-supplied path and do nothing to track which SSTables
+  exist, in what order, or which have been superseded by compaction. `Info.Path`/`Info.Bytes`
+  give a caller enough to build that bookkeeping, but nothing here does yet — needed
+  before more than one SSTable can coexist meaningfully.~~ **Closed in v1.13** — see
+  §13.8's `manifest` package. File naming is a plain incrementing sequence number
+  (`nextSequence`, derived from the manifest's own contents rather than a separate
+  counter) — deliberately not a richer scheme (no key-range or level encoded in the
+  name itself), since the manifest, not the filename, is the source of truth for which
+  level a file belongs to.
+- **Nothing yet decides when to run a compaction, or how often.** ~~§13.8's `Run`
+  performs one complete pick-merge-write-swap cycle and returns; nothing calls it on a
+  schedule, after a flush, or in the background, the same still-open gap `FlushIfFull`
+  has always had (previous bullet). A single `Run` call also does not cascade —
+  compacting L0 into L1 can itself push L1 over its own threshold, and nothing
+  currently notices and re-triggers a second compaction in response.~~ **Closed in
+  v1.14** — see §13.9's `compaction.Background`, with one correction found while
+  building it: the cascading concern above does not actually arise under the current
+  design. `CompactLevel` always replaces the level below with exactly one file, so
+  every level above L0 can only ever hold zero or one files, and a level holding at
+  most one file can never exceed any threshold of 1 or more — genuine cascading is
+  impossible with a sane configuration, not merely untested. What *is* still open is
+  `Background`'s connection to a live flush: nothing yet adds a newly flushed SSTable
+  to the manifest's L0 automatically ("The flush trigger still does not swap in a
+  fresh memtable or run in the background," above, still open), so `Background` has
+  nothing to react to until something else populates L0 for it to notice.
+- **Compaction merges a whole level with the whole level below it, not just the
+  overlapping key range.** True leveled compaction (LevelDB, RocksDB) only merges the
+  files at level L+1 whose key ranges overlap the specific L files being compacted,
+  bounding how much of L+1 gets rewritten per compaction. §13.8's `CompactLevel`
+  merges everything in both levels every time — simpler to get correct, and correct
+  regardless of key distribution, but write-amplifies more than necessary once a level
+  holds more data than a single compaction needs to touch.
+- **Compaction triggers on file count, not byte size**, and produces exactly one
+  output file per run rather than several size-bounded ones. Both are argued in
+  §13.8 as deliberate, correctness-first simplifications; both are natural next steps
+  once `targetBlockSize`'s own still-open measurement question (below) has an answer to
+  build on.
+- **`Options.MaxFilesPerLevel: 0` is caught at runtime, not rejected upfront.**
+  `Background`'s `maxDrainCycles` safety cap (§13.9) turns the degenerate
+  zero-threshold case into a bounded, reported error after 64 wasted compaction
+  cycles, rather than `StartBackground` or `Run` validating the configuration and
+  refusing it immediately. Cheaper to build and still safe, but a caller finds out
+  about the mistake late and somewhat obliquely (an error message) instead of
+  immediately and clearly (a rejected argument).
+- **Orphaned files from a crash between the manifest swap and cleanup are not detected
+  or removed on a later startup.** ~~§13.8's `Run` argues this window is safe (the
+  manifest is already correct, the leftover files are just wasted disk space), but
+  nothing currently scans a directory for files the manifest doesn't reference and
+  removes them — a real, if low-severity, gap.~~ **Closed in v1.15** — see §13.10's
+  `compaction.Recover`, which also validates every referenced file actually opens as
+  a well-formed SSTable, catching corruption at startup rather than at the first
+  unlucky `Get`. Still not automatic: `Recover` must be called once, explicitly,
+  before `Run` or `Background` ever starts against the same directory — nothing
+  enforces that ordering beyond the doc comment saying so.
 - **SSTable block reads scan linearly rather than binary search.** §13.2's original
   design already anticipated this ("once an index exists, a lookup inside a block can
   binary search rather than scan"); the reader implemented in v1.9 scans a block's
@@ -1401,6 +1476,7 @@ Deliberately unresolved. Each is answered by later work.
   the way the fsync policy (`docs/fsync-policy.md`) and `targetBlockSize` (§13.2) still
   haven't been picked from measurement either. Revisit once real workload numbers exist
   to trade read-amplification savings against the per-key memory cost.
+- **The skip list has no `Seek`.** `NewIterator` only walks from the beginning. A range
   scan from an arbitrary start key — which an SSTable read path merging several sources
   will eventually want — needs a seek that reuses `search`'s predecessor-finding walk
   rather than a full scan from the head. Deferred until something needs it.
@@ -1719,7 +1795,7 @@ The memtable is the sorted, in-memory structure every write lands in before it i
 durable in an SSTable: the WAL (§13.1) makes a write crash-safe, and the memtable is
 what makes it *queryable* while it is still only in the WAL and not yet flushed. A read
 path checks the active memtable first, then any memtables mid-flush, then SSTables
-oldest-to-newest, stopping at the first tombstone or value it finds — the memtable is
+newest-to-oldest, stopping at the first tombstone or value it finds — the memtable is
 the first and cheapest of those stops, and the one every write passes through.
 
 **Why a skip list.** Three structures were on the table.
@@ -1804,17 +1880,27 @@ one memtable's sequence of level choices reproducible from one seed regardless o
 else is running, and keeps two memtables from sharing state that would let one's insert
 order leak into another's level distribution.
 
-**`Memtable` satisfies `wal.Sink` structurally.** `ApplyPut` and `ApplyDelete` give a
-`Memtable` the two methods `wal.RecoverAndOpen` (§13.1) expects of a recovery sink,
-without this package importing package `wal` at all — Go's structural interfaces make
-that possible, and not importing it keeps the dependency one-way: the WAL knows nothing
-about memtables, and the memtable package knows nothing about the WAL either. A node's
-startup path is what wires the two together, by calling
-`wal.RecoverAndOpen(path, policy, memtable)`.
+**`Memtable` exposes `ApplyPut`/`ApplyDelete` without importing package `wal`.**
+`ApplyPut` and `ApplyDelete` are the two operations a WAL replay needs to rebuild a
+Memtable's state, kept as plain methods rather than behind a formal interface this
+package would have to import `wal` to name. Not importing `wal` keeps the dependency
+one-way: the WAL knows nothing about memtables, and the memtable package knows nothing
+about the WAL either. **This paragraph itself was wrong from v1.8 until v1.12** — it
+used to claim `ApplyPut`/`ApplyDelete` "satisfy the `wal.Sink` interface structurally"
+and that a node's startup path calls `wal.RecoverAndOpen(path, policy, memtable)`.
+Neither ever existed: package `wal` has never defined a `Sink` interface, and its
+actual recovery function, `Recover` (§13.1), takes a plain `func(wal.Entry) error`
+callback, not a `Memtable` or any interface at all. The design was right — this is
+exactly the shape the wiring needed to take — but the code implementing it did not
+exist for four revisions after the prose describing it was written. `engine.RecoverMemtable`
+(§13.7) is that wiring, finally built: the `func(wal.Entry) error` closure this
+paragraph always implied, living in package `engine` rather than here or in `wal`,
+because `engine` is the one package allowed to depend on both.
 
 **Implemented** at `internal/storage/memtable/`, across `skiplist.go` (the node type,
 the lock-free `search`, and level selection), `memtable.go` (the public `Put` / `Delete`
-/ `Get` / `Len` / `ApproxSize` surface and the `wal.Sink` methods), and `iterator.go`.
+/ `Get` / `Len` / `ApproxSize` surface and the `ApplyPut`/`ApplyDelete` recovery
+methods), and `iterator.go`.
 Correctness is checked against a reference map built alongside 5,000 randomly ordered
 inserts, including duplicate keys and tombstones; concurrency is checked by four
 dedicated tests — concurrent reads alone, concurrent reads against a single writer
@@ -1906,9 +1992,455 @@ false-positive measurement above, plus a coarse monotonicity check that the rate
 gets worse as bits-per-key rises, independent of the exact numbers). All under `-race
 -shuffle=on -count=3`.
 
+### 13.6 Read path across memtables and SSTables — implemented
+
+Every layer under §13 has been built and tested in isolation — the memtable's own
+`Get` (§13.4), an SSTable's own `Get` (§13.2) — but a real read has to check more than
+one of them, in the right order, and stop at the first one with an answer. This is
+that merge, and nothing more: `engine.Reader` does not decide when a memtable becomes
+immutable, does not trigger a flush, does not track which SSTable is newest, and does
+not persist or discover which files exist. It is handed its sources already in the
+right order and its only job is to walk them.
+
+**The order, corrected.** Active memtable first, then immutable memtables (frozen,
+waiting to be flushed) newest-frozen-first, then SSTables newest-flushed-first —
+**not** the oldest-to-newest order §13.4's own read-path sketch and one of §12's open
+questions both stated until this section corrected them. The reasoning is the same
+reasoning behind every tombstone-shadowing argument elsewhere in §13: a key's most
+recent write — whichever tier it landed in — has to be the first one found, or an
+older tier's stale value (or a since-superseded live value sitting under a newer
+tombstone) would win instead. Checking SSTables oldest-first would have been exactly
+that bug, just one layer further out than the ones §13.2 and §13.4 already guard
+against. Nothing in code ever shipped with the wrong order — it was only ever wrong in
+the prose describing the target shape — but it was wrong for two revisions before this
+task's own title stated the correct order plainly enough to catch it.
+
+**The three-outcome discipline finally pays for itself.** `(*memtable.Memtable).Get`
+and `(*sstable.Reader).Get` each distinguish "never written here" from "deleted here"
+from "found here, live" for exactly this moment: `Reader.Get` stops at the first tier
+reporting either a live value or a tombstone, and only a tier reporting the key as
+never-seen lets the search continue to an older one. A two-outcome `Get` at any layer
+below this one — collapsing "deleted" into "not found" — would have made this method
+impossible to implement correctly, no matter how carefully the merge logic above it
+was written. `Reader.Get` itself returns two outcomes, not three: a caller outside
+this package has no use for "never written" versus "written, then deleted," and
+passing the distinction further out would only relocate the same collapsing risk
+instead of removing it.
+
+**An SSTable read error halts the search rather than falling through.** A corrupt or
+unreadable block in the newest SSTable being checked might be hiding the actual answer
+— a tombstone, or an overwrite — for the key in question. Treating that error as "this
+tier had nothing to say" and moving on to an older SSTable could silently return stale
+data in place of surfacing the failure. `TestSSTableReadErrorHaltsSearchAndDoesNotFallThrough`
+checks this directly: a failing newer SSTable with a real, matching answer sitting in
+an older one still produces an error, never the older tier's value.
+
+**Bloom filter integration is deliberately absent.** §13.5 built and measured a Bloom
+filter; `Reader.Get` does not consult one before calling an SSTable's `Get`, which is
+the entire performance case a filter exists to make. Wiring it in needs a filter
+serialization format that doesn't exist yet (§12) and a place in `Open` to load one —
+real work, left for the task that closes those open questions, not attempted here.
+
+**No orchestration, still.** `Reader` accepts an already-ordered list of immutable
+memtables and SSTables; nothing yet produces that list. `sstable.FlushIfFull` (§13.3)
+still blocks its caller for the duration of a flush, still does not swap a fresh
+memtable into the write path first, and nothing calls it on a schedule. Closing the
+read-path open question did not close the write-path one sitting next to it in §12 —
+seeing that clearly is exactly why the two are recorded as separate questions instead
+of one.
+
+**Implemented** at `internal/storage/engine/`, in `reader.go`. Two narrow interfaces —
+`memtableSource` and `sstableSource`, matching `(*memtable.Memtable).Get`'s and
+`(*sstable.Reader).Get`'s exact signatures — let the merge logic be tested against
+hand-built fakes for the cases that are awkward to provoke through real files on every
+run (tombstone shadowing at each tier, a simulated corrupt-block error), on the same
+narrow-interface precedent `sstable.Source` set in `writer.go`. `reader_test.go` also
+runs the same scenarios end to end through real `*memtable.Memtable` and
+`*sstable.Reader` values, confirming `NewReader`'s adapter wiring and not just the
+interface-driven logic. 100% statement coverage, all under `-race -shuffle=on
+-count=3`.
+
+### 13.7 Tombstones and why a delete is a write — implemented
+
+Every layer in §13 already carries a tombstone somewhere — a `RecordDelete` in the
+WAL (§13.1), a `tombstone` bit in a memtable's `entryValue` (§13.4), a `Delete` entry
+with no value field in an SSTable's data block (§13.2), the shadowing logic in
+`Reader.Get` (§13.6) — but none of those sections, on its own, states the single
+principle all four exist to serve, or proves it by construction rather than by
+scattered argument. This section is that principle, stated once, plus the piece of
+code that was still missing to make it checkable end to end: `engine.Writer`, the live
+write path, which did not exist before this task even though every read-side and
+on-disk piece around it did.
+
+**The principle.** In a log-structured, immutable-file storage engine, deleting a key
+cannot mean removing information — it can only mean recording a new fact that
+supersedes an old one. This is forced by two things this design already committed to
+elsewhere, not a new constraint invented for deletes specifically:
+
+1. **Durability (§13.1).** A write is not acknowledged until it is on stable storage.
+   If a delete were handled purely in memory — remove the key from the active
+   memtable, append nothing to the WAL — a crash between that removal and the next
+   flush would lose all record that the delete ever happened. On restart, WAL replay
+   would rebuild the memtable from whatever Puts it still has on file, and the
+   "deleted" key would silently reappear with its last value. A delete has to cross
+   the exact same durability boundary a Put does, for the exact same reason.
+2. **Immutability once flushed (§13.2, §13.6).** Even setting crash recovery aside,
+   the moment more than one memtable or SSTable can exist for the same key range —
+   which §13.6 is what made real — an older, already-durable copy of a key may sit in
+   a tier the operation currently running cannot see or touch. Nothing can reach back
+   and un-write that copy; SSTables are flushed once and never modified again (§13.2's
+   whole `ErrFileExists` argument). The only way to make that old copy stop being the
+   answer is to write something NEWER that a read, walking tiers newest-first, finds
+   first — a tombstone is that newer fact, not an erasure of the old one.
+
+Both arguments land on the same conclusion from different directions: a delete is a
+**write** — same durability contract, same shape, same place in every tier's ordering
+— whose payload happens to mean "nothing is here anymore" instead of carrying a value.
+Nowhere in this codebase does a delete take a different code path than a put for
+reasons of being a delete; the only differences are which WAL record type gets
+appended and which bit gets set.
+
+**What was actually still missing.** Every tier already stored a tombstone correctly.
+What had never been built was the thing a client's `Delete` call would actually go
+through: `engine.Writer`, pairing one `*wal.WAL` and one `*memtable.Memtable`, with
+`Put` and `Delete` both following the identical two-step sequence — append to the WAL,
+check the error, only then apply to the memtable — differing solely in which WAL
+method and which Memtable method get called. `Delete`'s doc states directly why it
+cannot short-circuit when the memtable doesn't currently hold the key: it has no way
+of knowing whether an older, invisible-to-it tier holds a live copy, so skipping the
+append is indistinguishable, after a crash, from the delete having never been
+requested at all — `TestDeleteOfAKeyNeverPutStillWritesATombstone` checks this
+directly.
+
+**Proved, not just argued.** `TestDeleteSurvivesACrashBetweenAppendAndApply` provokes
+the exact crash window the durability argument above describes: a `Put` and a
+`Delete` both go through a `Writer`, and then the in-memory `*memtable.Memtable` that
+applied them is discarded outright — standing in for a process that died with
+unflushed memory state — with no flush, no snapshot, nothing. `engine.RecoverMemtable`
+rebuilds a completely fresh memtable from the WAL alone, and the tombstone is there.
+If `Delete`'s `AppendDelete` call were ever skipped, reordered after the memtable
+update, or replaced with an in-memory-only removal, this is the test that would catch
+it — the same role `TestStartupRecoveryStopsCleanlyAtTornTail` (§13.1) plays for WAL
+truncation, proving the property by rebuilding from bytes on disk rather than trusting
+the in-memory state that produced them. `TestPutAndDeleteBothFailIdenticallyWhenTheWALIsUnwritable`
+checks the failure side of the same symmetry: closing the WAL out from under a
+`Writer` makes both `Put` and `Delete` fail before ever touching the memtable, not one
+of them silently degrading to an in-memory-only operation while the other correctly
+fails.
+
+**`engine.RecoverMemtable` also closes a four-revision-old documentation bug.**
+§13.4's memtable section has claimed, since v1.8, that `ApplyPut`/`ApplyDelete`
+"satisfy a `wal.Sink` interface" and that a startup path calls
+`wal.RecoverAndOpen(path, policy, memtable)`. Neither type nor function has ever
+existed in package `wal` — `Recover` (§13.1) takes a plain `func(wal.Entry) error`
+callback. The design was correct; the code implementing it was not written until this
+task. `RecoverMemtable` is that callback, built once in package `engine` (the one
+package allowed to depend on both `wal` and `memtable`) instead of hand-rolled by
+every future caller, and §13.4's text is corrected to describe what actually exists.
+
+**Implemented** at `internal/storage/engine/writer.go` (`Writer`, `NewWriter`,
+`RecoverMemtable`) and `writer_test.go`. Alongside the crash-window and failure-
+symmetry tests above: immediate visibility of both a `Put` and a `Delete` through the
+paired memtable; a delete of a key the memtable never held still producing a
+tombstone; and `TestReadPathSeesADeleteThroughTheFullStack`, running a `Put` then a
+`Delete` through a real `Writer` and confirming `Reader.Get` (§13.6) — not a direct
+`Memtable.Get` — reports the key gone, tying the write path and the read path
+together through the same data for the first time. All under `-race -shuffle=on
+-count=3`.
+
+### 13.8 Leveled compaction — implemented
+
+This section closes two open questions at once: "SSTable file naming and manifest
+are not designed" (recorded since v1.9) and the actual reason a manifest was needed
+in the first place — nothing had ever reclaimed the space a superseded value or a
+no-longer-needed tombstone was still taking up. Getting here also required two
+smaller, real pieces that turned out not to exist yet: a way to read an entire
+SSTable's contents in order (`Get`, §13.2, only ever answered one key at a time), and
+a way to detect a source failing mid-read instead of silently looking like it
+finished cleanly. Both are covered below before the compaction algorithm itself,
+because the algorithm is built directly on top of them.
+
+**`Source` gained `Err() error`, and this is a real interface change, not an
+addition made for free.** Every `Source` before this task was `*memtable.Iterator` —
+pure in-memory, structurally unable to fail — so `Write`'s original loop,
+`for src.Next() { ... }`, never checked for a failure because nothing could produce
+one. `sstable.Iterator` (below) reads blocks off disk mid-scan, which very much can
+fail, and `Next()` returning `false` is the same observable outcome whether iteration
+finished cleanly or broke partway through a corrupt block. Without `Err`, a
+compaction merging several SSTables could silently write a truncated output file and
+report success — exactly the kind of bug this codebase has repeatedly built explicit
+guards against rather than trusted itself to avoid by care alone (§13.1's CRC-checked
+`Recover`, §13.2's block CRCs, §13.6's SSTable-read-error-halts-the-search rule).
+`Write` now checks `src.Err()` immediately after its main loop, before the final
+block, index, and footer are ever written, and refuses to publish a file if it is
+non-nil — `TestWriteRefusesToPublishWhenTheSourceFails` provokes exactly this with a
+source that yields several good entries and then fails, and confirms no file, not
+even a partial one, is left at the destination path. `*memtable.Iterator.Err` trivially
+returns `nil` always, at zero real cost, rather than being exempted from an interface
+it was the sole implementation of.
+
+**`sstable.Iterator` is `Get`'s counterpart for reading everything instead of one
+key**, walking every data block in file order and decoding its entries — the same
+`verifyAndSplitBlock`/`decodeBlockEntries` machinery `Get` already used, just iterated
+across every block instead of binary-searched to one. It satisfies `Source`, which is
+the entire reason it exists as this type rather than some SSTable-specific scan API:
+a compaction reads several SSTables, merges them, and hands the merged result
+straight back to `Write` to produce a new file, and nothing in that pipeline needs to
+know an SSTable-backed `Source` looks any different from a memtable-backed one.
+`TestIteratorReportsCorruptionThroughErrRatherThanSilence` flips a byte inside a real
+flushed file's data block and confirms the iterator stops with a non-nil `Err` rather
+than quietly reporting fewer entries than the file actually has.
+
+**`sstable.Merge` combines several `Source`s, already sorted, into one sorted
+`Source`** — the primitive both the write side (Reader's tier-priority rule, §13.6)
+and compaction's write-out step are built on. Sources are required newest-first, the
+identical convention `engine.Reader` already uses and for the identical reason: on a
+key collision, the lowest-indexed source wins, and every source holding that key is
+still advanced past it so the key is never repeated in the output — a repeated key
+would trip `Write`'s own `ErrOutOfOrder` guard, so this is load-bearing, not
+cosmetic. **A real bug was caught and fixed while building this, not left to a
+future bug report**: the first version checked every source's `Err()` in a loop that
+skipped sources already marked "done" — which meant a source that failed (and was
+therefore marked done in the same instant) would never actually have its error
+noticed, because the very flag that should have flagged it for inspection was also
+the flag being used to skip it. Fixed by checking `Err()` at the exact moment a
+source transitions to done, inside `advance`, rather than in a separate later pass —
+`TestMergeStopsAndPropagatesWhenASourceFails` is the regression test.
+
+If `dropTombstones` is true, a winning tombstone is discarded rather than emitted —
+see `CompactLevel`'s own doc, below, for exactly when that is safe.
+`TestMergeDroppingATombstoneDoesNotResurrectAnOlderValue` pins the property that makes
+this safe to do at all: the winner is resolved from every source holding the key
+*before* the drop decision is made, so dropping a tombstone can never fall through to
+an older source's stale copy of the same key — the tombstone and the stale value are
+never both candidates for the output at once.
+
+**The manifest** (`internal/storage/manifest/`) is deliberately the smallest thing
+that can answer "what exists right now": `Levels [][]string`, one slice of SSTable
+filenames per level, nothing else — no byte sizes, no key ranges, no sequence
+numbers, no record of a compaction in progress. `Save` persists it with the identical
+write-temp/fsync/rename/fsync-directory sequence `FileStorage` uses for Raft's own
+state (§5) and `sstable.Write` uses for a flushed file (§13.2) — a third repetition of
+the same primitive, for the same reason: a reader must never be able to open the
+manifest partway through a write and see a state that names a file that does not
+exist. `Load` on a missing file returns an empty manifest rather than an error, the
+same "nothing on disk yet is a valid starting state" posture `Recover` (§13.1) takes
+toward a missing WAL.
+
+**Leveled compaction** (`internal/storage/compaction/`) answers the four questions
+its own task description asks, in that order:
+
+1. **Pick the level** — `PickLevel` returns the lowest level whose file count exceeds
+   a threshold (`Options.MaxFilesPerLevel`, default 4, mirroring LevelDB's own L0
+   trigger). The *lowest* over-threshold level, not the most over-threshold one, is
+   chosen: L0 files overlap in key range and are checked by every read regardless of
+   whether they hold the key being looked for (§13.6), so a backlog at the shallowest
+   level costs every read, not just ones for keys living in whichever level happens to
+   be most backlogged.
+2. **Merge** — `sstable.Merge`, above, fed one `sstable.Iterator` per file in the
+   chosen level and the level below it, level's files listed first (newer).
+3. **Write out** — the merged `Source` is handed straight to the existing, unmodified
+   `sstable.Write` (§13.2). Compaction adds no new file-writing code of its own; it
+   only ever produces the `Source` `Write` already knew how to consume.
+4. **Atomically swap the manifest** — `manifest.Save`, once, after the new file is
+   already durably on disk.
+
+**The tombstone rule.** A tombstone surviving the merge into level `L+1` is dropped
+— actually reclaiming the space, which is the entire point of a compaction reaching a
+delete at all — only if `L+1` will be the lowest level holding any data once this
+compaction finishes (`isBottomAfterCompaction`: every level deeper than `L+1` is
+currently empty). If a deeper level still holds files, this compaction has no way of
+knowing whether one of them still holds an older, live copy of the key the tombstone
+is shadowing; dropping it anyway would let that older copy resurface the next time
+that deeper level is searched — exactly the bug §13.7's whole delete-is-a-write
+argument exists to prevent, one level further down.
+`TestCompactLevelKeepsTombstoneWhenDeeperLevelsHaveData` and
+`TestCompactLevelDropsTombstoneWhenNoDeeperLevelHasData` check both sides of this
+directly, the second by confirming the key is genuinely gone from the output, not
+merely tombstoned.
+
+**The crash-safety ordering, stated once and enforced by code order.** `Run` writes
+the merged file first (relying on `sstable.Write`'s own atomicity, not adding to it),
+saves the new manifest second, and deletes the superseded files last. A crash before
+the manifest save leaves the OLD manifest naming the OLD files, all still on disk —
+compaction simply never happened. A crash after the save but before cleanup leaves
+harmless orphaned files the manifest no longer references — disk usage, not a
+correctness problem, and not yet garbage-collected automatically (open question,
+below). The one ordering never used is deleting old files before or during the swap:
+that crash window would leave the manifest naming a file that is already gone, with
+no way to recover from it on the next `Load`.
+`TestRunNeverDeletesOldFilesIfTheManifestSwapFails` checks this by forcing the
+manifest save to fail (an unwritable path) and confirming every source file is still
+exactly where it was.
+
+**Deliberate simplifications, recorded as open questions rather than solved here:**
+file-count triggers rather than byte size (§12); exactly one output file per
+compaction rather than several size-bounded ones; a compaction always merges a level's
+files with *all* of the level below's files rather than only the overlapping subset a
+true leveled scheme would target, which write-amplifies more than necessary but is
+far simpler to get correct; and orphaned files left behind by a crash between the
+manifest swap and cleanup are not yet detected or removed on a later startup.
+
+**Implemented** at `internal/storage/sstable/iterator.go` (`Iterator`),
+`internal/storage/sstable/merge.go` (`Merge`), `internal/storage/manifest/` (`Manifest`,
+`Load`, `Save`), and `internal/storage/compaction/` (`PickLevel`, `CompactLevel`,
+`Run`). Tested end to end: a full `Run` cycle against real flushed SSTables, confirmed
+against the manifest on disk, the merged file's actual contents, and that superseded
+files are gone; the manifest-swap-failure crash-safety test above; and every merge and
+tombstone-rule case argued above, checked directly rather than only in prose. All
+under `-race -shuffle=on -count=3`.
+
+### 13.9 Background compaction — implemented, measured
+
+`compaction.Run` (§13.8) does one complete pick-merge-write-swap cycle and returns —
+nothing before this section ever called it more than once, synchronously, from a
+test. This closes that: `Background` runs cycles on a ticker in their own goroutine,
+so nothing calling `engine.Writer.Put` or `.Delete` (§13.7) ever has to trigger or
+wait on a compaction.
+
+**Why this needed no new locking, and why that claim is checked rather than trusted.**
+`engine.Writer`'s only durable state is its own `*wal.WAL` and `*memtable.Memtable`
+(§13.7); `Run` only ever touches SSTable files already on disk plus the manifest
+(§13.8). The two share no lock, no field, nothing — a live write path was never going
+to contend with a background compaction for anything in-process, by construction
+rather than by any synchronization added here. That argument is worth exactly as much
+as a test that runs both at once under `-race` and finds nothing, which
+`TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption` does: a write
+workload and `Background` compacting a seeded backlog, concurrently, in the same
+directory, clean under the race detector, with the compacted output still correct
+once both finish.
+
+**What running concurrently CAN still cost: the same disk.** No in-process lock is
+contended, but `Background`'s own I/O — reading several SSTables, writing a merged
+one, then `manifest.Save`'s fsync/rename/fsync-directory sequence — competes with a
+concurrent `Writer`'s WAL fsyncs for the same physical disk's bandwidth and, on a
+`SyncAlways` policy, the same fsync queue. This is the actual question worth
+measuring, and the one a "no shared lock" argument alone cannot answer.
+
+**Measured**, `TestWriteLatencyWithAndWithoutBackgroundCompaction`: [PLACEHOLDER —
+run the command below and paste the real numbers in; two rows, mean/p50/p99/max, one
+for a baseline write workload with no compaction running and one for the identical
+workload with `Background` actively draining a seeded L0 backlog concurrently.]
+
+| scenario | mean | p50 | p99 | max |
+|---|---|---|---|---|
+| baseline (no compaction) | _pending_ | _pending_ | _pending_ | _pending_ |
+| concurrent (background compaction) | _pending_ | _pending_ | _pending_ | _pending_ |
+
+**THIS MEASUREMENT DELIBERATELY DOES NOT ASSERT A HARD STATISTICAL THRESHOLD IN
+CODE**, unlike the Bloom filter's false-positive rate (§13.5), which a formula
+predicts exactly and which the test therefore checks against a derived tolerance
+band. Write latency under concurrent disk I/O has no such formula — it is a property
+of the actual machine and disk it runs on, and a hard-coded millisecond bound would
+be flaky on a slower CI runner or a faster laptop without meaning anything more true
+on either. The honest way to report it is the numbers themselves, above, from a real
+run — not asserted, measured, the same distinction the fsync policy write-up
+(`docs/fsync-policy.md`) already draws. The test's only hard assertion is a generous
+smoke-test ceiling — no single write may take longer than five seconds — which exists
+to catch an actual hang or deadlock, a real bug this test should still fail loudly
+on, not to make a claim about ordinary contention.
+
+**A hazard found while designing `Background`, fixed before it shipped rather than
+after a bug report.** `Run` compacting level `L` always replaces `L+1`'s files with
+exactly one new file (§13.8's documented simplification), which means every level
+above L0 can only ever hold zero or one files — genuine cascading (one compaction
+pushing the level below it over its own threshold) cannot happen with any sane
+`MaxFilesPerLevel` of 1 or more, since a level holding at most one file can never
+exceed a threshold that isn't 0. But nothing rejected `Options{MaxFilesPerLevel: 0}`,
+and under that value, `PickLevel` considers a level with even one file "over
+threshold" forever: a single file would get compacted one level deeper, endlessly,
+the manifest growing one level longer each cycle with no convergence. This was found
+by reasoning through the design, not by hitting it — `maxDrainCycles` bounds
+`drainOneCycle` to 64 `Run` calls before it gives up and reports an error instead of
+spinning, and `TestDrainOneCycleStopsAtTheSafetyCapRatherThanSpinningForever` provokes
+the degenerate configuration directly and confirms the loop terminates in well under
+a second rather than hanging.
+
+**`Stop` waits, deliberately unlike Raft's own ticker shutdown.** `Node.Stop`
+(`election.go`) is fire-and-forget: it closes a channel and returns, trusting the
+ticker goroutine to notice eventually. `Background.Stop` closes its own stop channel
+and then blocks until the loop has actually exited, because a caller — tests,
+especially — needs the guarantee that no further `Run` call will touch the manifest
+or an SSTable file once `Stop` returns, not just that a stop was requested. The
+difference is not a style preference: `TestBackgroundCompactsAnAlreadyOverThresholdManifestOnStart`
+and `TestBackgroundDoesNothingWhenNothingNeedsCompacting` both inspect on-disk state
+immediately after `Stop` returns, and depend on this guarantee to be deterministic at
+all — a fire-and-forget `Stop` would make both tests flaky, not merely slower.
+
+**Implemented** at `internal/storage/compaction/background.go` (`Background`,
+`StartBackground`, `Stop`, `Err`, `Cycles`) and `background_test.go` /
+`stall_test.go`. Tested: compacting an already-over-threshold manifest immediately on
+start (not waiting a full interval); repeated compaction across several ticks as new
+backlog arrives; a compaction error surfacing through `Err` without hanging the loop
+or leaving it unstoppable; `Stop`'s idempotency; the safety-cap termination above;
+the concurrent race/correctness test above; and the write-latency measurement above.
+All under `-race -shuffle=on -count=3`.
+
+### 13.10 Manifest recovery — implemented
+
+§13.8 already made a crash mid-compaction *safe*: `Run`'s ordering (write the merged
+file, then swap the manifest, then delete superseded files) means a crash at any
+point leaves either the old, complete state or the new one, never something naming a
+file that doesn't exist. What it left open — recorded explicitly at the time —
+was making that same crash *recoverable* in the operational sense: nothing detected
+or cleaned up the orphaned files a crash between the swap and cleanup leaves behind,
+and nothing validated, at startup, that the manifest's claims about what exists on
+disk are actually true. `Recover` is that missing step.
+
+**Two kinds of mismatch, two very different responses.** A file on disk the manifest
+doesn't reference is an orphan — exactly what `Run`'s own crash window produces — and
+`Recover` deletes it, no error. A `.tmp` file is deleted unconditionally, without even
+checking the manifest: `sstable.Write` and `manifest.Save` each only ever leave one
+behind by being interrupted mid-write (a hard kill or power loss, not a returned
+error, since a returned error already triggers their own defer-based cleanup), so a
+`.tmp` file existing at all means it was abandoned — there is no legitimate reading
+of the manifest under which one would ever be a live, needed file. The other
+direction is treated oppositely: a file the manifest *references* but disk is
+missing, or which fails to open as a valid SSTable, is reported as an error, not
+silently tolerated. Given `sstable.Write`'s and `manifest.Save`'s own atomicity
+guarantees, a manifest is only ever saved after the file it names is already
+durably, completely on disk — so this can only mean a bug in this package, external
+interference with the data directory, or real disk corruption, none of which
+`Recover` can safely paper over by pretending the file was never named. This is the
+same "believed impossible is guarded, not assumed" posture §8 takes toward Raft's
+own invariants, applied here to this package's own claims about itself. Every
+referenced file is opened, not merely stat'd — `sstable.Open` verifies the footer and
+index, catching a present-but-corrupt file at startup instead of the first time some
+later `Get` happens to read the wrong block.
+
+**`Recover` must run before any compaction starts, and cannot enforce that itself.**
+It deletes files a live compaction may have legitimately created but not yet
+referenced — its own in-progress merged output, its own in-progress `.tmp` file —
+so running it concurrently with `Run` or `Background` would delete out from under
+them. There is no way to tell "a stale orphan from a past crash" apart from "a file
+a compaction running right now is about to reference" by looking at the file alone;
+this is a precondition stated in `Recover`'s own doc, the same way `engine.RecoverMemtable`
+(§13.7) is understood to run once, at startup, before anything live depends on the
+state it rebuilds — not enforced by a type system, enforced by being the first thing
+a caller does.
+
+**Proved against the exact crash window `Run`'s own documentation describes, not a
+different or easier one.** `TestRecoverClosesTheExactCrashWindowRunDocuments`
+reproduces it by hand: call `CompactLevel` and `manifest.Save` directly — the first
+two of `Run`'s three steps — and deliberately stop before the third (deleting the
+superseded files), the precise point `Run`'s own doc names as the one safe crash
+window. `Recover` is then called against that state and confirmed to finish exactly
+the cleanup the simulated crash interrupted, with the compacted data itself intact
+and correct.
+
+**Implemented** at `internal/storage/compaction/recover.go` (`Recover`) and
+`recover_test.go`. Tested: a healthy directory left untouched; an orphaned SSTable
+removed; a leftover `.tmp` file removed unconditionally; a missing referenced file
+reported as an error; a corrupt referenced file caught by `sstable.Open` and
+reported as an error; a fresh, manifest-free directory handled the same way `Load`
+already does (§13.8); files this package has no business touching (anything that
+isn't `.sst` or `.tmp`) left alone; and the crash-window reproduction above. All
+under `-race -shuffle=on -count=3`.
+
 ---
 
 ## 14. Revision log
+
 
 | Version | Change |
 
@@ -1924,3 +2456,9 @@ gets worse as bits-per-key rises, independent of the exact numbers). All under `
 | v1.8 | The memtable implemented as a skip list (§13.4): lock-free `Get` and iteration against a single mutex-serialized writer, an atomically-swapped value-plus-tombstone pair per key so neither a splice nor an update can ever be observed half-done, and a per-instance seeded RNG for level selection on the same rule as Raft's election timer. Three structures — red-black tree, sorted slice, skip list — compared and the choice argued from which one lets a new node's publication be a single atomic pointer write. `Memtable` satisfies `wal.Sink` structurally, wiring the write-ahead log's recovery path to the memtable without either package importing the other. Concurrency argued from the memory model and then checked directly: concurrent reads alone, concurrent reads against a single inserting writer, concurrent reads against a single updating writer with byte-level torn-value detection, and concurrent iteration against a writer, all under `-race -shuffle=on -count=3`; a fifth test drives sixteen concurrent writers on disjoint keys through the same internal mutex production never contends, on the same "guarded, not assumed" reasoning §8 applies to Raft's own believed-impossible states. |
 | v1.9 | The memtable flush path implemented end to end (§13.2, §13.3). SSTable data blocks, index, and footer built out at `internal/storage/sstable/`, closing the open question v1.7 left behind — including a per-entry type byte the original paper design was missing, added and argued for so a flushed tombstone can't be mistaken for a legitimate empty value once the WAL's own record-level discriminator is no longer available to lean on. `Write` streams a sorted source into 4KB-target data blocks and publishes the finished file with the same write-temp/fsync/rename/fsync-directory sequence `FileStorage` already uses for Raft's own state, refusing outright to overwrite an existing path. `Open`/`Get` binary-search the in-memory index and verify each block's CRC before trusting it, with the binary-search step later factored into its own `findBlock` and given dedicated boundary tests (exact `LastKey` matches, the gap between blocks, before-first and past-last). `(*Memtable).ApproxSize` closes the other half of the open question — key-and-value byte tracking added to `upsert`, replacing `Len`'s distinct-key count as the quantity a flush decision should be based on, on the same measure-the-real-quantity argument the Raft compaction trigger's own fix already established (§10). `sstable.FlushIfFull` is the thin trigger tying the two together: compares `ApproxSize` against a caller-supplied threshold and flushes if reached, deliberately stopping short of choosing a file path, swapping in a fresh memtable, or running in the background — all recorded as still-open work, alongside the block reader's linear in-block scan and the unmeasured 4KB block-size default. |
 | v1.10 | A Bloom filter implemented and measured at `internal/storage/bloom/` (§13.5), standalone and not yet wired into the SSTable write or read paths. Kirsch-Mitzenmacher double hashing derives `k` probe positions from two base hashes; `k` itself chosen from `bitsPerKey` by the standard `k = bitsPerKey · ln 2` result, clamped to `[1, 30]`. The first hash construction tried — FNV-1 and FNV-1a as the two base hashes — measured 2x-10x the theoretical false-positive rate, worse at higher `k`, which is what pointed at correlated hashes rather than generic noise as the cause; fixed by deriving the second hash from the first through `mix64` (the splitmix64/MurmurHash3 finalizer) instead of hashing the key a second time with a related algorithm, the same one-real-hash shape LevelDB's own filter takes. Re-measured after the fix: observed false-positive rate within 3% of the theoretical formula — evaluated at the actual, rounded `n`, `m`, and `k` a filter is built with, not the simplified asymptotic approximation — at three widely spread bits-per-key settings (6, 10, and 14, the last two bracketing LevelDB's and RocksDB's shared default). Wiring the filter into a flush and a lookup, and designing where its bytes would live in the SSTable file format, both recorded as open questions rather than attempted here. |
+| v1.11 | The read path across memtables and SSTables implemented at `internal/storage/engine/` (§13.6): `Reader.Get` checks the active memtable, then immutable memtables newest-frozen-first, then SSTables newest-flushed-first, stopping at the first tier reporting a live value or a tombstone. Two narrow interfaces mirroring `(*memtable.Memtable).Get`'s and `(*sstable.Reader).Get`'s exact signatures let the merge logic be tested against hand-built fakes for tombstone-shadowing at every tier and a simulated corrupt-SSTable error, plus an end-to-end test through real memtables and SSTables confirming the adapter wiring itself. A real bug was caught and fixed in the writing, not the code: two prior mentions of the target read-path order -- §13.4's sketch and one of §12's open questions -- said SSTables should be checked oldest-to-newest, backwards from correct; both corrected here, alongside an unrelated orphaned-bullet formatting break in §12 introduced while adding the Bloom filter section in v1.10. Bloom filter integration remains explicitly out of scope, recorded as still open. The read side of "more than one memtable and SSTable to search" is closed; the write side -- deciding when to freeze a memtable, swapping in a fresh one, and running a flush in the background -- is not, and is recorded as its own separate open question rather than assumed closed alongside this one. || v1.11 | The read path across memtables and SSTables implemented at `internal/storage/engine/` (§13.6): `Reader.Get` checks the active memtable, then immutable memtables newest-frozen-first, then SSTables newest-flushed-first, stopping at the first tier reporting a live value or a tombstone. Two narrow interfaces mirroring `(*memtable.Memtable).Get`'s and `(*sstable.Reader).Get`'s exact signatures let the merge logic be tested against hand-built fakes for tombstone-shadowing at every tier and a simulated corrupt-SSTable error, plus an end-to-end test through real memtables and SSTables confirming the adapter wiring itself. A real bug was caught and fixed in the writing, not the code: two prior mentions of the target read-path order — §13.4's sketch and one of §12's open questions — said SSTables should be checked oldest-to-newest, backwards from correct; both corrected here, alongside an unrelated orphaned-bullet formatting break in §12 introduced while adding the Bloom filter section in v1.10. Bloom filter integration remains explicitly out of scope, recorded as still open. The read side of "more than one memtable and SSTable to search" is closed; the write side — deciding when to freeze a memtable, swapping in a fresh one, and running a flush in the background — is not, and is recorded as its own separate open question rather than assumed closed alongside this one. |
+
+| v1.12 | Tombstones and the argument for why a delete is a write consolidated at `internal/storage/engine/` (§13.7), alongside the one piece of code that was still missing to make the argument checkable end to end: `Writer`, the live write path. `Put` and `Delete` both append to the WAL before touching the memtable, in that order, every time -- the durability boundary a delete has to cross for the identical reason a put does, argued from two things already committed to elsewhere (the WAL's own durability contract, and SSTable/read-path immutability once more than one tier can exist) rather than as a new rule invented for deletes. Proved rather than only argued: a `Put` and `Delete` run through a `Writer`, the in-memory memtable that applied them is discarded outright to simulate a crash, and `RecoverMemtable` rebuilds the tombstone from the WAL alone. `RecoverMemtable` also closes a real, four-revision-old documentation bug -- §13.4 had claimed since v1.8 that a `wal.Sink` interface and a `wal.RecoverAndOpen` function existed and wired a Memtable to WAL replay; neither ever did, and both are corrected. Bloom filter integration and the write-side orchestration that would swap a full memtable out from under live writes remain explicitly open, tracked separately in §12. |
+| v1.13 | Leveled compaction implemented end to end (§13.8): a manifest (`internal/storage/manifest/`) tracking which SSTable belongs to which level, persisted with the same write-temp/fsync/rename/fsync-dir sequence used everywhere else in this engine; `PickLevel` choosing the lowest over-threshold level; `sstable.Merge`, a k-way merge over several sorted `Source`s with a newest-first tie-break and an explicit, argued rule for when a surviving tombstone can finally be dropped instead of carried forward; `sstable.Iterator`, the sequential full-table scan `Get` was never built to do, needed to feed a compaction at all; and `compaction.Run`, tying all of it together with a crash-safety ordering (write the merged file, then swap the manifest, then delete superseded files -- checked directly by forcing the swap to fail and confirming nothing is deleted). Two real bugs were caught and fixed while building this, not left for later: `sstable.Source` gained an `Err() error` method after realizing `Write`'s original loop had no way to detect a source failing mid-scan, a gap invisible until an SSTable-backed (and therefore genuinely fallible) `Source` existed for the first time; and `Merge`'s own first draft checked a source's `Err` only for sources not yet marked done, which is precisely the sources whose failure it needed to catch, fixed by checking at the exact moment a source transitions to done rather than in a later pass. File-count compaction triggers, single-output-file compactions, whole-level (rather than overlapping-range) merges, and orphaned post-crash file cleanup are all recorded as open questions rather than solved here. |
+| v1.14 | Background compaction implemented and measured (§13.9): `compaction.Background` runs pick-merge-write-swap cycles on a ticker, in their own goroutine, so a live `engine.Writer` never triggers or waits on one. No new locking was needed -- Writer only touches its own WAL and memtable, Run only touches SSTable files and the manifest, and `TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption` confirms this holds under `-race`, not just on paper. What running concurrently can still cost is the same physical disk, which `TestWriteLatencyWithAndWithoutBackgroundCompaction` measures directly rather than assumes away -- numbers pending a run on the user's own machine, the same discipline the Bloom filter's false-positive measurement (v1.10) already established, since write latency under real disk contention has no formula to check it against the way false-positive rate does. A real hazard was found and fixed before it could ship: `CompactLevel`'s one-output-file design means every level above L0 can only ever hold zero or one files, so genuine cascading is impossible with a sane threshold -- but `Options{MaxFilesPerLevel: 0}` was never rejected, and under it a single leftover file would get compacted one level deeper forever. `maxDrainCycles` bounds this to a reported error instead of an infinite spin, caught by reasoning through the design rather than by hitting it in production. `Background.Stop` deliberately waits for its goroutine to fully exit, unlike Raft's own fire-and-forget ticker shutdown, because callers -- tests, especially -- need the guarantee that no further compaction touches disk once Stop returns. |
+| v1.15 | Manifest recovery implemented (§13.10): `compaction.Recover` closes the open question v1.13's manifest design and v1.14's background runner both left explicitly unsolved -- a crash between the manifest swap and Run's own cleanup step (§13.8) was already safe, never recoverable in the sense of a node actually reclaiming the wasted disk space or noticing something was wrong. Recover reconciles the manifest against what a directory actually holds: any unreferenced `.sst` file is an orphan and is deleted; any leftover `.tmp` file is deleted unconditionally, since sstable.Write's and manifest.Save's own atomicity means one can only exist if a process died mid-write, never as a legitimate artifact; a file the manifest references but disk is missing, or which fails to open as a valid SSTable, is reported as an error rather than silently tolerated, on the same believed-impossible-is-guarded-not-assumed posture §8 applies to Raft's own invariants. Proved against the exact crash window Run's own documentation names, not an easier one: CompactLevel and manifest.Save are called directly, stopping deliberately before the cleanup step a crash would have interrupted, and Recover is shown to finish exactly that interrupted work. Recover must be called once, explicitly, before Run or Background ever starts against the same directory -- a precondition stated in its own doc and not enforced by the type system, on the same explicit-recovery-step precedent engine.RecoverMemtable already set rather than a change to StartBackground's signature. |
