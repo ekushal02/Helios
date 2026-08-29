@@ -14,14 +14,16 @@ import (
 //
 // A Memtable is not resized or reorganized once created; the caller
 // decides when it is full and switches to a fresh one before flushing the
-// old one to an SSTable. Sizing that decision (by entry count or by
-// approximate byte size) is not this package's concern -- see DESIGN.md
-// §12 for why it is still open.
+// old one to an SSTable. This package reports the size that decision
+// should be based on (see ApproxSize) but does not make the decision
+// itself -- deciding when a given size is "full," and doing the swap, is
+// package sstable's FlushIfFull and the layer above it, not this one.
 type Memtable struct {
 	mu     sync.Mutex // serializes writers only; Get and iteration never take it
 	head   *node
 	height atomic.Int32 // number of active levels, always >= 1
 	length atomic.Int64 // distinct keys currently tracked, tombstones included
+	size   atomic.Int64 // approximate key+value bytes tracked; see ApproxSize
 
 	// rng is a per-Memtable seeded source, touched only from insert while
 	// mu is held. This is the same rule Raft's election timer follows
@@ -31,6 +33,37 @@ type Memtable struct {
 	// that would make one's insert order affect another's level
 	// distribution.
 	rng *rand.Rand
+}
+
+// ApproxSize returns an approximate count of the key and value bytes
+// currently held, tombstones included. It is the quantity a caller should
+// threshold against to decide a Memtable is full -- not Len, which counts
+// keys, not bytes, and would treat a memtable of one 10MB value the same
+// as one holding a single byte. This is the same lesson the Raft log's own
+// compaction trigger already paid for (DESIGN.md §10): measuring
+// logLength() instead of the discardable-entry count it actually needed
+// produced roughly 160x more snapshots than the metric that was actually
+// wanted, and the fix was to measure the quantity the decision is really
+// about rather than the cheapest proxy for it. Key and value bytes are
+// exactly what a flush writes to disk (DESIGN.md §13.2), so they are the
+// right proxy for "how big will the SSTable be" in a way an entry count
+// never is.
+//
+// The number is approximate in one direction only: it counts every byte
+// this Memtable's writer has ever added or replaced, but the skip list's
+// own bookkeeping -- node structs, forward-pointer slices, the entryValue
+// box -- is not included. That overhead is real but roughly constant per
+// key regardless of value size, so it does not change where the threshold
+// should sit so much as it means the true resident size is always
+// somewhat larger than what this method reports.
+//
+// Deciding *when* a Memtable is full enough to act on this number, and
+// switching a fresh Memtable into the write path before flushing the old
+// one, stays outside this package for the same reason it always has (see
+// the type doc): this method only answers "how big," never "is that big
+// enough."
+func (m *Memtable) ApproxSize() int64 {
+	return m.size.Load()
 }
 
 // New returns an empty Memtable seeded from the current time.
@@ -75,14 +108,21 @@ func (m *Memtable) upsert(key, value []byte, tombstone bool) {
 	entry := &entryValue{value: copyBytes(value), tombstone: tombstone}
 
 	if existing != nil {
-		// The key is already here. Swap its value atomically rather than
-		// touching any forward pointer -- a concurrent reader that holds
-		// a reference to this node reads entry.Load() exactly once and
-		// gets either the old entryValue or the new one, in full, never
-		// a mix of the two (see entryValue's doc).
+		// The key is already here. Adjust size by the difference before
+		// swapping the value in -- old and new are never both counted, and
+		// the key's own bytes were already charged once when this node
+		// was first inserted and do not change on an overwrite.
+		old := existing.entry.Load()
+		m.size.Add(valueSize(entry) - valueSize(old))
+		// Swap its value atomically rather than touching any forward
+		// pointer -- a concurrent reader that holds a reference to this
+		// node reads entry.Load() exactly once and gets either the old
+		// entryValue or the new one, in full, never a mix of the two
+		// (see entryValue's doc).
 		existing.entry.Store(entry)
 		return
 	}
+	m.size.Add(int64(len(key)) + valueSize(entry))
 
 	level := randomLevel(m.rng)
 	if int32(level) > height {
@@ -146,6 +186,16 @@ func (m *Memtable) Len() int {
 // site.
 func (m *Memtable) ApplyPut(key, value []byte) { m.Put(key, value) }
 func (m *Memtable) ApplyDelete(key []byte)     { m.Delete(key) }
+
+// valueSize is the byte contribution an entryValue makes toward
+// ApproxSize: the value's length, or zero for a tombstone, which carries
+// no value at all once flushed (see block.go's data block entry framing).
+func valueSize(e *entryValue) int64 {
+	if e.tombstone {
+		return 0
+	}
+	return int64(len(e.value))
+}
 
 func copyBytes(b []byte) []byte {
 	if b == nil {
