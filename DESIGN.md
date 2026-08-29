@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.7 — leader election, log replication, the apply path, linearizable
+**Status:** v1.8 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -11,8 +11,9 @@ below the resulting floor is repaired with `InstallSnapshot` rather than entries
 Verified under crashes, restarts, network partitions, message loss, reordering, and a
 node offline for ten thousand entries. The on-disk formats for the LSM storage engine
 that will back the state machine above the apply channel — write-ahead log record,
-SSTable data block, footer, and index — are now fixed on paper, and the write-ahead log
-itself is implemented and tested.
+SSTable data block, footer, and index — are fixed on paper. The write-ahead log and the
+memtable (a skip list) are both implemented and tested, including concurrent reads
+against a single writer.
 
 ---
 
@@ -1352,8 +1353,21 @@ Deliberately unresolved. Each is answered by later work.
   Wiring one is memtable work, not WAL work, so it waits on the memtable existing.
 - **SSTable block, index, and footer are designed but not built.** §13.2 fixes the byte
   layout; the block writer, index builder, and reader that turn a flushed memtable into
-  a file on disk are the next task, along with the memtable itself that would produce
-  the input to flush.
+  a file on disk are the next task.
+- **Memtable flush trigger is not implemented.** `Len()` reports a distinct-key count,
+  not an approximate byte size, and nothing yet decides when a memtable is full and
+  should be switched out and flushed. The Raft log's own compaction trigger (§10)
+  already argues for measuring the right quantity rather than a proxy for it; the same
+  argument applies here; a size estimate, not an entry count, is almost certainly the
+  right trigger, and is not yet measured.
+- **The skip list has no `Seek`.** `NewIterator` only walks from the beginning. A range
+  scan from an arbitrary start key — which an SSTable read path merging several sources
+  will eventually want — needs a seek that reuses `search`'s predecessor-finding walk
+  rather than a full scan from the head. Deferred until something needs it.
+- **No custom key comparator.** Keys are compared with `bytes.Compare` throughout, which
+  is exactly right for the byte-string keys this engine has today. A comparator seam
+  would only earn its complexity if a future key encoding (composite keys, integer keys
+  needing numeric rather than lexicographic order) needed it, and nothing does yet.
 
 ---
 
@@ -1543,11 +1557,121 @@ avoids by construction.
 agree on how a key/value pair is framed; the block writer, the index builder, and the
 reader that turns this layout into working code are separate, later work.
 
+### 13.3 Memtable — a skip list, implemented
+
+The memtable is the sorted, in-memory structure every write lands in before it is
+durable in an SSTable: the WAL (§13.1) makes a write crash-safe, and the memtable is
+what makes it *queryable* while it is still only in the WAL and not yet flushed. A read
+path checks the active memtable first, then any memtables mid-flush, then SSTables
+oldest-to-newest, stopping at the first tombstone or value it finds — the memtable is
+the first and cheapest of those stops, and the one every write passes through.
+
+**Why a skip list.** Three structures were on the table.
+
+*A red-black or AVL tree* gives the same O(log n) operations and sorted iteration, but
+rebalancing on insert rewrites parent and child pointers as a unit — there is no way to
+publish a rotation as a single atomic pointer swap the way a skip list publishes a new
+node. A concurrent reader mid-traversal during a rotation can be sent down a pointer
+that the rotation is in the middle of replacing. Making that safe means either a lock
+readers must take too, or a far more intricate concurrent-rotation scheme than this
+component's job justifies.
+
+*A plain sorted slice, or a `map` sorted at flush time*, needs no concurrency scheme at
+all for reads, since nothing is ever rearranged mid-read — but every insert into a
+slice at the wrong position is an O(n) shift, and a `map` has no order to give an
+iterator without an O(n log n) sort on every flush. Both are the right choice once a
+structure is only ever built once and read many times (an SSTable's index, for
+instance); a memtable is inserted into constantly and must stay sorted the entire time.
+
+*A skip list* (Pugh, 1990) gives up the tree's worst-case guarantees for a
+probabilistic O(log n) — but its insert is a splice of independent forward pointers,
+one per level, each one a single pointer write. Publishing a new node is exactly as
+atomic as a skip list's structure allows it to be, without extra machinery to make it
+so. That property is the entire reason it was chosen over the other two.
+
+**The concurrency contract, stated precisely.**
+
+- `Get` and iteration take no lock. Any number of goroutines may call either, at any
+  time, concurrently with each other.
+- `Put` and `Delete` are serialized by an internal mutex. Production has exactly one
+  writer in practice — the same single-applier goroutine that already owns the apply
+  path (§8) — so the mutex is never contended there; it exists so a second writer,
+  should one ever call in by mistake, gets correctness rather than corruption. This is
+  the same "guarded, not assumed" posture DESIGN.md §8 takes toward Raft's own
+  believed-impossible states, applied to a different layer: `TestConcurrentWritersAreGuardedNotAssumed`
+  exercises sixteen concurrent writers on disjoint keys and asserts every one lands
+  correctly, precisely because that usage should never occur and is cheap to guarantee
+  anyway.
+
+**Why the splice is safe without a reader-side lock.** A new node's own forward
+pointers are set before the node is reachable from anywhere — nothing else can observe
+it yet, so no atomics are needed for that half. Publishing it is a single atomic store
+of the node pointer into its predecessor's forward slot at each level. A concurrent
+reader loading that slot observes either the old successor or the new node, and if it
+observes the new node, that node's own forward pointers were already set one line
+earlier in program order — there is no interleaving in which a reader can reach a node
+that is only half-linked. Go's memory model treats `sync/atomic` operations as
+synchronization points precisely so that a store observed by a load carries everything
+sequenced before the store with it; that guarantee is what this argument leans on.
+
+**Why an update is safe without a reader-side lock either.** A key's value and its
+tombstone bit are boxed together in one struct and swapped as a single atomic pointer,
+never written to separately. A reader that loads a node's current entry gets the whole
+old struct or the whole new one — never a value that has moved on while its tombstone
+bit has not, or the reverse, and never a value with some old bytes and some new ones
+spliced together. `TestConcurrentReadsDuringUpdateDetectTornValue` checks this directly
+rather than by argument alone: values are filled with a single repeated byte, so a torn
+read would show up as a value whose bytes disagree with each other, and 20,000
+concurrent overwrites against 16 concurrent readers never produce one.
+
+**What a `Get` result means.** Three outcomes, not two — `ok=false` (never written to
+this memtable; keep searching an older level), `ok=true, tombstone=true` (deleted here;
+stop searching older levels, the value has been superseded), and `ok=true,
+tombstone=false, value=...` (found). Collapsing the tombstone case into "not found"
+would be the classic LSM read bug: a delete followed by a search that falls through to
+a stale value still sitting in an older SSTable.
+
+**Iteration makes no snapshot-isolation promise, deliberately.** An iterator walks the
+same lock-free level-0 chain a `Get` does, so it may run concurrently with a writer —
+`TestConcurrentIteratorDuringWrites` runs eight iterators against one writer and asserts
+only that keys never arrive out of order, not that any particular set of keys was seen.
+That is the honest contract for what an iterator is for today: draining a memtable that
+has already been switched out of the write path ahead of a flush, where nothing is
+writing to it any more and the ordering guarantee is all a block writer needs. It would
+be the wrong contract for a hypothetical transaction or range-scan feature that needed
+a consistent point-in-time view of a memtable still being written to; nothing here
+claims to provide that.
+
+**`rng` is per-memtable and seeded, never the global `rand`.** The same rule Raft's
+election timer follows (§10), for the same reason: a seeded, per-instance source makes
+one memtable's sequence of level choices reproducible from one seed regardless of what
+else is running, and keeps two memtables from sharing state that would let one's insert
+order leak into another's level distribution.
+
+**`Memtable` satisfies `wal.Sink` structurally.** `ApplyPut` and `ApplyDelete` give a
+`Memtable` the two methods `wal.RecoverAndOpen` (§13.1) expects of a recovery sink,
+without this package importing package `wal` at all — Go's structural interfaces make
+that possible, and not importing it keeps the dependency one-way: the WAL knows nothing
+about memtables, and the memtable package knows nothing about the WAL either. A node's
+startup path is what wires the two together, by calling
+`wal.RecoverAndOpen(path, policy, memtable)`.
+
+**Implemented** at `internal/storage/memtable/`, across `skiplist.go` (the node type,
+the lock-free `search`, and level selection), `memtable.go` (the public `Put` / `Delete`
+/ `Get` / `Len` surface and the `wal.Sink` methods), and `iterator.go`. Correctness is
+checked against a reference map built alongside 5,000 randomly ordered inserts,
+including duplicate keys and tombstones; concurrency is checked by four dedicated
+tests — concurrent reads alone, concurrent reads against a single writer inserting new
+keys, concurrent reads against a single writer overwriting one hot key (the torn-value
+check above), and concurrent iteration against a writer — all run under `-race
+-shuffle=on -count=3`.
+
 ---
 
 ## 14. Revision log
 
 | Version | Change |
+
 |---|---|
 | v1 | Initial design: states, RPCs, persistent and volatile state |
 | v1.1 | Majority-intersection argument for the up-to-date check; implementation decisions; the election-timer reset deviation recorded as an open question; volatile state expanded to match the implementation |
@@ -1557,3 +1681,4 @@ reader that turns this layout into working code are separate, later work.
 | v1.5 | Persistence implemented: the record format and its checksum, the write-temp / fsync / rename / fsync-dir sequence, the dirty-flag funnel and the three exits it guards, and the refusal to treat a corrupt record as a fresh node; the limits of SIGKILL as evidence stated explicitly; fsync policy measured across always / batch / never and written up in `docs/fsync-policy.md`, with the node's write path shown to be entirely fsync-bound and the compaction-first assumption withdrawn; replication coalesced to one round in flight per peer, measured at 2.6× throughput and 125× fewer messages; `kill` and `crash` distinguished as separate faults; reordering demoted from an asserted property to a reported one, with the guards it had been covering tested directly instead |
 | v1.6 | Snapshotting and log compaction: the snapshot record and why `lastIncludedTerm` cannot be derived; the ordering rule between image and truncated log, and the asymmetry of the two crash windows; the state record carrying its own floor so a compacted log is not ambiguous; three-way reconciliation of the two floors on restart; `InstallSnapshot` written up as §4.3 with the no-chunking deviation; the index seam in `log.go` with its greppable invariant and fail-closed `termAt`; the compaction trigger measuring discardable entries rather than log length, with the 59-versus-9,453 measurement behind it; `Snapshot` guarded on `commitIndex` because `lastApplied` lags the caller by a mutex acquisition; image rebuilds throttled per peer; the restart-replay question closed and chunking, snapshot-during-replication and the `kvMachine` gap opened; the snapshot/AppendEntries interleavings pinned deterministically, with a same-term leader now refusing an image as it already refuses entries; recovery measured at image sizes up to a gigabyte, showing time is not the constraint and that both the encode and decode paths allocate a second copy of the image |
 | v1.7 | On-disk formats for the LSM storage engine fixed on paper: the write-ahead log record framing and its CRC coverage, with the departure from LevelDB's block-fragmented WAL recorded and reasoned through; the SSTable data block, index block, and trailing footer laid out, with the footer-at-the-end decision argued from the engine's own write order; the boundary between Raft's persistent state (§5) and the engine's write-ahead log stated explicitly, since the two are separate durability islands answering different questions. The write-ahead log itself implemented at `internal/storage/wal/`, with the three sync policies, corrupt-record handling, and torn-tail recovery tested directly. Startup recovery added as `Recover`, distinct from a bare `Replay`, with the truncate-the-stale-tail step it performs and the reason skipping it would permanently hide every record written after a recovery that didn't truncate; proven with a test that deliberately corrupts a record's payload on disk, asserts recovery stops there cleanly, and then confirms a second, independent recovery pass sees a record appended after the first one — the assertion a truncation-free recovery would fail. SSTable encoding left as designed-but-not-yet-built. |
+| v1.8 | The memtable implemented as a skip list (§13.3): lock-free `Get` and iteration against a single mutex-serialized writer, an atomically-swapped value-plus-tombstone pair per key so neither a splice nor an update can ever be observed half-done, and a per-instance seeded RNG for level selection on the same rule as Raft's election timer. Three structures — red-black tree, sorted slice, skip list — compared and the choice argued from which one lets a new node's publication be a single atomic pointer write. `Memtable` satisfies `wal.Sink` structurally, wiring the write-ahead log's recovery path to the memtable without either package importing the other. Concurrency argued from the memory model and then checked directly: concurrent reads alone, concurrent reads against a single inserting writer, concurrent reads against a single updating writer with byte-level torn-value detection, and concurrent iteration against a writer, all under `-race -shuffle=on -count=3`; a fifth test drives sixteen concurrent writers on disjoint keys through the same internal mutex production never contends, on the same "guarded, not assumed" reasoning §8 applies to Raft's own believed-impossible states. |
