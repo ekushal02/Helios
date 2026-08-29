@@ -35,16 +35,35 @@ const targetBlockSize = 4096
 // Source is what Write drains into an SSTable: a forward-only cursor over
 // entries already in ascending key order. *memtable.Iterator satisfies
 // this structurally, the same way *memtable.Memtable satisfies wal.Sink
-// structurally (DESIGN.md §13.3) -- this package needs memtable's
+// structurally (DESIGN.md §13.4) -- this package needs memtable's
 // iteration shape, not an import of it, and Source is that shape written
 // down. (flush.go is the one file in this package that does import
 // memtable, to offer the memtable-specific convenience of Flush and
 // FlushIfFull; Write itself stays decoupled.)
+//
+// Err REPORTS A MID-ITERATION FAILURE, ADDED IN v1.13, AFTER Source
+// GAINED ITS FIRST FALLIBLE IMPLEMENTATION. Every Source before
+// sstable.Iterator (§13.8) was pure in-memory -- a *memtable.Iterator
+// walks pointers already resident in RAM and cannot fail -- so Write's
+// original loop, `for src.Next() { ... }`, never checked for a failure
+// because there was structurally nothing that could produce one. An
+// SSTable-backed Iterator reads blocks off disk mid-scan, which very much
+// can fail (a corrupt block, an I/O error), and Next() returning false is
+// the same observable outcome whether iteration finished cleanly or broke
+// partway through. Without Err, a compaction merging several SSTables
+// (§13.8) could silently produce a truncated output file and report
+// success. Every Source must now report nil once exhausted cleanly, and
+// the true cause once Next has returned false because of a failure --
+// Write checks this immediately after its loop ends and refuses to
+// publish a file if it is non-nil. *memtable.Iterator's Err trivially
+// always returns nil, at zero real cost, rather than being exempted from
+// the interface it was the original, and only, implementation of.
 type Source interface {
 	Next() bool
 	Key() []byte
 	Value() []byte
 	Tombstone() bool
+	Err() error
 }
 
 // Info summarizes a successfully written SSTable, for a caller that wants
@@ -182,6 +201,18 @@ func Write(src Source, path string) (*Info, error) {
 		prevKey = key
 	}
 
+	if err := src.Err(); err != nil {
+		// Checked before anything below is committed to disk, and before
+		// the empty-source check: Next returning false because a source
+		// failed partway through -- or failed on its very first call,
+		// yielding zero entries -- must never be indistinguishable from a
+		// source that simply ran out of entries cleanly. Every entry
+		// successfully drained before the failure is discarded along
+		// with the rest of this write; see the doc on Source.Err for why
+		// a partial, silently-short file is exactly the outcome this
+		// check exists to prevent.
+		return nil, fmt.Errorf("sstable: source failed: %w", err)
+	}
 	if info.Entries == 0 {
 		return nil, ErrEmptySource
 	}

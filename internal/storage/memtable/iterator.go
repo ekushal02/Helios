@@ -59,3 +59,13 @@ func (it *Iterator) Value() []byte {
 func (it *Iterator) Tombstone() bool {
 	return it.node.entry.Load().tombstone
 }
+
+// Err always returns nil. A Memtable is walked entirely in memory --
+// there is no I/O for a traversal to fail on -- so this exists purely to
+// satisfy sstable.Source (§13.2), which added Err in v1.13 once an
+// SSTable-backed Iterator (a Source that genuinely can fail mid-scan)
+// existed for the first time. See sstable.Source's own doc for why every
+// implementation, fallible or not, now carries this method.
+func (it *Iterator) Err() error {
+	return nil
+}

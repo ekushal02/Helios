@@ -1,6 +1,7 @@
 package sstable
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -319,3 +320,81 @@ func (s *fakeSource) Next() bool {
 func (s *fakeSource) Key() []byte     { return s.entries[s.i-1].Key }
 func (s *fakeSource) Value() []byte   { return s.entries[s.i-1].Value }
 func (s *fakeSource) Tombstone() bool { return s.entries[s.i-1].Tombstone }
+func (s *fakeSource) Err() error      { return nil }
+
+// failingSource yields a handful of well-formed entries and then reports
+// a failure through Err rather than exhausting cleanly -- the shape a
+// disk-backed sstable.Iterator (§13.8) takes when a block read fails
+// partway through a scan, which is exactly the case Source.Err was added
+// to let Write detect.
+type failingSource struct {
+	entries []blockEntry
+	i       int
+	failAt  int // Next returns false (as if failed) once i reaches this
+	err     error
+}
+
+func (s *failingSource) Next() bool {
+	if s.i >= s.failAt || s.i >= len(s.entries) {
+		return false
+	}
+	s.i++
+	return true
+}
+
+func (s *failingSource) Key() []byte     { return s.entries[s.i-1].Key }
+func (s *failingSource) Value() []byte   { return s.entries[s.i-1].Value }
+func (s *failingSource) Tombstone() bool { return s.entries[s.i-1].Tombstone }
+func (s *failingSource) Err() error      { return s.err }
+
+// TestWriteRefusesToPublishWhenTheSourceFails is the test
+// Source.Err's own doc promises exists: a source that stops partway
+// through with a real failure must not produce a file that looks like a
+// complete, valid SSTable missing only the entries after the failure.
+func TestWriteRefusesToPublishWhenTheSourceFails(t *testing.T) {
+	wantErr := errors.New("simulated disk read failure")
+	src := &failingSource{
+		entries: []blockEntry{
+			{Key: []byte("a"), Value: []byte("1")},
+			{Key: []byte("b"), Value: []byte("2")},
+			{Key: []byte("c"), Value: []byte("3")},
+		},
+		failAt: 2, // yields "a" and "b" successfully, then fails
+		err:    wantErr,
+	}
+	path := filepath.Join(t.TempDir(), "flush.sst")
+	_, err := Write(src, path)
+	if err == nil {
+		t.Fatal("Write against a failing source: err = nil, want the propagated error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Write error = %v, want it to wrap %v", err, wantErr)
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Fatal("Write against a failing source left a truncated file at path -- must publish nothing at all")
+	}
+	if _, statErr := os.Stat(path + ".tmp"); statErr == nil {
+		t.Fatal("Write against a failing source left its temp file behind")
+	}
+}
+
+// TestWriteRefusesToPublishWhenTheSourceFailsImmediately checks the
+// edge case where a source fails on its very first call, yielding zero
+// entries -- this must be reported as the failure it is, not as
+// ErrEmptySource, which would misdescribe a real I/O failure as an
+// ordinary "nothing to write" case.
+func TestWriteRefusesToPublishWhenTheSourceFailsImmediately(t *testing.T) {
+	wantErr := errors.New("simulated failure on the first read")
+	src := &failingSource{failAt: 0, err: wantErr}
+	path := filepath.Join(t.TempDir(), "flush.sst")
+	_, err := Write(src, path)
+	if err == nil {
+		t.Fatal("Write against an immediately-failing source: err = nil, want the propagated error")
+	}
+	if errors.Is(err, ErrEmptySource) {
+		t.Fatal("Write against an immediately-failing source returned ErrEmptySource -- a real failure must not be misreported as an ordinary empty source")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Write error = %v, want it to wrap %v", err, wantErr)
+	}
+}
