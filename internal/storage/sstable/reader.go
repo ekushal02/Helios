@@ -91,24 +91,27 @@ func (r *Reader) NumBlocks() int { return len(r.index) }
 
 // Get looks up key. The three-outcome contract matches
 // (*memtable.Memtable).Get exactly, and for the same reason: a caller
-// merging this SSTable underneath one or more memtables (DESIGN.md §13.3)
+// merging this SSTable underneath one or more memtables (DESIGN.md §13.4)
 // needs to tell "never written here" apart from "deleted here, stop
 // looking further down," and collapsing that distinction is the read bug
 // that whole design already argues against.
+//
+// Get is two steps, deliberately kept separate rather than one fused loop:
+// findBlock (below) does a binary search over the in-memory index to
+// locate the single block key could be in, then Get itself reads that one
+// block off disk and scans its entries. The split is not just style --
+// findBlock's contract (which block, if any) is independent of how a
+// block's bytes are verified or parsed, and TestFindBlock* in
+// reader_test.go exercises it directly against a hand-built index with no
+// file on disk at all, which a single fused function would not allow.
 func (r *Reader) Get(key []byte) (value []byte, tombstone bool, ok bool, err error) {
-	// The index holds one entry per block, keyed by that block's LAST
-	// key, in block order -- so the first entry whose LastKey is >= key
-	// is the only block key could possibly be in. bytes.Compare gives
-	// the ordering sort.Search needs.
-	i := sort.Search(len(r.index), func(i int) bool {
-		return bytes.Compare(r.index[i].LastKey, key) >= 0
-	})
-	if i == len(r.index) {
-		return nil, false, false, nil // past the last block's last key
+	e, found := r.findBlock(key)
+	if !found {
+		return nil, false, false, nil // past every block's last key
 	}
 
-	raw := make([]byte, r.index[i].BlockLength)
-	if _, err := r.file.ReadAt(raw, int64(r.index[i].BlockOffset)); err != nil {
+	raw := make([]byte, e.BlockLength)
+	if _, err := r.file.ReadAt(raw, int64(e.BlockOffset)); err != nil {
 		return nil, false, false, fmt.Errorf("sstable: read block: %w", err)
 	}
 	body, err := verifyAndSplitBlock(raw)
@@ -125,10 +128,34 @@ func (r *Reader) Get(key []byte) (value []byte, tombstone bool, ok bool, err err
 	// targetBlockSize, so this scan is bounded too, and correctness comes
 	// first for a task whose job is producing a file a reader can trust
 	// at all.
-	for _, e := range entries {
-		if bytes.Equal(e.Key, key) {
-			return e.Value, e.Tombstone, true, nil
+	for _, en := range entries {
+		if bytes.Equal(en.Key, key) {
+			return en.Value, en.Tombstone, true, nil
 		}
 	}
 	return nil, false, false, nil
+}
+
+// findBlock returns the one data block that could contain key -- the
+// first block, in file order, whose LastKey is >= key -- or ok=false if
+// key sorts past every block's last key, meaning no block on disk can
+// hold it.
+//
+// This is the entire on-disk-format reason the index is sorted by
+// LastKey (§13.2): a block holds every key greater than the previous
+// block's LastKey and up to and including its own, so the blocks
+// partition the whole key space in order, and the first LastKey that is
+// not less than key identifies the one partition key could fall in --
+// whether or not key is actually present in it. bytes.Compare gives
+// sort.Search the ordering it needs; the search touches only r.index,
+// already resident in memory since Open, so a call that turns out to
+// find nothing costs no disk read at all.
+func (r *Reader) findBlock(key []byte) (e indexEntry, ok bool) {
+	i := sort.Search(len(r.index), func(i int) bool {
+		return bytes.Compare(r.index[i].LastKey, key) >= 0
+	})
+	if i == len(r.index) {
+		return indexEntry{}, false
+	}
+	return r.index[i], true
 }
