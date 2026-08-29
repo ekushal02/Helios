@@ -1,0 +1,29 @@
+<svg viewBox="0 0 720 590" xmlns="http://www.w3.org/2000/svg" font-family="monospace" font-size="13">
+<rect width="720" height="590" fill="#ffffff"/>
+<text x="70" y="30" font-weight="bold">Write amplification (physical bytes / logical bytes)</text>
+<line x1="70" y1="50" x2="70" y2="230" stroke="#333" stroke-width="1"/>
+<line x1="70" y1="230" x2="520" y2="230" stroke="#333" stroke-width="1"/>
+<rect x="100" y="74" width="90" height="156" fill="#3b6fb5"/>
+<text x="145" y="68" text-anchor="middle">2.750</text>
+<text x="145" y="250" text-anchor="middle">maxFilesPerLevel=2</text>
+<rect x="250" y="91" width="90" height="139" fill="#3b6fb5"/>
+<text x="295" y="85" text-anchor="middle">2.446</text>
+<text x="295" y="250" text-anchor="middle">maxFilesPerLevel=4</text>
+<rect x="400" y="97" width="90" height="133" fill="#3b6fb5"/>
+<text x="445" y="91" text-anchor="middle">2.347</text>
+<text x="445" y="250" text-anchor="middle">maxFilesPerLevel=8</text>
+<text x="70" y="310" font-weight="bold">Peak space amplification (on-disk bytes / live logical bytes)</text>
+<line x1="70" y1="330" x2="70" y2="510" stroke="#333" stroke-width="1"/>
+<line x1="70" y1="510" x2="520" y2="510" stroke="#333" stroke-width="1"/>
+<line x1="70" y1="477" x2="520" y2="477" stroke="#555" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="260" y="471" fill="#555">final SA = 1.090 (all configs)</text>
+<rect x="100" y="435" width="90" height="75" fill="#b5673b"/>
+<text x="145" y="429" text-anchor="middle">2.417</text>
+<text x="145" y="530" text-anchor="middle">maxFilesPerLevel=2</text>
+<rect x="250" y="408" width="90" height="102" fill="#b5673b"/>
+<text x="295" y="402" text-anchor="middle">3.287</text>
+<text x="295" y="530" text-anchor="middle">maxFilesPerLevel=4</text>
+<rect x="400" y="354" width="90" height="156" fill="#b5673b"/>
+<text x="445" y="348" text-anchor="middle">5.024</text>
+<text x="445" y="530" text-anchor="middle">maxFilesPerLevel=8</text>
+</svg>
