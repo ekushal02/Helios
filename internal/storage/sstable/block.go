@@ -5,14 +5,23 @@ import (
 	"hash/crc32"
 )
 
-// A data block is a run of sorted entries followed by a checksum over every
-// byte that precedes it:
+// A data block is a run of sorted entries, optionally compressed as a
+// whole, preceded by a one-byte marker saying which, and followed by a
+// checksum over both:
 //
-//	+------------------------------------------------------------+
-//	| entry | entry | ... | entry                                 |
-//	+------------------------------------------------------------+
-//	| BlockCRC32 (4B)                                              |
-//	+------------------------------------------------------------+
+//	+-------------------+------------------------------------------+----------------+
+//	| CompressionType(1B)| entry | entry | ... | entry  (raw or compressed) | BlockCRC32(4B) |
+//	+-------------------+------------------------------------------+----------------+
+//
+// See CompressionType's own doc (compress.go) for the two values this
+// byte can take and why compression, when used, is flate rather than a
+// self-checksumming container format like gzip. THE COMPRESSION-TYPE
+// BYTE WAS ADDED AFTER THE TYPE BYTE BELOW, NOT AT THE SAME TIME --
+// this block-level byte says how the WHOLE block's bytes are stored;
+// the per-entry Type byte below says whether one entry is a Put or a
+// Delete once the block's bytes are already in their true, decompressed
+// form. The two solve different problems at different layers and are
+// not interchangeable, despite both being one-byte discriminators.
 //
 // A Put entry:
 //
@@ -36,7 +45,7 @@ import (
 // run -- there is no outer framing left to carry the discriminator once the
 // WAL's record boundary is gone. Without a type field, a memtable
 // tombstone flushed into an SSTable would be indistinguishable from a
-// legitimate empty-string value, which is exactly the read bug §13.3's
+// legitimate empty-string value, which is exactly the read bug §13.4's
 // three-outcome Get contract exists to prevent one layer up. Sentinel
 // encodings (ValueLen = 0xFFFFFFFF, say) were rejected for the same reason
 // the WAL rejected delimiter-scanning for keys and values: a value is
@@ -129,31 +138,91 @@ func readUint32Prefixed(body []byte, off int) (field []byte, next int, err error
 	return body[off:end], end, nil
 }
 
-// finalizeBlock appends body's checksum, producing the complete on-disk
-// bytes for one data block. The CRC covers every entry byte and nothing
-// else -- not a length prefix, because the block's own length is carried
-// externally by the index entry that points at it (§13.2's BlockLength),
-// the same division of responsibility the WAL record header uses between
-// Length and CRC (§13.1).
-func finalizeBlock(body []byte) []byte {
-	crc := crc32.ChecksumIEEE(body)
+// finalizeBlock compresses body (if compression is not CompressionNone
+// and actually helps -- see below), prepends a one-byte CompressionType
+// marker, and appends a checksum, producing the complete on-disk bytes
+// for one data block. The CRC covers the type byte and the payload that
+// follows it, whichever form that payload is in -- not a length prefix,
+// because the block's own length is carried externally by the index
+// entry that points at it (§13.2's BlockLength), the same division of
+// responsibility the WAL record header uses between Length and CRC
+// (§13.1).
+//
+// THE CRC COVERS THE ON-DISK (POSSIBLY COMPRESSED) BYTES, NOT THE
+// ORIGINAL ENTRY BYTES -- CHECKED BEFORE DECOMPRESSION IS EVER
+// ATTEMPTED, NOT AFTER. Corruption happens to whatever bytes are
+// actually on the physical medium, which are the compressed ones once
+// compression is in play; verifying those first, and only decompressing
+// once they're known-good, means this package never hands an
+// unverified byte stream to a decompressor. A decompressor asked to
+// make sense of arbitrary corrupted input is exactly the kind of
+// component a format like this should never trust blindly -- the same
+// reasoning maxDecompressedBlockSize's own doc (compress.go) applies to
+// bounding what a verified-but-still-adversarial stream could claim to
+// expand to.
+//
+// COMPRESSION IS SKIPPED, EVEN IF REQUESTED, WHEN IT DOESN'T ACTUALLY
+// SAVE SPACE. A block of already-compressed or near-random data can
+// come out of flate LARGER than it went in (a few bytes of framing
+// overhead with nothing to compress away), and decompression has a real
+// CPU cost a reader would pay on every future Get for no benefit at
+// all in that case. finalizeBlock compresses first, compares sizes, and
+// only keeps the compressed form -- falling back to CompressionNone --
+// if it is strictly smaller.
+func finalizeBlock(body []byte, compression CompressionType) ([]byte, error) {
+	payload := body
+	actual := CompressionNone
+
+	if compression == CompressionFlate {
+		compressed, err := compressFlate(body)
+		if err != nil {
+			return nil, err
+		}
+		if len(compressed) < len(body) {
+			payload = compressed
+			actual = CompressionFlate
+		}
+	}
+
+	out := make([]byte, 0, typeSize+len(payload)+crcSize)
+	out = append(out, byte(actual))
+	out = append(out, payload...)
+
+	crc := crc32.ChecksumIEEE(out)
 	var crcBuf [crcSize]byte
 	binary.LittleEndian.PutUint32(crcBuf[:], crc)
-	return append(body, crcBuf[:]...)
+	out = append(out, crcBuf[:]...)
+	return out, nil
 }
 
-// verifyAndSplitBlock checks raw's trailing CRC against its body and, if it
-// matches, returns the body alone (with the CRC trimmed off) for
-// decodeBlockEntries to parse.
+// verifyAndSplitBlock checks raw's trailing CRC against everything ahead
+// of it (the compression-type byte and the payload together), and if it
+// matches, returns the ORIGINAL entry bytes for decodeBlockEntries to
+// parse -- transparently decompressing first if the type byte says the
+// payload isn't stored raw. Every caller (Reader.loadBlock, Iterator.Next)
+// is unaffected by this: a block's compression is a per-block, on-disk
+// implementation detail this function fully absorbs, never something a
+// reader needs to know or ask about.
 func verifyAndSplitBlock(raw []byte) (body []byte, err error) {
-	if len(raw) < crcSize {
+	if len(raw) < typeSize+crcSize {
 		return nil, ErrCorruptBlock
 	}
-	body = raw[:len(raw)-crcSize]
+	withoutCRC := raw[:len(raw)-crcSize]
 	wantCRC := binary.LittleEndian.Uint32(raw[len(raw)-crcSize:])
-	gotCRC := crc32.ChecksumIEEE(body)
+	gotCRC := crc32.ChecksumIEEE(withoutCRC)
 	if gotCRC != wantCRC {
 		return nil, ErrCorruptBlock
 	}
-	return body, nil
+
+	compression := CompressionType(withoutCRC[0])
+	payload := withoutCRC[typeSize:]
+
+	switch compression {
+	case CompressionNone:
+		return payload, nil
+	case CompressionFlate:
+		return decompressFlate(payload)
+	default:
+		return nil, ErrCorruptBlock
+	}
 }

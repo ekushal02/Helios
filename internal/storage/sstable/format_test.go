@@ -11,7 +11,10 @@ func TestEncodeDecodeBlockRoundTrip(t *testing.T) {
 	block = encodePutEntry(block, []byte("bb"), []byte(""))
 	block = encodeDeleteEntry(block, []byte("ccc"))
 
-	finalized := finalizeBlock(block)
+	finalized, err := finalizeBlock(block, CompressionNone)
+	if err != nil {
+		t.Fatalf("finalizeBlock: %v", err)
+	}
 
 	body, err := verifyAndSplitBlock(finalized)
 	if err != nil {
@@ -42,10 +45,18 @@ func TestEncodeDecodeBlockRoundTrip(t *testing.T) {
 func TestVerifyAndSplitBlockDetectsCorruption(t *testing.T) {
 	var block []byte
 	block = encodePutEntry(block, []byte("a"), []byte("1"))
-	finalized := finalizeBlock(block)
+	finalized, err := finalizeBlock(block, CompressionNone)
+	if err != nil {
+		t.Fatalf("finalizeBlock: %v", err)
+	}
 
 	corrupted := bytes.Clone(finalized)
-	corrupted[0] ^= 0xFF // flip a bit inside the entry, leave the CRC alone
+	// Flip a bit anywhere in the CRC-covered bytes (here, byte 0, the
+	// compression-type byte) -- the CRC covers the type byte and the
+	// payload together (block.go), so corrupting either is caught the
+	// same way, before verifyAndSplitBlock ever looks at what the type
+	// byte says.
+	corrupted[0] ^= 0xFF
 
 	if _, err := verifyAndSplitBlock(corrupted); err != ErrCorruptBlock {
 		t.Fatalf("verifyAndSplitBlock on corrupted data: err = %v, want ErrCorruptBlock", err)
@@ -54,7 +65,7 @@ func TestVerifyAndSplitBlockDetectsCorruption(t *testing.T) {
 
 func TestVerifyAndSplitBlockRejectsTruncatedInput(t *testing.T) {
 	if _, err := verifyAndSplitBlock([]byte{1, 2, 3}); err != ErrCorruptBlock {
-		t.Fatalf("verifyAndSplitBlock on 3 bytes (shorter than one CRC): err = %v, want ErrCorruptBlock", err)
+		t.Fatalf("verifyAndSplitBlock on 3 bytes (shorter than one type byte + one CRC): err = %v, want ErrCorruptBlock", err)
 	}
 }
 

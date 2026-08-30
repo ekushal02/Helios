@@ -96,14 +96,35 @@ var (
 	ErrFileExists = errors.New("sstable: refusing to overwrite an existing file")
 )
 
-// Write drains src, in order, into a new immutable SSTable at path:
-// sorted data blocks (block.go), an index over them (index.go), and a
-// trailing footer, published all at once via the same write-temp / fsync
-// / rename / fsync-directory sequence FileStorage uses for Raft's own
-// persistent state (DESIGN.md §5) -- for the same reason. A write of more
-// than one sector is not atomic, so a crash mid-write must never be
-// allowed to leave a reader an SSTable whose footer, index, or trailing
-// blocks are missing but whose leading bytes look like a valid file.
+// Write drains src, in order, into a new immutable SSTable at path, with
+// no block compression -- every existing caller of Write, across every
+// package that already uses it, keeps working exactly as it did before
+// this task, writing the same bytes it always has. See WriteCompressed
+// for the compressed variant, and CompressionType's doc (compress.go)
+// for why a new function was added rather than Write's own signature
+// changed: the identical "leave the simple existing path alone, add a
+// new one for the new capability" precedent OpenWithCache set over Open
+// (§13.12).
+func Write(src Source, path string) (*Info, error) {
+	return write(src, path, CompressionNone)
+}
+
+// WriteCompressed is Write, but every data block is passed through
+// compression (finalizeBlock decides per block whether it actually
+// helped -- see that function's doc) before being written.
+func WriteCompressed(src Source, path string, compression CompressionType) (*Info, error) {
+	return write(src, path, compression)
+}
+
+// write is the sorted-data-blocks / index / footer / atomic-publish
+// sequence both Write and WriteCompressed share: sorted data blocks
+// (block.go), an index over them (index.go), and a trailing footer,
+// published all at once via the same write-temp / fsync / rename /
+// fsync-directory sequence FileStorage uses for Raft's own persistent
+// state (DESIGN.md §5) -- for the same reason. A write of more than one
+// sector is not atomic, so a crash mid-write must never be allowed to
+// leave a reader an SSTable whose footer, index, or trailing blocks are
+// missing but whose leading bytes look like a valid file.
 //
 // UNLIKE THE WAL, THIS FILE IS ASSEMBLED ONCE, ALL AT ONCE. The WAL is
 // append-only and a reader tolerates a torn tail by design (§13.1); an
@@ -112,10 +133,9 @@ var (
 // is exactly the case rename(2) exists for: build the whole thing under a
 // name nothing is looking at yet, then publish it in one atomic step.
 //
-// Write returns ErrEmptySource if src yields nothing at all -- see the
-// doc on that error for why an empty SSTable is refused rather than
-// produced.
-func Write(src Source, path string) (*Info, error) {
+// Returns ErrEmptySource if src yields nothing at all -- see the doc on
+// that error for why an empty SSTable is refused rather than produced.
+func write(src Source, path string, compression CompressionType) (*Info, error) {
 	if _, err := os.Stat(path); err == nil {
 		return nil, fmt.Errorf("%w: %s", ErrFileExists, path)
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -153,7 +173,10 @@ func Write(src Source, path string) (*Info, error) {
 		if len(block) == 0 {
 			return nil
 		}
-		finalized := finalizeBlock(block)
+		finalized, err := finalizeBlock(block, compression)
+		if err != nil {
+			return fmt.Errorf("sstable: finalize block: %w", err)
+		}
 		n, err := w.Write(finalized)
 		if err != nil {
 			return fmt.Errorf("sstable: write block: %w", err)

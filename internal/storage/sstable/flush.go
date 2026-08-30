@@ -18,6 +18,14 @@ func Flush(m *memtable.Memtable, path string) (*Info, error) {
 	return Write(m.NewIterator(), path)
 }
 
+// FlushCompressed is Flush, but every data block is compressed -- see
+// WriteCompressed. Added alongside Flush rather than replacing it, on
+// the same "leave the existing simple path alone" precedent Write and
+// WriteCompressed themselves follow.
+func FlushCompressed(m *memtable.Memtable, path string, compression CompressionType) (*Info, error) {
+	return WriteCompressed(m.NewIterator(), path, compression)
+}
+
 // FlushIfFull is the size-threshold trigger this task exists to add: if
 // m.ApproxSize() has reached thresholdBytes, flush it to path and report
 // flushed=true; otherwise do nothing and report flushed=false with a nil
@@ -30,7 +38,7 @@ func Flush(m *memtable.Memtable, path string) (*Info, error) {
 // controls both, the same way wal.Open takes a full path rather than
 // inventing a naming scheme of its own), does not swap a fresh Memtable
 // into the write path, does not make the flushed memtable's data visible
-// to reads against the new one (see DESIGN.md §13.3's note on memtables
+// to reads against the new one (see DESIGN.md §13.4's note on memtables
 // "mid-flush"), and does not run in the background -- the caller blocks
 // for the duration of the write, same as Flush. All of that is real work
 // belonging to whatever orchestrates the write path above both this

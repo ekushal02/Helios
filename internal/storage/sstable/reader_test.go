@@ -39,7 +39,7 @@ func TestFindBlockOnAHandBuiltIndex(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		e, ok := r.findBlock([]byte(tc.key))
+		_, e, ok := r.findBlock([]byte(tc.key))
 		if ok != tc.wantFound {
 			t.Errorf("findBlock(%q): ok = %v, want %v", tc.key, ok, tc.wantFound)
 			continue
@@ -56,7 +56,7 @@ func TestFindBlockOnAHandBuiltIndex(t *testing.T) {
 // that.
 func TestFindBlockOnAnEmptyIndex(t *testing.T) {
 	r := &Reader{index: nil}
-	if _, ok := r.findBlock([]byte("anything")); ok {
+	if _, _, ok := r.findBlock([]byte("anything")); ok {
 		t.Fatal("findBlock on an empty index: ok = true, want false")
 	}
 }

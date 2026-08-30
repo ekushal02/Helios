@@ -2,30 +2,27 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.15 — leader election, log replication, the apply path, linearizable
+**Status:** v1.19 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
 lease. The log is compacted behind a state-machine image, and a follower that falls
 below the resulting floor is repaired with `InstallSnapshot` rather than entries.
 Verified under crashes, restarts, network partitions, message loss, reordering, and a
-node offline for ten thousand entries. The LSM storage engine that will back the state
-machine above the apply channel is under active development: the write-ahead log, the
-memtable (a skip list, with approximate size tracking for a flush trigger), SSTable
-read/write (data blocks, an index, a footer, sequential iteration, a k-way merge, and
-the flush path that produces one from a full memtable), a Bloom filter (implemented and
-measured against its theoretical false-positive curve, not yet wired into the SSTable
-paths that will use it), a merged read/write path (`engine.Reader` across memtables and
-SSTables newest-first; `engine.Writer` durably recording both puts and deletes through
-the WAL before the memtable), and leveled compaction — including a background runner
-(`compaction.Background`) that drains a compaction backlog on its own goroutine, with
-write-latency measured directly against a live `engine.Writer` running concurrently,
-and startup recovery (`compaction.Recover`) that cleans up orphaned files from a crash
-mid-compaction and validates every file the manifest still claims exists actually
-does — are all implemented and tested. Not yet wired into a single engine that swaps
-a full memtable out from under live writes and flushes it into the manifest
-`Background` compacts, so that a live write workload actually feeds the backlog
-`Background` drains rather than the two only having been measured side by side.
+node offline for ten thousand entries. The LSM storage engine — write-ahead log,
+memtable, SSTable read/write with optional per-block compression, a Bloom filter
+(measured, not yet wired into the SSTable read path), a shared LRU block cache, a
+merged read/write path, and leveled compaction with a background runner and startup
+recovery — is now wired in as the actual Raft state machine (§14), not just exercised
+by tests calling it directly: `internal/kvstore.Machine` consumes a real `raft.Node`'s
+`ApplyCh` end to end, closing the long-standing "nothing swaps a full memtable out from
+under live writes" gap along the way, implements both linearizable read paths against
+the real storage engine, and implements Raft's snapshot contract (a logical image of
+the full live key set, not yet the file-referencing physical form a larger engine would
+eventually want). `cmd/helios` is a real, if single-node-only, running program, not a
+stub. No client-facing network API exists yet — that, a background flush goroutine, and
+a handful of "asserted, not yet measured against a real workload" constants are what
+remain, tracked explicitly in §12 and §14.7 rather than left implicit.
 
 ---
 
@@ -287,7 +284,7 @@ does not know who won.
 >A server may vote for only one candidate in a given term. For example, if C votes for A in term 5 and then crashes, C must persist votedFor = A. If C forgets this information after restarting, it could vote for B in the same term. With enough other votes, both A and B could obtain a majority and be elected leaders in term 5, violating Raft's Election Safety property. Therefore votedFor must be persisted before responding to the vote request.
 
 **Implemented.** All three reach stable storage before any reply or outgoing RPC that
-depends on them. `docs/fsync-policy.md` covers what "stable" is allowed to mean and what
+depends on them. `fsync-policy.md` covers what "stable" is allowed to mean and what
 each answer costs; this section covers the mechanism.
 
 ### The record
@@ -386,7 +383,7 @@ across a hundred seeded rounds that crash a node under load and restart it.
 
 **None of that tests fsync.** SIGKILL destroys a process, not a page cache, so every one
 of those tests would pass with the flush calls deleted. The fsync policy rests on the
-argument in `docs/fsync-policy.md`, not on a green suite.
+argument in `fsync-policy.md`, not on a green suite.
 
 What a restart *costs* is measured separately, at image sizes up to a gigabyte — see
 §10.
@@ -1301,7 +1298,7 @@ Deliberately unresolved. Each is answered by later work.
   coalesce: the batched storage measures 1.00 flushes per write on the real write path,
   against 0.04 at the storage layer with 64 concurrent writers. That gap — 147 against
   3,679 writes/s — is what the critical section costs, and it is the largest single
-  number in `docs/fsync-policy.md`. Moving the write out is the highest-value
+  number in `fsync-policy.md`. Moving the write out is the highest-value
   performance work left in the storage path. It is blocked on one question: coalescing
   drops superseded records, which is sound only because the records form a total order
   over states the node actually occupied. Released from the lock, a record that shortens
@@ -1384,7 +1381,7 @@ Deliberately unresolved. Each is answered by later work.
   would never shadow an older value sitting in a "more recent" SSTable read first. §13.4
   and this open question both said it wrong; both are fixed as of v1.11.
 - **The flush trigger still does not swap in a fresh memtable or run in the background.**
-  v1.11 closed the READ side of having more than one memtable and SSTable to search —
+  ~~v1.11 closed the READ side of having more than one memtable and SSTable to search —
   given an already-assembled, already-ordered list of sources, `engine.Reader` merges
   them correctly. v1.12 added `engine.Writer`, so a live `Put`/`Delete` now durably
   reaches a single active memtable through the WAL. What still doesn't exist is the
@@ -1393,7 +1390,27 @@ Deliberately unresolved. Each is answered by later work.
   background flush while keeping it visible to `Reader` as an immutable memtable in the
   meantime. `Reader` and `Writer` are both built to be handed that state once it exists;
   nothing yet produces it, and nothing yet unifies `Reader` and `Writer` into one type a
-  caller would actually hold.
+  caller would actually hold.~~ **Closed in v1.19** — see §14.2's
+  `kvstore.Machine.freezeAndFlushLocked`, with one part still open: the swap runs
+  synchronously in the apply path, not in the background the way `compaction.Background`
+  itself runs (§13.9). A background flush goroutine remains its own, separate open
+  question, listed below.
+- **Flushing runs synchronously in the apply path, not on a background goroutine.**
+  §14.2's `freezeAndFlushLocked` closes the swap-the-memtable question, but while a
+  flush is in progress no further command can apply, and a concurrent `Get` blocks
+  behind the same mutex. Mirroring `compaction.Background`'s own shape (§13.9) for
+  flushing specifically is real, deferred work — attempting it in the same task that
+  closed the swap question itself would have been two large changes at once.
+- **A read reloads the manifest on every call rather than reacting to a change
+  notification.** §14.3's `orderedSSTReadersLocked` has to reload because
+  `compaction.Background` can change the manifest at any moment, independent of
+  `Machine`'s own apply loop, and there is no cheaper moment to notice than checking on
+  every read. Unmeasured against a real read-heavy workload.
+- **Snapshots are logical (the full live key set, re-encoded), not physical (a
+  reference to the SSTable files that already hold the data).** §14.4 argues this
+  explicitly: a physical snapshot, the way RocksDB's own checkpoint mechanism works,
+  needs `InstallSnapshot`'s RPC to carry file references or chunked bytes rather than
+  one opaque blob — which needs the *next* open question on this list solved first.
 - **SSTable file naming and manifest are not designed.** ~~`sstable.Write` and
   `FlushIfFull` both take a caller-supplied path and do nothing to track which SSTables
   exist, in what order, or which have been superseded by compaction. `Info.Path`/`Info.Bytes`
@@ -1432,13 +1449,31 @@ Deliberately unresolved. Each is answered by later work.
   §13.8 as deliberate, correctness-first simplifications; both are natural next steps
   once `targetBlockSize`'s own still-open measurement question (below) has an answer to
   build on.
+- **Space amplification, measured at full convergence, cannot distinguish compaction
+  configurations from each other under the current whole-level-merge design.**
+  §13.11 found this directly: every `MaxFilesPerLevel` setting converges to the same
+  fully-deduplicated steady state, since `CompactLevel` always performs a full merge
+  rather than a partial, overlapping-range one. The moment partial-range merging
+  (already an open question, above) is built, this stops being true — a partial merge
+  can leave stale data behind in ranges it didn't touch, and final space amplification
+  would start actually depending on how aggressively a configuration compacts. Peak
+  space amplification (measured during the run, not after) is the number that
+  differentiates configurations under the current design, and is what §13.11's chart
+  plots for exactly this reason.
 - **`Options.MaxFilesPerLevel: 0` is caught at runtime, not rejected upfront.**
   `Background`'s `maxDrainCycles` safety cap (§13.9) turns the degenerate
   zero-threshold case into a bounded, reported error after 64 wasted compaction
   cycles, rather than `StartBackground` or `Run` validating the configuration and
   refusing it immediately. Cheaper to build and still safe, but a caller finds out
   about the mistake late and somewhat obliquely (an error message) instead of
-  immediately and clearly (a rejected argument).
+  immediately and clearly (a rejected argument). **This nearly bit a second time**:
+  §13.11's own amplification measurement first tried draining at `maxFilesPerLevel: 0`
+  in a loop to force full convergence, reproducing the identical cascade-forever
+  hazard in a different function (`drainAndTally`, which has no cap of its own) before
+  it was caught and replaced with a narrower, bounded fix. One runtime guard in one
+  place did not prevent the same mistake from being written twice — a real argument
+  for validating this upfront, centrally, rather than trusting every future drain loop
+  to remember the hazard on its own.
 - **Orphaned files from a crash between the manifest swap and cleanup are not detected
   or removed on a later startup.** ~~§13.8's `Run` argues this window is safe (the
   manifest is already correct, the leftover files are just wasted disk space), but
@@ -1473,9 +1508,38 @@ Deliberately unresolved. Each is answered by later work.
   wiring question above — no point designing a format for a filter nothing yet builds.
 - **`bitsPerKey` is not chosen for this engine, only measured in the abstract.** §13.5's
   table shows three settings' actual behavior but does not pick one as Helios's default,
-  the way the fsync policy (`docs/fsync-policy.md`) and `targetBlockSize` (§13.2) still
+  the way the fsync policy (`fsync-policy.md`) and `targetBlockSize` (§13.2) still
   haven't been picked from measurement either. Revisit once real workload numbers exist
   to trade read-amplification savings against the per-key memory cost.
+- **Block cache size is not chosen for this engine either, for the identical reason.**
+  §13.12's three sizes (10%, 50%, 150% of one test file's cacheable bytes) show the
+  shape of the trade-off, not a recommendation — a real deployment's cache should be
+  sized against its own working set and available memory, neither of which this
+  measurement has any way to know. The same still-open list this bullet joins
+  (`bitsPerKey`, `targetBlockSize`, the fsync policy) is exactly the list of "measured,
+  not yet picked" defaults a real workload would eventually resolve together.
+- **`blockcache.LRU` holds one mutex for its entire Get or Put, not a sharded or
+  lock-free design.** Correct and simple, but every concurrent caller serializes
+  through the same lock regardless of which keys they're touching — a real bottleneck
+  only under heavy concurrent access this engine hasn't been measured at yet.
+  Deliberately not solved here, on the same "correctness first" priority §13.2's
+  original linear block scan took over an unbuilt binary search.
+- **The SSTable footer has no format-version field.** §13.13's block-level
+  compression is a breaking change to the on-disk block layout, made safely only
+  because nothing in this actively-developed project depends on an old file
+  surviving a format change — every test rebuilds its own files fresh. A real
+  deployment migrating live data across a format boundary would need `Open` to tell
+  old-format and new-format files apart before it can even find the footer's own
+  fields reliably, which needs a version marker this footer has never carried.
+  Deferred until this project actually needs to open a file across a format
+  boundary, which it has not yet had to.
+- **Flate's compression level is asserted at the standard library's default, not
+  measured or tuned.** §13.13 picks `flate.DefaultCompression` and stops there — the
+  same "asserted, not yet chosen from a real workload" status `targetBlockSize`,
+  `bitsPerKey`, and block cache size are already recorded under. A faster level would
+  trade some ratio for lower CPU cost on both the write and (more importantly, since
+  it happens far more often) the read path; nothing here has measured where that
+  trade is worth making yet.
 - **The skip list has no `Seek`.** `NewIterator` only walks from the beginning. A range
   scan from an arbitrary start key — which an SSTable read path merging several sources
   will eventually want — needs a seek that reuses `search`'s predecessor-finding walk
@@ -1563,7 +1627,7 @@ cases identically: stop, and report how much of the file was valid. Distinguishi
 operator inspecting the file past the returned offset rather than encoded into the
 replay path itself.
 
-**Sync policy is the same fork `docs/fsync-policy.md` documents for Raft's persistent
+**Sync policy is the same fork `fsync-policy.md` documents for Raft's persistent
 state, one layer up.** `SyncAlways` fsyncs every record and is the correct default for
 anything the caller intends to keep; `SyncNever` flushes to the OS buffer but never
 fsyncs, for tests and throughput measurement only; `SyncBatch` flushes on every append
@@ -2317,15 +2381,21 @@ concurrent `Writer`'s WAL fsyncs for the same physical disk's bandwidth and, on 
 `SyncAlways` policy, the same fsync queue. This is the actual question worth
 measuring, and the one a "no shared lock" argument alone cannot answer.
 
-**Measured**, `TestWriteLatencyWithAndWithoutBackgroundCompaction`: [PLACEHOLDER —
-run the command below and paste the real numbers in; two rows, mean/p50/p99/max, one
-for a baseline write workload with no compaction running and one for the identical
-workload with `Background` actively draining a seeded L0 backlog concurrently.]
+**Measured**, `TestWriteLatencyWithAndWithoutBackgroundCompaction`:
 
 | scenario | mean | p50 | p99 | max |
 |---|---|---|---|---|
-| baseline (no compaction) | _pending_ | _pending_ | _pending_ | _pending_ |
-| concurrent (background compaction) | _pending_ | _pending_ | _pending_ | _pending_ |
+| baseline (no compaction) | 2.876ms | 2.985ms | 4.011ms | 10.184ms |
+| concurrent (background compaction) | 2.762ms | 2.982ms | 3.607ms | 10.080ms |
+
+One background compaction cycle completed during the concurrent run. Mean, p50, and
+max are within measurement noise of each other between the two scenarios — p99 is
+actually slightly *better* concurrent (3.607ms vs. 4.011ms), which is consistent
+with ordinary run-to-run variance at this sample size rather than a real effect in
+either direction. **The result supports the "no shared lock" argument directly**:
+if `Background`'s own disk I/O were meaningfully starving the concurrent `Writer`'s
+WAL fsyncs, the concurrent row would show consistently higher latency at every
+percentile, not numbers this close together with p99 favoring the concurrent case.
 
 **THIS MEASUREMENT DELIBERATELY DOES NOT ASSERT A HARD STATISTICAL THRESHOLD IN
 CODE**, unlike the Bloom filter's false-positive rate (§13.5), which a formula
@@ -2335,7 +2405,7 @@ of the actual machine and disk it runs on, and a hard-coded millisecond bound wo
 be flaky on a slower CI runner or a faster laptop without meaning anything more true
 on either. The honest way to report it is the numbers themselves, above, from a real
 run — not asserted, measured, the same distinction the fsync policy write-up
-(`docs/fsync-policy.md`) already draws. The test's only hard assertion is a generous
+(`fsync-policy.md`) already draws. The test's only hard assertion is a generous
 smoke-test ceiling — no single write may take longer than five seconds — which exists
 to catch an actual hang or deadlock, a real bug this test should still fail loudly
 on, not to make a claim about ordinary contention.
@@ -2437,9 +2507,526 @@ already does (§13.8); files this package has no business touching (anything tha
 isn't `.sst` or `.tmp`) left alone; and the crash-window reproduction above. All
 under `-race -shuffle=on -count=3`.
 
+### 13.11 Write and space amplification, measured across three configurations
+
+Every prior section of §13 built one piece of the compaction pipeline in isolation;
+this is the first place two of that pipeline's own numbers are put next to each
+other on purpose. Write amplification and space amplification are the two standard
+LSM terms (any RocksDB or LevelDB tuning guide covers both) for the same underlying
+trade-off:
+
+	write amplification = total physical bytes written / total logical bytes written
+	space amplification = on-disk bytes for the current live data / the minimal bytes that data actually needs
+
+More frequent compaction should lower space amplification (stale copies and spent
+tombstones get reclaimed sooner) at the cost of higher write amplification (more
+rewriting overall) — the classic tension, and the reason `MaxFilesPerLevel` (§13.8)
+is a knob at all rather than a constant. `compaction.MeasureAmplification` checks
+that expectation against real numbers rather than trusting it as self-evident.
+
+**A finding, not a flaw: final space amplification does not differentiate the three
+configurations at all.** `CompactLevel` always performs a *full* merge of both levels
+it touches (§13.8's documented simplification, not a partial-range one), so every
+configuration, once drained to full convergence, arrives at the exact same
+fully-deduplicated steady state — there is only one canonical "everything merged,
+nothing stale left" representation of a given live key set, and how many
+intermediate compactions ran on the way there cannot change the destination. The
+first version of this measurement tried to show the trade-off using this final,
+converged snapshot and found no difference across configurations — correctly, as it
+turns out, once the reason was traced down rather than assumed to be a bug. Two real
+mistakes were caught and fixed in the process of tracing it:
+
+1. **A workload-boundary artifact, not a real result.** With a fixed number of flush
+   cycles, a larger `MaxFilesPerLevel` needs more accumulated L0 files before
+   compaction ever triggers, so the workload could end with a small, never-yet-merged
+   L0 backlog sitting there simply because the run stopped before enough new flushes
+   arrived to cross the threshold again. In an early run, that leftover backlog was
+   large enough to make the loosest configuration's measured space amplification come
+   out *identical* to the tightest one's, for a reason that had nothing to do with
+   either policy. Fixed by forcing any leftover L0 backlog into L1 once, explicitly,
+   after the workload ends, so every configuration's final snapshot reflects true
+   convergence rather than wherever the fixed op count happened to leave it.
+2. **The first fix attempted for (1) reproduced a hazard already found and fixed
+   once, in a different file.** Draining with `PickLevel`/`maxFilesPerLevel: 0` in a
+   loop was tried first — and is exactly the degenerate configuration
+   `Background.maxDrainCycles` (§13.9) already exists to guard against: a level with
+   even one file is "over threshold" forever at that setting, cascading one level
+   deeper every cycle with no convergence, because a compaction always leaves exactly
+   one file at the level it just wrote into. `drainAndTally` (this section's own
+   drain loop) has no such cap, so the same hazard reappeared here, in new code,
+   because the fix for (1) was reached for without first checking whether it reintroduced
+   something already on record. The actual fix needed was much narrower: only level 0
+   can ever legitimately hold a leftover backlog at the end of this workload (every
+   level below it is always left at 0 or 1 files by construction, the same invariant
+   §13.9 already argues from), so the real fix is one explicit, bounded `CompactLevel`
+   call on level 0 — never a loop, and never at threshold 0.
+
+**The number that does differentiate the three configurations is peak, not final,
+space amplification** — the highest total on-disk footprint observed at any point
+*during* the run, sampled after each flush and before that cycle's compaction (if
+any) has had a chance to reclaim anything. This is the number a real deployment
+actually has to provision disk headroom for: not "how small does it get once
+everything settles," but "how large does the backlog get before compaction catches
+up." A looser `MaxFilesPerLevel` lets more un-merged data accumulate before
+reclaiming it, which is exactly what peak space amplification is expected to show
+rising with, and does.
+
+**Deterministic, not measured-with-tolerance like write latency (§13.9).** Every
+byte count here follows from a fixed, seeded workload and this package's own
+deterministic merge and compaction logic — there is no real-time disk latency
+anywhere in this measurement's own loop, unlike §13.9's. `TestMeasureAmplificationIsFullyDeterministic`
+checks this directly (two runs at the same configuration compared field by field,
+not just eyeballed), and it is what lets
+`TestWriteAndSpaceAmplificationAcrossThreeConfigurations` assert the trade-off's
+direction as a hard pass/fail requirement rather than only log it.
+
+**Measured**, confirmed identical on the project owner's own machine — as expected,
+since every input here is deterministic (`TestMeasureAmplificationIsFullyDeterministic`
+above is exactly this guarantee, checked, not just claimed):
+
+| maxFilesPerLevel | write amplification | peak space amplification | final space amplification |
+|---|---|---|---|
+| 2 | 2.750 | 2.417 | 1.090 |
+| 4 | 2.446 | 3.287 | 1.090 |
+| 8 | 2.347 | 5.024 | 1.090 |
+
+**Plotted** at `amplification.svg` (repository root, alongside `fsync-policy.md` —
+this project's other measured artifact that lives outside DESIGN.md itself),
+generated by the same command: two bar-chart panels sharing a `maxFilesPerLevel`
+x-axis, write amplification on top and peak space amplification below, with a
+dashed reference line marking the constant final space amplification value. No
+third-party charting dependency was added — this project's `go.mod` has never had
+one, and three bars per panel is well within what a hand-written SVG can render
+plainly, on the same "use the stdlib, build the structure by hand" precedent
+`hash/fnv` and `hash/crc32` already set elsewhere in this engine (§13.1, §13.5).
+
+**Implemented** at `internal/storage/compaction/amplification.go`
+(`AmplificationResult`, `MeasureAmplification`, `drainAndTally`, `totalOnDiskBytes`),
+`amplification_test.go`, and `cmd/ampplot/main.go` (the standalone tool that prints
+a copy-pasteable table and writes the SVG). All under `-race -shuffle=on -count=3`.
+
+### 13.12 Block cache with LRU eviction, measured
+
+Every `Get` before this section paid for a full disk read, CRC verification, and
+entry decode on every single call, even for a block it had already read a moment
+ago (§13.2). A block cache is the standard answer (any RocksDB or LevelDB tuning
+guide has one): keep recently-used blocks' decoded entries in memory, so a repeat
+lookup skips all three costs — not just the disk read, which the OS's own page
+cache may already be absorbing, but the CPU cost of re-verifying and re-parsing a
+block it has already verified and parsed once.
+
+**A cache keyed by (path, block index) can never go stale — there is only an
+eviction problem to solve, not an invalidation one.** An SSTable is written once
+and never modified again after `Write` publishes it (§13.2's whole `ErrFileExists`
+argument), and compaction (§13.8) never edits a file in place — it always produces
+an entirely new one and leaves the old for deletion, never mutation. The bytes at
+a given (path, block index) today are the bytes that will be there for as long as
+that file exists at all. This is what let the cache itself stay simple: no version
+numbers, no generation counters, no "has this changed since I cached it" check
+anywhere in `blockcache.LRU` — the invalidation problem every general-purpose cache
+has to solve does not exist for this engine's data, by construction.
+
+**`blockcache.LRU[K, V]`** (`internal/storage/blockcache/`) is a generic,
+byte-size-bounded LRU built entirely from stdlib — `container/list` for the recency
+ordering, a map for O(1) lookup, no third-party dependency, on the same precedent
+`cmd/ampplot`'s hand-written SVG already set (§13.11). It knows nothing about
+blocks, SSTables, or this engine specifically; `sstable.BlockCache` is a type alias
+instantiating it with an unexported cache key (`path`, block index) and value
+(`[]blockEntry`, the already-decoded entries), plus `NewBlockCache(maxBytes)`, which
+sizes each cached block by its summed key-and-value bytes — the same "count key and
+value bytes, not structural overhead" convention `(*Memtable).ApproxSize` already
+established (§13.3), applied here to a cached block instead of a whole memtable.
+
+**A real edge case caught while designing the eviction rule, not after.** The
+straightforward eviction loop — evict from the back until under budget — has a
+failure mode: if a single entry is larger than the entire budget, that loop would
+evict everything, *including the entry `Put` was just asked to insert*, making
+`Put` silently a no-op for anything bigger than the configured size. This is not
+hypothetical: an SSTable data block is usually near `targetBlockSize` but is
+explicitly allowed to exceed it by one entry (§13.2), so a cache sized smaller than
+the largest block that can occur would otherwise never successfully cache anything
+at all. Fixed by never evicting the last remaining entry — an oversized single
+entry is kept, alone, exceeding the nominal budget, rather than refused.
+**A second, related bug surfaced immediately after fixing the first**: that same
+leniency meant a budget of `0` (meant as "cache nothing") still left exactly one
+entry cached, since `Put` always inserts before the eviction loop runs and that
+loop refuses to remove a lone survivor. Fixed by handling `maxBytes <= 0` as its
+own case, checked first, before there is anything to evict —
+`TestBudgetOfZeroCachesNothing` and `TestSingleEntryLargerThanBudgetIsStillCached`
+both pin the two cases directly so neither regresses into the other again.
+
+**`Reader` gains an optional cache, with zero blast radius on the existing API.**
+`Open` is unchanged — every existing caller, across every package that already uses
+`sstable.Open`, keeps working exactly as before, with no cache at all. A new
+`OpenWithCache(path, cache)` attaches a shared `*BlockCache`, which may already hold
+blocks from other files: `TestCacheIsSharedAcrossMultipleFiles` confirms two
+different SSTables' blocks don't collide or shadow each other in one shared cache.
+`TestCacheHitAvoidsTouchingDiskAtAll` is the test that actually proves a hit skips
+disk entirely, rather than trusting the code path by inspection: read a key once
+to populate the cache, truncate the underlying file to zero bytes, and confirm a
+second `Get` for the same key still returns the right value — which is only
+possible if that second call never touched the file at all.
+
+**`Iterator` deliberately does not use the cache.** A full sequential scan — the
+only thing `Iterator` is for, used by compaction's merges (§13.8) — reads every
+block exactly once no matter what, so there is nothing a cache could save it from
+re-reading during that same scan; populating the cache with blocks a merge happens
+to pass through would only evict genuinely-reusable point-lookup entries for other
+keys that were never going to be re-read by that merge anyway.
+
+**Measured**, `TestReadLatencyWithAndWithoutBlockCacheAtThreeSizes`: a single
+5,000-key SSTable, read `20,000` times under a fixed, seeded Zipfian access pattern
+(skewed, not uniform — a cache's entire benefit disappears under uniform access to
+a working set larger than itself, since every access would be a first touch
+regardless of size), once with no cache and once each at three cache sizes (10%,
+50%, and 150% of the exact cacheable byte total, the last one comfortably enough to
+hold every block at once):
+
+| configuration | mean latency | p50 | p99 | hit rate |
+|---|---|---|---|---|
+| no cache | 1.530µs | 1.292µs | 4.334µs | — |
+| 10% | 600ns | 125ns | 2.292µs | 0.701 |
+| 50% | 282ns | 125ns | 2.000µs | 0.908 |
+| 150% | 142ns | 125ns | 1.500µs | 0.986 |
+
+**Measured on the project owner's own machine**, above. Latency is logged, not
+asserted against a hard threshold, for the identical reason §13.9's write-stall
+measurement isn't: real time depends on the machine it runs on, and these numbers
+differ noticeably from an earlier sandbox run (1.530µs vs. 2.567µs mean at no
+cache) while showing the identical shape — a clean staircase, no cache slowest,
+150% fastest — for exactly that reason: the shape is what the design predicts, the
+absolute numbers are whatever the machine happens to produce. Hit rate is asserted
+directly, because it depends only on the fixed Zipfian seed and this package's own
+deterministic `LRU` — a larger cache must never hit less often than a smaller one
+against the identical access pattern, and the 150% cache (sized to hold everything)
+must reach a miss count nowhere near the total read count. The hit-rate column
+above — 0.701 / 0.908 / 0.986 — matches the sandbox run exactly, confirming that
+determinism directly rather than by argument alone.
+
+**Implemented** at `internal/storage/blockcache/lru.go` (`LRU`, `New`),
+`lru_test.go`; `internal/storage/sstable/reader.go` (`BlockCache`, `NewBlockCache`,
+`OpenWithCache`, the cache-aware `loadBlock`), `cache_test.go`, and
+`cache_latency_test.go`. All under `-race -shuffle=on -count=3`.
+
+### 13.13 Per-block compression, measured against its CPU cost
+
+Every data block until this section stored its entries exactly as written — no
+smaller than the sum of every key and value in it, redundancy and all. Real records
+(structured rows, log lines, serialized objects) usually carry far more repeated
+literal text across entries than an incompressible workload ever would, and
+DEFLATE-family compression is very good at removing exactly that kind of
+redundancy. This section adds it, per block, and measures what it actually costs
+against what it actually saves — the two numbers a compression decision is
+worthless without both of.
+
+**The block layout gained a one-byte marker, not a version field.** A data block is
+now `CompressionType(1B) + entries (raw or compressed) + BlockCRC32(4B)`, where the
+CRC covers the type byte and whatever follows it together. **This is a breaking
+change to the on-disk format**, the same category of change the original per-entry
+type byte was (§13.2) — but unlike that one, made after real files already existed
+in this project's own test suite, not before. It is safe here for the same reason
+any breaking format change is safe in an actively-developed, not-yet-deployed
+engine: nothing depends on an old file surviving a format change, and every test
+that builds one rebuilds it fresh. A real deployment migrating live data across
+format versions would need a version field in the footer to tell old and new files
+apart at `Open` time — recorded as an open question rather than built here, since
+nothing in this project has ever needed to open a file across a format boundary yet.
+
+**flate, not gzip or zlib — the reason is this format's own CRC.** Both gzip and
+zlib wrap DEFLATE in their own container, complete with their own header and (gzip's
+case) their own CRC32. Redundant here: every block already carries a `BlockCRC32`
+over its full on-disk bytes, compressed or not, so a self-checksumming compression
+container would mean paying for two checksums covering overlapping bytes.
+`compress/flate` is the raw DEFLATE stream with no such wrapper — the same "use the
+stdlib primitive, build only the structure around it" precedent `hash/crc32` and
+`hash/fnv` already set (§13.1, §13.5), extended here to picking the leanest stdlib
+variant of a whole family rather than the most convenient one.
+
+**CRC verification happens on the on-disk bytes, before decompression is ever
+attempted — never the other way around.** Corruption happens to whatever bytes are
+physically on disk, which are the compressed ones once compression is in play;
+checking those first, and only decompressing once they're known-good, means this
+package never hands an unverified byte stream to a decompressor. A decompressor fed
+adversarial or corrupted input is exactly the kind of component a format like this
+should never trust blindly, which is also why `decompressFlate` enforces
+`maxDecompressedBlockSize` (64× `targetBlockSize`) — a defensive bound against a
+CRC-valid-but-adversarial stream claiming to expand to something unbounded, the
+classic "decompression bomb" shape, not a limit any block this package's own
+`Write` produces would ever approach.
+
+**Compression is skipped, even when requested, if it doesn't actually help.**
+`finalizeBlock` compresses first, compares sizes, and falls back to
+`CompressionNone` whenever the compressed form isn't strictly smaller — a block of
+already-compressed or near-random data can come out of flate *larger* than it went
+in, and decompression has a real CPU cost a reader would otherwise pay on every
+future `Get` for no benefit at all. `TestFinalizeBlockFallsBackToUncompressedWhenItDoesNotHelp`
+checks this directly against genuinely random input.
+
+**`Write` is completely unchanged; `WriteCompressed` is new — the identical "leave
+the simple existing path alone" precedent `OpenWithCache` set over `Open` (§13.12),
+now applied to the write side.** Every existing caller of `Write`, across every
+package that already uses it, keeps writing the same bytes it always has. Reading a
+compressed file needs no new API at all: `Open`, `OpenWithCache`, `Get`, and
+`Iterator` all handle a compressed block exactly like an uncompressed one, because
+`verifyAndSplitBlock` absorbs the decompression transparently before
+`decodeBlockEntries` ever sees the bytes — `TestOpenReadsCompressedFilesWithoutAnySpecialAPI`
+checks this against a full sequential scan and a cached `Get` both, not just a plain
+point lookup.
+
+**Measured**, `TestCompressionSpaceSavingAgainstCPUCost`: 5,000 keys, each with a
+moderately redundant, JSON-shaped value (repeated field names and boilerplate text,
+varying only a few fields per record — the shape of a real structured log line or
+serialized row, not padding or random bytes), flushed once uncompressed and once
+with flate, then read back 20,000 times against each (no block cache, so
+decompression's cost is paid on every single `Get` rather than diluted after the
+first touch of each block):
+
+| | uncompressed | compressed (flate) |
+|---|---|---|
+| file size | 810,514 B | 63,597 B |
+| space saved | — | 92.2% |
+| write (compress) duration | 10.816ms | 29.313ms |
+| read latency, mean | 1.878µs | 7.072µs |
+| read latency, p99 | 12.542µs | 41.625µs |
+
+Measured on the project owner's own machine. File size and space-saved percentage
+matched my own sandbox run exactly, as expected (deterministic — see below). Write
+duration was roughly 2.7x slower compressed; read latency roughly 3.8x slower on
+mean and 3.3x slower on p99 — a real, measurable CPU cost on both paths, smaller in
+absolute terms than my own sandbox's ratios (which ran closer to 4-5x on both) but
+the same direction and the same order of magnitude, consistent with ordinary
+machine-to-machine variance in a real-time measurement rather than a discrepancy
+worth chasing.
+
+File size and space-saved percentage are deterministic (the same "no timing
+involved" argument §13.11's amplification measurement and §13.12's hit-rate numbers
+already make) and are asserted directly in the test — at least 20% saved on this
+workload, or the test fails outright. Write and read *durations* are logged only,
+not asserted against a hard threshold, for the identical reason every other latency
+measurement in this project draws that line: real time depends on the machine
+running it.
+
+**Implemented** at `internal/storage/sstable/compress.go` (`CompressionType`,
+`compressFlate`, `decompressFlate`, `maxDecompressedBlockSize`), the compression-
+aware `finalizeBlock`/`verifyAndSplitBlock` in `block.go`, `WriteCompressed` and the
+shared `write` helper in `writer.go`, `FlushCompressed` in `flush.go`,
+`compress_test.go`, `compression_test.go`, and `compression_measure_test.go`. All
+under `-race -shuffle=on -count=3`.
+
 ---
 
-## 14. Revision log
+## 14. The state machine
+
+Everything in §2 through §12 is agreement; everything in §13 is a storage engine that
+has, until now, only ever been exercised by tests calling it directly. Nothing has
+ever connected the two. apply.go's own doc comment has said what belongs here since
+before §13 existed at all: *"Everything below this line is agreement; everything
+above it is the key-value store."* This section is that layer, finally built:
+`internal/kvstore`, a real state machine attached to a real `raft.Node`'s `ApplyCh`,
+backed by the storage engine end to end rather than a map.
+
+**Not a hypothetical gap — a literal one, named in the code.** `e2e_test.go`'s own
+`kvMachine`, present since this project's very first Raft phase, carries this exact
+comment on its command encoding: *"A throwaway encoding, deliberately. Phase H
+brings a real one; giving this test a serious codec now would mean writing it twice
+and inviting the second one to be a copy of the first."* This is Phase H.
+`internal/kvstore` never imports `internal/raft`'s test files and `internal/raft`
+never imports `internal/kvstore` at all — the new package is a consumer of the
+public `raft.Node` API (`Submit`, `ApplyCh`, `ReadIndex`, `ReadLease`,
+`SnapshotNotify`, `Snapshot`), exactly as any other caller of that API would be,
+with no special access whatsoever. Everything this section describes was built by
+reading that public surface and `e2e_test.go` / `installsnapshot_test.go`'s own
+existing test harnesses for precedent, not by reaching into Raft's internals.
+
+### 14.1 A real command codec, replacing the throwaway one
+
+`codec.go` gives `Put` and `Delete` a real wire encoding —
+
+```
+Put:    [opType(1B)][keyLen(4B)][key][valueLen(4B)][value]
+Delete: [opType(1B)][keyLen(4B)][key]
+```
+
+— the same length-prefixed, opaque-payload shape the WAL (§13.1) and SSTable block
+entries (§13.2) already use, for the identical reason both give: a key or value is
+opaque as far as this format is concerned, so a length prefix is the only delimiter
+that cannot collide with content. A Delete carries no value field at all, not a
+zero-length one, matching the same distinction §13.2's data blocks draw between "no
+value" and "empty value" — an empty string is a legitimate value a client might
+actually `Put`, and conflating it with "this is a delete" is exactly the read bug
+every layer below this one was already built to avoid.
+
+### 14.2 The memtable-swap open question, finally closed
+
+Since §13.3, every subsequent §13 section's own open questions have repeated some
+version of the same sentence: *"nothing yet swaps a full memtable out from under
+live writes."* `Machine.freezeAndFlushLocked`, called from the apply path once
+`(*Memtable).ApproxSize` crosses a configured threshold, is that sentence closed —
+close the active WAL, flush the frozen memtable to a new *compressed* SSTable
+(§13.13, on by default: this is the first place every piece built across §13 runs
+together as one real pipeline, and shipping it with compression on is the honest way
+to exercise that pipeline as it actually runs, not a stripped-down demo of it),
+record the new file in the manifest's L0 (§13.8, newest-first — a fresh flush is
+always the newest thing that exists), delete the now-redundant WAL, and start a
+fresh memtable, WAL, and `Writer` as the new active target. `TestFlushTriggersOnceTheActiveMemtableExceedsThreshold`
+checks this directly: a low threshold, a hundred writes, at least one file
+materializes in L0, and every value — written before or after the flush — still
+reads back correctly through it.
+
+**This runs synchronously, in the apply path — a real, named simplification, not an
+oversight.** While a flush is in progress, no further command can be applied, and a
+concurrent `Get` blocks behind the same mutex the flush holds. A background flush
+goroutine, mirroring `compaction.Background`'s own shape (§13.9), is real future
+work, recorded as an open question rather than attempted in the same task that
+closes the swap-the-memtable question itself — two large changes at once was the
+wrong scope for either one.
+
+`compaction.Background` (§13.9) runs alongside, started by `NewMachine` against the
+same manifest and directory, draining whatever `freezeAndFlushLocked` produces
+independently of the apply loop. `TestBackgroundCompactionDrainsL0AfterEnoughFlushes`
+is the test that proves these two independently-built pieces actually interoperate,
+not just coexist: enough flushes to cross `MaxFilesPerLevel` leaves L1 holding a
+real compacted file, with every current value still correct once the read path is
+serving data that has been rewritten underneath it.
+
+### 14.3 Reads: both linearizable paths, against the real read path
+
+`Machine.Get` is the safe path — `n.ReadIndex()`, a wait for that barrier to apply
+at the term it was issued under, then a local read via a freshly-constructed
+`engine.Reader` (§13.6) over the current active memtable and every open SSTable
+reader, reloaded from the manifest on every call so a compaction that finished a
+moment ago on a *different* goroutine is never missed. `Machine.GetLeaseRead` is the
+lease path (§9) — no round trip, correct only under the bounded-clock-drift
+assumption that whole section already argues for. Neither method ever runs on the
+goroutine that consumes `ApplyCh` — the one way to deadlock this, per `read.go`'s own
+warning, and the reason `Get`/`GetLeaseRead` are ordinary exported methods any
+caller's own goroutine can call, never the apply loop's.
+
+**Reloading the manifest on every read is a real, unmeasured cost, recorded rather
+than optimized away.** `compaction.Background` can change the manifest at any
+moment, independent of this Machine's own apply loop, so there is no cheaper moment
+to notice a change than checking on every read. A change-notification from
+`Background`, rather than a reload on every call, is the natural next step and is
+left for later.
+
+**Applied-term bookkeeping is windowed by index, not pruned at snapshot time — a
+design that was tried, found wrong, and replaced before shipping.** A caller waiting
+on a specific `(index, term)` pair (the claim-ticket protocol `Submit` and
+`ReadIndex` both use) needs to know the term a *specific* index carried, not just the
+most recent one. Pruning that map down to "entries above the current snapshot floor"
+the moment a snapshot is taken sounds airtight — no future barrier can land at or
+below a covered index — but is not: a barrier issued a moment before a snapshot,
+still waiting when that snapshot's own pruning runs, would find its own index's term
+already deleted, even though it truly was applied at a real, correct term. Not a
+wrong answer (a missing entry is treated as "unknown, retry," never fabricated) but a
+spurious failure a genuinely successful read had no reason to suffer.
+`maxAppliedTermsWindow` (10,000 entries, trimmed by index on every apply) sidesteps
+the timing question entirely: it has nothing to do with when a snapshot happens, only
+with how far behind the current applied index a lookup is, and a barrier checked
+promptly — the only kind `ReadIndex`'s own protocol describes — always finds its
+entry.
+
+### 14.4 Snapshots: a logical image, not a physical one — a choice, not a default
+
+`take` (answering `n.SnapshotNotify()`) and `installSnapshot` (answering a
+`SnapshotValid` `ApplyMsg`) implement Raft's existing snapshot contract exactly as
+`installsnapshot_test.go`'s own `snapshotMachine` already does for its map — encode
+the whole state, hand it to `n.Snapshot(index, data)`; decode a received image and
+*replace* local state with it, never merge, per Rule 8. What differs is what "the
+whole state" means once it is not a map.
+
+A snapshot image is the full live key set at the applied index it covers, as a flat
+sequence of length-prefixed key/value pairs, produced by `sstable.Merge` (§13.8) over
+the active memtable's iterator and every open SSTable reader's iterator, **with
+tombstones dropped**: a snapshot is ground truth as of its index, so a deleted key is
+correctly just absent from it, never present-as-a-tombstone. This is a **logical**
+snapshot, not a **physical** one, and that was a choice made explicitly, not the
+only design available. A real production LSM engine typically checkpoints by
+referencing its own on-disk SSTable files directly — RocksDB's own checkpoint
+mechanism hard-links the current manifest's files rather than re-serializing their
+contents, far cheaper for a large, mostly-immutable dataset. That approach needs
+`InstallSnapshot`'s own RPC to carry file references or chunked file bytes rather
+than one opaque blob, which this project's Raft layer does not do yet — "chunking
+`InstallSnapshot`" has been an open question since before this package existed.
+Building that now would have meant redesigning the snapshot RPC in the same task
+that wires in a state machine for the first time — two large changes at once. The
+logical form built here works within Raft's existing, completely unmodified
+contract; the physical form is real, deferred work, recorded as an open question
+rather than solved by default.
+
+**Installation replays through the ordinary write path — not a second, snapshot-only
+mechanism.** `installSnapshot` wipes exactly the files this `Machine` itself
+tracked (never a blanket directory removal, so anything else sharing the same disk
+is never at risk), then decodes the image by calling a fresh `Writer.Put` once per
+entry — the identical WAL-then-memtable durability sequence a live client write
+takes (§13.7's whole delete-is-a-write argument, extended here to
+"install-is-a-write," for the same underlying reason: nothing about *how* data
+arrived changes what durability it needs). `TestSnapshotTakeAndInstallRoundTrips`
+builds a real image from one `Machine`'s live state and installs it into a
+completely separate one, confirming every key reads back correctly — checked by
+reading the reconstructed storage state directly, deliberately bypassing `Get`'s own
+Raft read-barrier protocol, because the two `Machine`s in that test are attached to
+two independently-running, unrelated `raft.Node`s whose own index spaces were never
+going to line up, and what the test is actually checking (did installation correctly
+rebuild the storage engine) has nothing to do with Raft's read protocol at all.
+
+### 14.5 Restart, and the first time every recovery path in this project runs together
+
+`NewMachine`'s startup sequence is `compaction.Recover` (§13.10, cleaning up any
+orphaned files from a crash mid-compaction and validating every SSTable the manifest
+still claims exists), then `engine.RecoverMemtable` (§13.7, replaying whatever the
+active WAL still holds into a fresh memtable) — composed with `raft.OpenNode`'s own,
+completely separate recovery of Raft's own log and persistent state (§5). Three
+independently-built recovery mechanisms, none of which had ever been exercised
+alongside the other two before `TestRestartRecoversAllAppliedState`: stop a
+`Machine` and its `Node` mid-run, after enough writes to have triggered at least one
+flush, open fresh ones against the exact same on-disk directories, and confirm every
+value — including a delete issued before the stop — is exactly as it was.
+
+### 14.6 A real, if minimal, running program
+
+`cmd/helios/main.go` is no longer the one-line stub it was: a real `raft.Node`,
+opened against real `FileStorage`, with a real `Machine` attached, running until a
+shutdown signal arrives. **Single-node only, deliberately, as a limit of the
+project's current scope, not of this command.** Raft's own `Transport` interface has
+never had a real network implementation — every multi-node test in package `raft`
+runs against an in-memory fake transport built for testing, and a gRPC API,
+multi-node deployment, and chaos testing are explicitly later, unreached phases of
+this project. A no-op `Transport` is therefore the only honest choice available for
+a cluster of exactly one node, which never has a peer to reach — not a shortcut
+standing in for a real transport this command chose not to build.
+
+Run and stopped cleanly by hand, twice in a row against the same data directory,
+confirming what the tests already prove more rigorously: the second run picks up
+exactly where the first left off, on disk, for real, not simulated.
+
+### 14.7 What this section deliberately leaves open
+
+Recorded here rather than left implicit: no client-facing network API exists yet
+(no gRPC, matching the project's own stated roadmap); the flush that closes §14.2's
+open question runs synchronously rather than in the background; a read reloads the
+manifest on every call rather than reacting to a change notification; snapshots are
+logical, not physical, and `InstallSnapshot` still has no chunking; and a Machine's
+own configured constants (`FlushThresholdBytes`, `CompactionInterval`, the 64MB
+block cache `cmd/helios` picks) join `targetBlockSize`, `bitsPerKey`, and the rest of
+§12's list of "asserted, not yet measured against a real workload" defaults.
+
+**Implemented** at `internal/kvstore/` — `codec.go` (`encodePut`, `encodeDelete`,
+`decodeCommand`), `snapshot.go` (`encodeSnapshotImage`, `decodeSnapshotImage`),
+`machine.go` (`Machine`, `NewMachine`, the apply loop, `freezeAndFlushLocked`),
+`read_snapshot.go` (`Get`, `GetLeaseRead`, `Put`, `Delete`, `take`,
+`installSnapshot`) — and `cmd/helios/main.go`. Tested: the codec's round trip and
+every malformed-input case; a real single-node `raft.Node` (built from scratch for
+these tests, using nothing but the public `Transport` and `OpenNode`/`FileStorage`
+API, since Raft's own multi-node test harness is unexported and internal to package
+`raft`) driving `Put`/`Delete`/`Get`/`GetLeaseRead` through 300 real operations
+including overwrites and deletes; the flush trigger; background compaction actually
+interoperating with it; snapshot take-and-install; and restart recovery. All under
+`-race -shuffle=on -count=3`.
+
+---
+
+## 15. Revision log
 
 
 | Version | Change |
@@ -2462,3 +3049,7 @@ under `-race -shuffle=on -count=3`.
 | v1.13 | Leveled compaction implemented end to end (§13.8): a manifest (`internal/storage/manifest/`) tracking which SSTable belongs to which level, persisted with the same write-temp/fsync/rename/fsync-dir sequence used everywhere else in this engine; `PickLevel` choosing the lowest over-threshold level; `sstable.Merge`, a k-way merge over several sorted `Source`s with a newest-first tie-break and an explicit, argued rule for when a surviving tombstone can finally be dropped instead of carried forward; `sstable.Iterator`, the sequential full-table scan `Get` was never built to do, needed to feed a compaction at all; and `compaction.Run`, tying all of it together with a crash-safety ordering (write the merged file, then swap the manifest, then delete superseded files -- checked directly by forcing the swap to fail and confirming nothing is deleted). Two real bugs were caught and fixed while building this, not left for later: `sstable.Source` gained an `Err() error` method after realizing `Write`'s original loop had no way to detect a source failing mid-scan, a gap invisible until an SSTable-backed (and therefore genuinely fallible) `Source` existed for the first time; and `Merge`'s own first draft checked a source's `Err` only for sources not yet marked done, which is precisely the sources whose failure it needed to catch, fixed by checking at the exact moment a source transitions to done rather than in a later pass. File-count compaction triggers, single-output-file compactions, whole-level (rather than overlapping-range) merges, and orphaned post-crash file cleanup are all recorded as open questions rather than solved here. |
 | v1.14 | Background compaction implemented and measured (§13.9): `compaction.Background` runs pick-merge-write-swap cycles on a ticker, in their own goroutine, so a live `engine.Writer` never triggers or waits on one. No new locking was needed -- Writer only touches its own WAL and memtable, Run only touches SSTable files and the manifest, and `TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption` confirms this holds under `-race`, not just on paper. What running concurrently can still cost is the same physical disk, which `TestWriteLatencyWithAndWithoutBackgroundCompaction` measures directly rather than assumes away -- numbers pending a run on the user's own machine, the same discipline the Bloom filter's false-positive measurement (v1.10) already established, since write latency under real disk contention has no formula to check it against the way false-positive rate does. A real hazard was found and fixed before it could ship: `CompactLevel`'s one-output-file design means every level above L0 can only ever hold zero or one files, so genuine cascading is impossible with a sane threshold -- but `Options{MaxFilesPerLevel: 0}` was never rejected, and under it a single leftover file would get compacted one level deeper forever. `maxDrainCycles` bounds this to a reported error instead of an infinite spin, caught by reasoning through the design rather than by hitting it in production. `Background.Stop` deliberately waits for its goroutine to fully exit, unlike Raft's own fire-and-forget ticker shutdown, because callers -- tests, especially -- need the guarantee that no further compaction touches disk once Stop returns. |
 | v1.15 | Manifest recovery implemented (§13.10): `compaction.Recover` closes the open question v1.13's manifest design and v1.14's background runner both left explicitly unsolved -- a crash between the manifest swap and Run's own cleanup step (§13.8) was already safe, never recoverable in the sense of a node actually reclaiming the wasted disk space or noticing something was wrong. Recover reconciles the manifest against what a directory actually holds: any unreferenced `.sst` file is an orphan and is deleted; any leftover `.tmp` file is deleted unconditionally, since sstable.Write's and manifest.Save's own atomicity means one can only exist if a process died mid-write, never as a legitimate artifact; a file the manifest references but disk is missing, or which fails to open as a valid SSTable, is reported as an error rather than silently tolerated, on the same believed-impossible-is-guarded-not-assumed posture §8 applies to Raft's own invariants. Proved against the exact crash window Run's own documentation names, not an easier one: CompactLevel and manifest.Save are called directly, stopping deliberately before the cleanup step a crash would have interrupted, and Recover is shown to finish exactly that interrupted work. Recover must be called once, explicitly, before Run or Background ever starts against the same directory -- a precondition stated in its own doc and not enforced by the type system, on the same explicit-recovery-step precedent engine.RecoverMemtable already set rather than a change to StartBackground's signature. |
+| v1.16 | Write and space amplification measured across three compaction configurations and plotted (§13.11): `compaction.MeasureAmplification` runs a fixed, seeded 20,000-operation workload at MaxFilesPerLevel settings of 2, 4, and 8, and `cmd/ampplot` renders the result as a hand-written SVG bar chart (no third-party charting dependency added -- this project's go.mod has never had one). The measurement is fully deterministic, unlike write latency (v1.14), so the trade-off's direction is asserted as a hard test requirement rather than only logged. A genuine finding, not a flaw: final (fully-converged) space amplification came out identical across all three configurations, because CompactLevel's whole-level merge (§13.8) always reaches the same deduplicated steady state regardless of path; peak space amplification, sampled mid-run before compaction catches up, is what actually differentiates the configurations, and is what gets plotted. Two real mistakes were caught and fixed while building this: a workload-boundary artifact where a fixed operation count left the loosest configuration with an unmerged L0 leftover that skewed its final snapshot to falsely match the tightest configuration's; and the first attempted fix for that reproduced, in a new function, the exact MaxFilesPerLevel-0 cascade-forever hazard v1.14's Background.maxDrainCycles was built to guard against elsewhere -- caught before shipping, and replaced with a narrower, bounded single-compaction fix rather than a capped loop. Recorded as a new open question: one runtime guard in one place did not stop the same mistake from being written twice, an argument for validating this upfront rather than per-caller. Also fixed in passing: a stale `docs/fsync-policy.md` path in five live prose references (the file lives at the repository root); the v1.5 revision entry's own wording is left untouched as a historical record. |
+| v1.17 | A block cache with LRU eviction implemented and measured (§13.12): `blockcache.LRU[K, V]`, a generic, byte-size-bounded cache built entirely from stdlib (`container/list`), wired into `sstable.Reader` via a new `OpenWithCache` that leaves the existing `Open` and every one of its callers completely unchanged. Keyed by (path, block index), which needs no invalidation logic at all -- an SSTable is immutable once published (§13.2) and compaction (§13.8) never edits one in place, so a cached block can never go stale, only become evictable. Two real bugs caught while designing the eviction rule, not after: a naive evict-until-under-budget loop would silently make Put a no-op for any single entry larger than the configured budget (a real case, since a data block is allowed to exceed targetBlockSize by one entry), fixed by never evicting the last remaining entry; and that same fix then left a `maxBytes: 0` cache ("cache nothing") holding exactly one entry regardless, fixed by handling a non-positive budget as its own case checked first. `TestCacheHitAvoidsTouchingDiskAtAll` is the test that actually proves a cache hit skips disk entirely rather than trusting the code path by inspection -- read a key once, truncate the file to zero bytes, confirm a second read for the same key still succeeds. Read latency measured with no cache and at three cache sizes (10%, 50%, 150% of one SSTable's cacheable bytes) against a fixed, seeded Zipfian access pattern -- numbers pending a run on the user's own machine, the same discipline every prior latency measurement in this project has followed, since real time depends on the machine it runs on; hit rate, which depends only on the deterministic seed and cache logic, is asserted directly rather than only logged. Two new open questions recorded: the cache's single coarse mutex, and its size being measured in the abstract rather than chosen for a real workload, joining `bitsPerKey` and `targetBlockSize` on the same still-open list. |
+| v1.18 | Per-block compression implemented and measured against its CPU cost (§13.13): the data block layout gains a one-byte CompressionType marker ahead of its entries, CRC-verified on the on-disk (possibly compressed) bytes before decompression is ever attempted -- a real, breaking change to the on-disk format, made safely only because nothing in this actively-developed project depends on an old file surviving a format change. flate, not gzip or zlib, chosen specifically because this format already carries its own BlockCRC32 and a self-checksumming compression container would mean paying for two overlapping checksums. finalizeBlock compresses first and falls back to CompressionNone whenever the compressed form isn't strictly smaller, so a block of already-compressed or near-random data never pays a decompression cost for zero benefit. decompressFlate enforces a 64x-targetBlockSize decompression-bomb guard, defending against a CRC-valid-but-adversarial stream rather than anything this package's own Write could ever legitimately produce. Write is completely unchanged; WriteCompressed is new, the identical "leave the simple existing path alone" precedent OpenWithCache set over Open (v1.17) now applied to the write side -- and unlike that precedent, reading a compressed file needs no new API at all, since verifyAndSplitBlock absorbs decompression transparently before any caller (Get, Iterator, a cached Reader) ever sees the difference. Measured on a moderately redundant, JSON-shaped 5,000-key workload: space saved and file size are deterministic and asserted directly (at least 20% or the test fails); write (compress) and read (decompress) duration are logged only, pending a run on the user's own machine, the same discipline every prior latency measurement in this project has followed. Two new open questions recorded: the SSTable footer has no format-version field for a real cross-version migration, and flate's compression level is asserted at the standard library default rather than measured, joining targetBlockSize, bitsPerKey, and block cache size on the same still-open list. |
+| v1.19 | The storage engine wired in as Raft's real state machine (new §14), replacing e2e_test.go's own kvMachine and its explicitly-named "throwaway encoding" -- that file's own comment has said "Phase H brings a real one" since before §13 existed. internal/kvstore is a pure consumer of raft.Node's public API (Submit, ApplyCh, ReadIndex, ReadLease, SnapshotNotify, Snapshot); neither package imports the other's internals. A real Put/Delete wire codec replaces the throwaway one. Machine.freezeAndFlushLocked closes the "nothing swaps a full memtable out from under live writes" gap every §13 section since v1.10 has repeated -- synchronously, in the apply path, a named simplification rather than an oversight, with a background flush goroutine recorded as its own separate open question. Both linearizable read paths (barrier and lease) run against a freshly-constructed engine.Reader, reloaded from the manifest on every call since compaction.Background can change it independently of the apply loop. Applied-term bookkeeping is windowed by index rather than pruned at snapshot time -- the first design tried (prune at the snapshot floor) was found to produce spurious read failures for a barrier issued just before a snapshot, and was replaced before shipping. Snapshots are a logical image (the full live key set via sstable.Merge, tombstones dropped) rather than a physical one referencing SSTable files directly -- a real, explicit design choice, not a default, argued in full in §14.4 and left as an open question rather than attempted alongside everything else in this task. Startup composes three independently-built recovery mechanisms (compaction.Recover, engine.RecoverMemtable, raft.OpenNode's own log recovery) for the first time. cmd/helios is a real, running, single-node program -- started, stopped, and restarted by hand against the same data directory, not just exercised by tests -- honestly single-node-only, since Raft's own Transport has never had a real network implementation. Tested end to end with a real single-node raft.Node built from scratch for these tests (Raft's own multi-node test harness is unexported and internal to package raft): 300 real Put/Delete/overwrite operations, the flush trigger, background compaction actually interoperating with it, snapshot take-and-install, and restart recovery, all under -race -shuffle=on -count=3. Five new open questions recorded in §12, closing one that has recurred since v1.10. |
