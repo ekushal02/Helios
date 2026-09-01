@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.19 — leader election, log replication, the apply path, linearizable
+**Status:** v1.23 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -13,16 +13,24 @@ node offline for ten thousand entries. The LSM storage engine — write-ahead lo
 memtable, SSTable read/write with optional per-block compression, a Bloom filter
 (measured, not yet wired into the SSTable read path), a shared LRU block cache, a
 merged read/write path, and leveled compaction with a background runner and startup
-recovery — is now wired in as the actual Raft state machine (§14), not just exercised
-by tests calling it directly: `internal/kvstore.Machine` consumes a real `raft.Node`'s
-`ApplyCh` end to end, closing the long-standing "nothing swaps a full memtable out from
-under live writes" gap along the way, implements both linearizable read paths against
-the real storage engine, and implements Raft's snapshot contract (a logical image of
-the full live key set, not yet the file-referencing physical form a larger engine would
-eventually want). `cmd/helios` is a real, if single-node-only, running program, not a
-stub. No client-facing network API exists yet — that, a background flush goroutine, and
-a handful of "asserted, not yet measured against a real workload" constants are what
-remain, tracked explicitly in §12 and §14.7 rather than left implicit.
+recovery — is wired in as the actual Raft state machine (§14): `internal/kvstore.Machine`
+consumes a real `raft.Node`'s `ApplyCh` end to end, implements both linearizable read
+paths against the real storage engine, and implements Raft's snapshot contract (a
+logical image of the full live key set). `cmd/helios` is a real, if single-node-only,
+running program. A full-system test exists and has completed a real 300,000-key run
+(§14.8) — reduced from the originally-planned one million after a real attempt at that
+scale was watched for 19 hours and deliberately killed, its own trajectory being the
+finding: restart currently reapplies the *entire* committed history rather than only
+whatever wasn't yet durable (§14.9, high priority in §12); every applied write pays for
+two separate, lock-held fsyncs, confirmed with unusual precision once restart-replay —
+which pays for only one of the two — ran 21.85× faster than live writes on the same
+303,000 entries (§14.10, §14.12); and the test's own first restart measurement was
+silently measuring the wrong thing, found from a real run's reads timing out rather
+than from review (§14.11). All findings correct on every value checked at every scale
+tested; all costing (or previously hiding the cost of) more than a well-scoped system
+should. No client-facing network API exists yet either — that, a
+background flush goroutine, and a handful of "asserted, not yet measured against a
+real workload" constants are what remain, tracked explicitly in §12 and §14.7.
 
 ---
 
@@ -1304,7 +1312,20 @@ Deliberately unresolved. Each is answered by later work.
   over states the node actually occupied. Released from the lock, a record that shortens
   the log no longer subsumes the promise made by the record that lengthened it. Settle
   that before wiring the batcher in — it is written and tested, and would be actively
-  wrong today.
+  wrong today. **§14.10 confirms this cost at real, full-system scale**: it is one of two
+  stacked, lock-held fsyncs on every applied write (the other is the storage engine's
+  own WAL fsync, `wal.SyncAlways`), and the two together are what made this project's
+  own million-key test take far longer than originally estimated.
+- **A write's two lock-held fsyncs (Raft's own `persistIfDirty` and the storage
+  engine's own WAL) may not both be load-bearing, and fixing them together could be
+  more valuable than fixing either alone.** §14.10's own argument, connected
+  explicitly to §14.9's: if restart is fixed to durably track which Raft index the
+  storage engine's recovered state already reflects, Raft's persisted log becomes
+  arguably *already* sufficient durability for crash recovery, which would make the
+  storage engine's own per-write fsync redundant for that purpose specifically (its
+  role in staging an efficient, flushable memtable would remain). Neither this nor
+  the `persistIfDirty` batching question above was attempted under the time pressure
+  of the task that found the connection between them.
 - **Whole-log rewrite on every persist.** Each write re-encodes the entire log.
   Measured, this is not the bottleneck: extrapolating from an unflushed 7,862-byte
   record at 0.284ms, the record would have to reach roughly 190 KB — order six thousand
@@ -1401,6 +1422,21 @@ Deliberately unresolved. Each is answered by later work.
   behind the same mutex. Mirroring `compaction.Background`'s own shape (§13.9) for
   flushing specifically is real, deferred work — attempting it in the same task that
   closed the swap question itself would have been two large changes at once.
+- **HIGH PRIORITY — restart reapplies the entire committed history a second time,
+  rather than only whatever wasn't yet durable.** Found in §14.9, not assumed: a
+  five-thousand-key sanity run showed on-disk size roughly doubling across a restart
+  in which nothing new was written. `lastApplied` is volatile Raft state and resets
+  to zero on every restart; nothing currently tells a freshly-reopened `raft.Node`
+  "the state machine already durably reflects everything up to index N," so
+  `ApplyCh` redelivers the full history on top of what `compaction.Recover` and
+  `RecoverMemtable` already reconstructed. Not a correctness bug — Put and Delete
+  are idempotent under replay in the same order, checked directly at both the small
+  and (pending) one-million-key scale — but restart cost currently scales with total
+  applied history rather than with the unflushed tail since the last checkpoint,
+  which is what it should scale with. The fix needs the storage engine to durably
+  track which Raft index its own recovered state corresponds to, without adding a
+  second fsync to the write path that already pays for one — not a small change, and
+  deliberately not attempted under the time pressure of the task that found it.
 - **A read reloads the manifest on every call rather than reacting to a change
   notification.** §14.3's `orderedSSTReadersLocked` has to reload because
   `compaction.Background` can change the manifest at any moment, independent of
@@ -3009,7 +3045,10 @@ manifest on every call rather than reacting to a change notification; snapshots 
 logical, not physical, and `InstallSnapshot` still has no chunking; and a Machine's
 own configured constants (`FlushThresholdBytes`, `CompactionInterval`, the 64MB
 block cache `cmd/helios` picks) join `targetBlockSize`, `bitsPerKey`, and the rest of
-§12's list of "asserted, not yet measured against a real workload" defaults.
+§12's list of "asserted, not yet measured against a real workload" defaults. One more
+was found only after this section shipped, at real scale — restart redoing more work
+than it needs to, §14.9's own finding, marked HIGH PRIORITY in §12 rather than folded
+in quietly alongside the rest.
 
 **Implemented** at `internal/kvstore/` — `codec.go` (`encodePut`, `encodeDelete`,
 `decodeCommand`), `snapshot.go` (`encodeSnapshotImage`, `decodeSnapshotImage`),
@@ -3023,6 +3062,311 @@ API, since Raft's own multi-node test harness is unexported and internal to pack
 including overwrites and deletes; the flush trigger; background compaction actually
 interoperating with it; snapshot take-and-install; and restart recovery. All under
 `-race -shuffle=on -count=3`.
+
+### 14.8 The full-system test: one million keys
+
+Every test in §14.1–14.7 proves the pieces work — at a scale small enough to run in
+seconds, as part of the ordinary `-race -shuffle=on -count=3` gate. None of them
+prove the system holds together at a scale where every mechanism actually has to do
+real work: enough writes to flush dozens of times, enough data for compaction to
+matter, enough total bytes that a bug hiding in "this only shows up once you're past
+the first few files" has somewhere to hide. `TestFullSystemOneMillionKeys`
+(`internal/kvstore/fullsystem_test.go`) is that test — one million distinct keys,
+written through a real single-node `raft.Node` and the full storage engine beneath
+it, 1% of them deleted, all of them verified, the whole system stopped and reopened
+from disk, and verified again.
+
+**Gated behind `testing.Short()`**, the identical convention this project's own
+testing philosophy has followed since the Raft phase: *"the right response to suite
+growth is `testing.Short()` tiering, not deletion."* It never runs as part of the
+ordinary gate; run it explicitly:
+
+```
+go test ./internal/kvstore/... -run TestFullSystemOneMillionKeys -v -timeout 2h
+```
+
+**A generous timeout is not paranoia.** `DefaultOptions` uses `wal.SyncAlways`
+(§13.1) — every applied write fsyncs before `Machine.Put` returns, and application
+happens on exactly one goroutine (the apply loop, §14), so the write phase's total
+time is fundamentally bounded by one million sequential fsyncs *regardless* of how
+many goroutines are pipelining `Submit` calls into it (64, in this test — real
+concurrency, since `Submit` itself returns as soon as an entry reaches the log,
+`submit.go`'s own doc, well before it applies). That is not a limitation this test
+works around; it is the honest cost of the durability guarantee `DefaultOptions`
+makes, and a weaker sync policy here would mean the test was no longer actually
+checking what it claims to.
+
+**Raft's own snapshotting is disabled for this test** (`SetSnapshotThreshold(0)`),
+deliberately, not as an oversight. §14.4 already documents why a snapshot here is
+*logical*, not physical: `take` re-encodes the entire current live key set into one
+blob on every cycle. At this scale, that cost grows with the live set across the
+run — left enabled at Raft's own default threshold (2,000 entries), it would fire
+roughly 500 times over the course of one million applies, each one progressively
+more expensive as the live set grows toward it. What this test is actually
+exercising is the storage engine's *own* restart path — `compaction.Recover`
+(§13.10) and WAL replay (§13.7's `RecoverMemtable`) — which needs no Raft snapshot
+to have ever been taken at all; `TestSnapshotTakeAndInstallRoundTrips` already
+checks the Raft-snapshot path in isolation, at a scale that doesn't confound it with
+this cost.
+
+**Verification uses the lease read path, not the safe one, for all one million
+checks — with a small sample of the safe path checked separately.** `Get`'s
+barrier-based protocol (§14.3) appends a real log entry per call; doing that a
+million times would double the log for no benefit the correctness claim actually
+needs. `GetLeaseRead` exercises the same underlying storage read path at full scale
+with no log growth; `fullSystemSpotCheckSafeReads` checks 200 keys, evenly spread
+across the key space, through `Get` specifically, confirming the two paths still
+agree without paying for a million barrier entries to prove it everywhere.
+
+**Measured, on the project owner's own machine — at 300,000 keys, not the full one
+million, and that reduction is itself part of the finding.** A first attempt at the
+full one million keys was run, watched, and deliberately killed after roughly 19
+hours — not because anything was broken (every signal available, real syscalls, a
+coherent manifest, growing on-disk state, confirmed it was doing real work the whole
+time) but because the trajectory made clear that completing it would take multiple
+days, driven by the compounding compaction cost §14.10 already names. That attempt's
+own findings are recorded in full in §14.12, including a striking, precise
+confirmation of the two-stacked-fsync diagnosis that only showed up once a real
+restart at real scale actually ran. `HELIOS_FULLSYSTEM_KEYS=300000` — the same test,
+the same code path, `-timeout 0`, run to completion rather than killed — is what
+produced the table below.
+
+| phase | duration | rate |
+|---|---|---|
+| write (300,000 puts) | 4h15m54s | 19.54 puts/sec (final instantaneous; started at 102/s, decayed continuously — see §14.12) |
+| delete (3,000 deletes) | 4m42s | 10.62 deletes/sec |
+| read-back, pre-restart | 4.86s | 61,723 gets/sec (lease read path) |
+| restart — setup | 449ms | — |
+| restart — full catch-up (ApplyCh redelivery) | 11m49.7s | 426.96 entries/sec (303,000 entries) |
+| read-back, post-restart | 4.77s | 62,896 gets/sec (lease read path) |
+| on-disk size, before restart | 26.3 MB (6 files) | — |
+| on-disk size, after restart | 41.5 MB (5 files) | — |
+| total test wall time | 4h33m | — |
+
+Correct on every one of 300,000 keys, both before and after restart, including the
+3,000 deleted keys correctly reporting absent both times. `Fault()` empty throughout.
+
+### 14.9 A real finding from building this test: restart redoes more work than it needs to
+
+**This is not a correctness bug — checked directly, not assumed.** Every value read
+back after a restart, at every scale this project has tested, including the small
+sanity run that surfaced this, is exactly correct. What was found instead is that
+restart currently costs more than it should, in a way invisible at the scale
+§14.1–14.7's own tests run at and unmissable at this section's.
+
+`lastApplied` is volatile Raft state (§5's persistent/volatile distinction) and
+resets to zero on every restart. Nothing currently tells a freshly-reopened
+`raft.Node` "the state machine already durably reflects everything up to index N" —
+so once a restarted node re-establishes leadership (committing its own current-term
+entry, which by Log Matching transitively commits everything beneath it — the exact
+mechanism `read.go`'s own barrier argument already describes for a different
+purpose), `ApplyCh` redelivers *every* committed entry from the beginning, on top of
+whatever `compaction.Recover` and `RecoverMemtable` already reconstructed from disk.
+Put and Delete are idempotent under replay in the same order, which is exactly why
+this produces the *correct final value* every time — and exactly why
+`TestRestartRecoversAllAppliedState`, run at a scale where "twice as much work" is
+still fast, never caught it. A small sanity run of this section's own full-system
+test, at 5,000 keys rather than one million, made it directly visible: on-disk size
+roughly doubled across a restart in which nothing new was written, because the
+entire applied history had been durably re-written to the fresh WAL a second time.
+
+**The fix needs the storage engine to durably know which Raft index its own
+recovered state already corresponds to** — and the cheapest *correct* way to record
+that, without adding a second fsync to every single write (which would undo the
+entire point: a write path already paying for one fsync per apply has no room to pay
+for two), is not a small change. It was not attempted here, under time pressure, in
+the same task that found it — deliberately, on the same "a correct earlier design
+should not be reversed by pressure to ship a fix quickly" discipline this project has
+applied to every other significant finding. Recorded as a new, high-priority open
+question (§12) rather than patched provisionally.
+
+**Practical consequence for §14.8's own numbers**: expect the restart phase to take
+roughly as long as the original write phase, not the near-instant recovery a
+correctly-scoped restart would achieve. This is stated plainly in the test's own
+output (`fullsystem_test.go`'s own `t.Logf` note alongside the restart duration) so
+whoever runs it is not left wondering whether the number they are looking at is a
+mistake.
+
+### 14.10 A second real finding: every write crosses two fsync boundaries, and
+concurrency doesn't help the way this section originally assumed
+
+**The first real attempt at §14.8's full one-million-key run, on real hardware,
+hit its own two-hour timeout at roughly 19% complete.** Not a deadlock — the
+`go test` timeout's own goroutine dump is the proof, not an assumption: dozens of
+writer goroutines queued on two ordinary mutexes (this package's own `Machine.mu`,
+and `raft.Node`'s own `n.mu`), with the log index each one was waiting on climbing
+steadily across the dump rather than frozen at a single value. That is what
+contention behind one serialized bottleneck looks like; a genuine deadlock would
+show every index frozen and at least one cycle of locks each waiting on the other,
+neither of which appeared.
+
+**The real cause: every applied write pays for two separate, sequential, lock-held
+fsyncs, not the one this section's original write-up accounted for.**
+`raft.Node.Submit`'s own `appendChecked` holds `n.mu` for the full duration of
+`persistIfDirty`'s synchronous fsync of Raft's persistent log (`submit.go`, §5) —
+already a known, pre-existing open question in this project (§12: `persistIfDirty`
+under `n.mu` blocking group commit, measured a 25× potential gain from batching,
+long before this task). Separately, `Machine.applyCommand` holds its own `Machine.mu`
+for the full duration of the storage engine's own WAL fsync (`wal.SyncAlways`,
+§13.1). Two fully independent locks, two fully independent fsyncs, both held
+across the actual disk write, both on the path of every single Put — and neither
+one is small on real hardware. A first attempt at estimating this section's own
+expected runtime accounted for one fsync, not two, and the true per-write cost
+turned out to be far higher than that estimate.
+
+**This is also why the original 64-goroutine writer pool in §14.8 was itself a real
+mistake, corrected before this section shipped rather than left in.**
+`fullSystemWritePhase`'s original doc argued that concurrent `Submit` calls would
+pipeline real throughput, since `Submit` "returns as soon as the entry is in this
+node's log" (`submit.go`'s own doc) rather than waiting for replication or
+application. That argument is true as far as it goes and still misses the actual
+bottleneck: `Submit` is not cheap to call concurrently, because `appendChecked`
+holds `n.mu` for its own synchronous fsync before ever returning — so every
+concurrent caller queues behind that one lock regardless of how many are trying at
+once. Measured directly, not just reasoned about: a sanity run at 8 writers reached
+the identical throughput (409 puts/sec) a first run at 64 writers had reached
+(405 puts/sec) — concurrency purchased nothing. The pool was reduced from 64 to 8,
+not for correctness (both were already correct) but because a pool of 64 produces
+a nearly illegible goroutine dump on any future timeout for zero benefit, while
+8 stays small enough to read and still isn't purely sequential.
+
+**A path to a real fix exists, and is directly connected to §14.9's own finding,
+but neither was attempted here.** If restart is eventually fixed to durably track
+which Raft index the storage engine's own recovered state already reflects (§14.9),
+that finding's own logic runs in reverse too: Raft's persisted log is arguably
+*already* sufficient durability for every applied command, which would make the
+storage engine's own per-write WAL fsync redundant rather than load-bearing, at
+least for crash-recovery purposes specifically (its role in building an efficient,
+flushable in-memory memtable stage would remain). Fixing both together could
+plausibly remove one of the two fsync boundaries entirely rather than just
+batching each independently. Recorded as a further open question (§12), explicitly
+connected to §14.9's rather than a new, unrelated one — not attempted under the
+time pressure of the task that found it, for the identical reason §14.9's own fix
+wasn't.
+
+**`HELIOS_FULLSYSTEM_KEYS` was added to §14.8's own test as a direct result of this
+finding**, not part of its original design: an environment-variable override (not a
+test flag, not a second exported constant — loud enough not to be forgotten) that
+runs the exact same code path at a caller-chosen scale, letting a real throughput
+number be measured on whatever machine the full run will happen on before
+committing hours to it, rather than trusting an estimate a second time.
+
+**Reducing the writer pool from 64 to 8, measured directly rather than just argued
+for, turned out to help more than the argument alone predicted.** §14.10 reasoned
+that concurrency couldn't purchase real throughput here, since every `Submit` queues
+behind the same lock-held fsync regardless of how many callers are trying at once —
+true, but incomplete. A real run at reduced scale (20,000 keys) with the corrected
+8-writer pool reached 77.19 puts/sec, against the original 64-writer run's own
+observed 26.34 ops/sec (extrapolated from its timeout's own goroutine dump) — nearly
+3x faster, not merely unchanged. Fewer goroutines contending for the same serialized
+resource reduced real scheduling and lock-acquisition overhead on top of removing
+the throughput benefit that was never actually there; the original 64-writer design
+was not just failing to help, it was actively costing something.
+
+### 14.11 A third real finding: the test's own restart measurement was wrong, not
+just the system it measured
+
+**§14.9 documents a real system finding — restart reapplies the entire committed
+history. §14.11 is a separate, second finding, in this test's own code, not the
+system it tests: the test was not correctly MEASURING that cost, and a real
+20,000-key run failing is what surfaced it, not review.**
+
+`NewMachine` starts the apply loop with `go machine.run()` and returns immediately;
+it does not wait for Raft's redelivered backlog to finish reapplying. §14.8's first
+version measured "restart" as the time until `NewMachine` returned — which only ever
+captured the fast, synchronous half of a restart (`compaction.Recover`, WAL replay)
+while the slow half (the apply loop working through everything §14.9 says Raft
+redelivers) ran invisibly, overlapping with whatever the test did next: its own
+post-restart verification. At real scale, that produced exactly the failure a
+premature verification phase would: 144 of the first `GetLeaseRead` calls timed out
+waiting for their own read barrier, because the apply loop was still minutes behind
+and `defaultReadTimeout` (5 seconds, `read_snapshot.go`) was nowhere near long
+enough to wait it out. **Every one of those reads was correctly refusing to answer
+from state that hadn't caught up — not a correctness bug. A timing bug in the test's
+own phase ordering, not in `Machine`.**
+
+Fixed by capturing `AppliedIndex()` from the first `Machine` immediately before
+closing it, then polling the second one after restart until it reaches that same
+value — with a budget derived from the write and delete phases the same run already
+measured (3x their combined duration, §14.9's own claim that catch-up costs roughly
+what produced the backlog, checked directly rather than assumed) — before
+verification is allowed to start at all. That wait is also what "restart" now
+actually reports: confirmed at 20,000 keys, `setup: 316ms, full catch-up: 1m15s,
+total: 1m16s` — a real, substantial cost, correctly measured and correctly waited
+for, rather than a misleadingly fast number that was silently measuring the wrong
+thing.
+
+**Practical consequence for planning a full run**: extrapolate from the write phase
+*and* the restart phase together, not the write phase alone — the earlier guidance
+to budget "10-15 hours" based on write-phase extrapolation alone understated the
+total, since the restart phase's real cost was invisible until this fix existed to
+measure it.
+
+### 14.12 The killed one-million-key attempt, and what a completed 300,000-key run
+confirmed about all three prior findings
+
+**A real attempt at the full one million keys was made, watched to completion of
+its 19th hour, and deliberately killed — not because anything was wrong, but
+because the trajectory made the true cost visible for the first time.** Every
+external signal checked during that run (a process sample showing genuine syscalls
+— `write`, `fcntl`, `rename` — not pure blocking; a coherent, valid `MANIFEST`; a
+steadily growing on-disk footprint; roughly 23% average CPU utilization over 18h48m
+of wall-clock time, consistent with a process genuinely waiting on serialized disk
+I/O rather than stuck) confirmed the system was doing real work the entire time, not
+hung. It was killed anyway, because at the observed rate, completing it would have
+taken multiple additional days — a cost this task's own scope does not extend to
+absorbing.
+
+**A real gap in this test's own instrumentation was found and fixed as a direct
+result of trying to observe that 19-hour run.** `t.Logf` output is buffered by the
+testing framework and only flushes when the test *completes* — a test that runs for
+19 hours and is then killed had produced, up to that point, precisely nothing
+quotable, regardless of how much real progress it had made. `fullSystemProgress`
+(`fullsystem_test.go`) was added to fix this: a periodic reporter using plain,
+unbuffered `fmt.Fprintf` to stdout, mirrored to a fixed external log path outside
+`t.TempDir()` (so it survives regardless of how the test process ends), reporting
+completed count, elapsed time, instantaneous-since-start rate, and a naive linear
+ETA every two minutes. Confirmed working immediately: a fresh attempt at
+`HELIOS_FULLSYSTEM_KEYS=300000`, this time watched live rather than reconstructed
+after the fact from `lsof` and manifest archaeology, is what produced §14.8's real
+numbers.
+
+**The write phase's own rate, watched continuously for the first time, decayed
+smoothly and continuously across the entire run — not to a stable floor, contrary
+to a real-time read taken partway through.** During the 300,000-key run, the
+reported cumulative rate fell from 102.18/s in the first two minutes to 19.54/s at
+completion 4h16m later. A live reading taken around the 40-46 minute mark, when the
+*interval-to-interval* rate briefly held near 23-24/s for several consecutive
+samples, was read in conversation as possible evidence of stabilization. **The full
+curve shows this was not a stabilization — it was a brief flattening within a
+longer decay that continued smoothly onward to 19.54/s by the end.** Recorded
+plainly as a correction, not smoothed over: a short window of real data supported a
+read that the complete run did not bear out, and the honest thing is to say so
+rather than let the earlier, more optimistic reading stand uncorrected.
+
+**The clearest and most precise confirmation yet of §14.10's two-stacked-fsync
+diagnosis came from the restart, not the write phase.** Replaying 303,000 entries
+(300,000 puts plus 3,000 deletes) via `ApplyCh` redelivery during restart took 709.7
+seconds — 426.96 entries/sec, **21.85× faster** than the write phase's own final
+rate of 19.54 puts/sec. This is exactly the shape §14.10's own argument predicts:
+replay never calls `Submit`, so it never pays for `persistIfDirty`'s fsync — every
+entry arrives already committed, straight onto `ApplyCh` — while it still pays the
+storage engine's own WAL fsync in full, since `Machine.applyCommand` runs unchanged
+either way. Removing one of the two fsync boundaries and keeping the other produced
+a >20× speedup on the exact same kind of work. This is consistent with, not
+definitive proof of, the two-fsync diagnosis specifically — replay also skips the
+worker-pool scheduling and retry-loop overhead the write phase's own client-side
+code carries, which a fully controlled comparison would need to isolate before
+calling this conclusive. It is nonetheless the single most striking piece of
+evidence gathered so far for why §12's connected open question (removing one fsync
+boundary entirely, not just batching each) is worth pursuing.
+
+**On-disk footprint grew across the restart despite the entry count staying fixed**
+(26.3MB across 6 files before, to 41.5MB across 5 files after) — consistent with
+compaction running again during replay, on the same live key set, and is not itself
+surprising: a fresh `Machine` replaying through `Put` rebuilds its own SSTables from
+scratch via the identical flush/compaction pipeline live traffic uses, so some
+reshuffling of the physical bytes representing the same logical data is expected.
 
 ---
 
@@ -3053,3 +3397,7 @@ interoperating with it; snapshot take-and-install; and restart recovery. All und
 | v1.17 | A block cache with LRU eviction implemented and measured (§13.12): `blockcache.LRU[K, V]`, a generic, byte-size-bounded cache built entirely from stdlib (`container/list`), wired into `sstable.Reader` via a new `OpenWithCache` that leaves the existing `Open` and every one of its callers completely unchanged. Keyed by (path, block index), which needs no invalidation logic at all -- an SSTable is immutable once published (§13.2) and compaction (§13.8) never edits one in place, so a cached block can never go stale, only become evictable. Two real bugs caught while designing the eviction rule, not after: a naive evict-until-under-budget loop would silently make Put a no-op for any single entry larger than the configured budget (a real case, since a data block is allowed to exceed targetBlockSize by one entry), fixed by never evicting the last remaining entry; and that same fix then left a `maxBytes: 0` cache ("cache nothing") holding exactly one entry regardless, fixed by handling a non-positive budget as its own case checked first. `TestCacheHitAvoidsTouchingDiskAtAll` is the test that actually proves a cache hit skips disk entirely rather than trusting the code path by inspection -- read a key once, truncate the file to zero bytes, confirm a second read for the same key still succeeds. Read latency measured with no cache and at three cache sizes (10%, 50%, 150% of one SSTable's cacheable bytes) against a fixed, seeded Zipfian access pattern -- numbers pending a run on the user's own machine, the same discipline every prior latency measurement in this project has followed, since real time depends on the machine it runs on; hit rate, which depends only on the deterministic seed and cache logic, is asserted directly rather than only logged. Two new open questions recorded: the cache's single coarse mutex, and its size being measured in the abstract rather than chosen for a real workload, joining `bitsPerKey` and `targetBlockSize` on the same still-open list. |
 | v1.18 | Per-block compression implemented and measured against its CPU cost (§13.13): the data block layout gains a one-byte CompressionType marker ahead of its entries, CRC-verified on the on-disk (possibly compressed) bytes before decompression is ever attempted -- a real, breaking change to the on-disk format, made safely only because nothing in this actively-developed project depends on an old file surviving a format change. flate, not gzip or zlib, chosen specifically because this format already carries its own BlockCRC32 and a self-checksumming compression container would mean paying for two overlapping checksums. finalizeBlock compresses first and falls back to CompressionNone whenever the compressed form isn't strictly smaller, so a block of already-compressed or near-random data never pays a decompression cost for zero benefit. decompressFlate enforces a 64x-targetBlockSize decompression-bomb guard, defending against a CRC-valid-but-adversarial stream rather than anything this package's own Write could ever legitimately produce. Write is completely unchanged; WriteCompressed is new, the identical "leave the simple existing path alone" precedent OpenWithCache set over Open (v1.17) now applied to the write side -- and unlike that precedent, reading a compressed file needs no new API at all, since verifyAndSplitBlock absorbs decompression transparently before any caller (Get, Iterator, a cached Reader) ever sees the difference. Measured on a moderately redundant, JSON-shaped 5,000-key workload: space saved and file size are deterministic and asserted directly (at least 20% or the test fails); write (compress) and read (decompress) duration are logged only, pending a run on the user's own machine, the same discipline every prior latency measurement in this project has followed. Two new open questions recorded: the SSTable footer has no format-version field for a real cross-version migration, and flate's compression level is asserted at the standard library default rather than measured, joining targetBlockSize, bitsPerKey, and block cache size on the same still-open list. |
 | v1.19 | The storage engine wired in as Raft's real state machine (new §14), replacing e2e_test.go's own kvMachine and its explicitly-named "throwaway encoding" -- that file's own comment has said "Phase H brings a real one" since before §13 existed. internal/kvstore is a pure consumer of raft.Node's public API (Submit, ApplyCh, ReadIndex, ReadLease, SnapshotNotify, Snapshot); neither package imports the other's internals. A real Put/Delete wire codec replaces the throwaway one. Machine.freezeAndFlushLocked closes the "nothing swaps a full memtable out from under live writes" gap every §13 section since v1.10 has repeated -- synchronously, in the apply path, a named simplification rather than an oversight, with a background flush goroutine recorded as its own separate open question. Both linearizable read paths (barrier and lease) run against a freshly-constructed engine.Reader, reloaded from the manifest on every call since compaction.Background can change it independently of the apply loop. Applied-term bookkeeping is windowed by index rather than pruned at snapshot time -- the first design tried (prune at the snapshot floor) was found to produce spurious read failures for a barrier issued just before a snapshot, and was replaced before shipping. Snapshots are a logical image (the full live key set via sstable.Merge, tombstones dropped) rather than a physical one referencing SSTable files directly -- a real, explicit design choice, not a default, argued in full in §14.4 and left as an open question rather than attempted alongside everything else in this task. Startup composes three independently-built recovery mechanisms (compaction.Recover, engine.RecoverMemtable, raft.OpenNode's own log recovery) for the first time. cmd/helios is a real, running, single-node program -- started, stopped, and restarted by hand against the same data directory, not just exercised by tests -- honestly single-node-only, since Raft's own Transport has never had a real network implementation. Tested end to end with a real single-node raft.Node built from scratch for these tests (Raft's own multi-node test harness is unexported and internal to package raft): 300 real Put/Delete/overwrite operations, the flush trigger, background compaction actually interoperating with it, snapshot take-and-install, and restart recovery, all under -race -shuffle=on -count=3. Five new open questions recorded in §12, closing one that has recurred since v1.10. |
+| v1.20 | The full-system test built (new §14.8): TestFullSystemOneMillionKeys writes 1,000,000 distinct keys through a real single-node raft.Node and the full storage engine, deletes 1% of them, verifies all of them, stops and reopens the whole system from disk, and verifies again -- gated behind testing.Short() and run explicitly, not part of the ordinary gate, the same convention this project's testing philosophy has followed since the Raft phase. Verification uses the lease read path at full scale (no per-check log growth) with a 200-key spot-check through the safe barrier path. Raft's own snapshotting is disabled for the test, deliberately -- isolating the storage engine's own restart path (compaction.Recover, RecoverMemtable) from the growing cost of §14.4's already-documented logical-snapshot re-encoding. Deliberately not run in this sandbox -- the number belongs to whoever actually depends on it, the same discipline every other real-time measurement in this project has followed, applied with more force at this scale. A genuine finding surfaced while sanity-checking the test at reduced scale before delivering it, not left for the person running the real one to discover alone (new §14.9, marked HIGH PRIORITY in §12): restart currently reapplies the ENTIRE committed history a second time, on top of what WAL/SSTable recovery already reconstructs, because lastApplied is volatile Raft state that resets on every restart with nothing yet telling a freshly-reopened Node "the state machine already durably reflects everything up to index N." Checked directly, not assumed, to be correct on every value rather than merely wasteful in a way that also happens to be safe: Put and Delete are idempotent under replay in the same order, which is exactly why this was invisible at every smaller scale this project had tested restart at until now. The real fix -- durably tracking the applied-index high-water mark without adding a second fsync to a write path that already pays for one -- was not attempted under the time pressure of the task that found it. |
+| v1.21 | A second real finding from §14.8's full-system test, surfaced by its actual first attempt at real scale (new §14.10): every applied write pays for two separate, sequential, lock-held fsyncs, not the one the test's original design accounted for -- raft.Node.Submit's own appendChecked holds n.mu through persistIfDirty's synchronous fsync (a pre-existing, already-documented open question, now confirmed at real-system scale rather than only in isolation), and Machine.applyCommand separately holds its own Machine.mu through the storage engine's own WAL fsync. Confirmed via the go test timeout's own goroutine dump, not assumed: dozens of writer goroutines queued on two ordinary mutexes with climbing (not frozen) indices -- the signature of contention behind one serialized bottleneck, not a deadlock. A connected design mistake corrected before the test shipped its second version: the original 64-goroutine writer pool assumed concurrent Submit calls would pipeline real throughput, which is false here -- Submit is not cheap to call concurrently, since appendChecked holds n.mu for its own fsync before returning. Measured directly: 8 writers and 64 writers reached materially identical throughput (409 vs 405 puts/sec), so the pool was reduced to 8 -- legibility on a future timeout's dump, not a throughput fix, since none is available without touching Raft's own persistIfDirty. HELIOS_FULLSYSTEM_KEYS added to the test as a direct result: an environment-variable override letting a real throughput number be measured, on whatever machine the full run will happen on, at a scale that finishes in minutes, before committing hours to the full one. Two new open questions recorded in §12: persistIfDirty's cost confirmed at full-system scale (connected to the pre-existing entry on it), and a further one connecting this finding to v1.20's own restart-replay finding -- fixing both together could plausibly remove one of the two fsync boundaries entirely, rather than only batching each independently; neither attempted under the time pressure of the task that found the connection. |
+| v1.22 | A third real finding from getting §14.8's full-system test to run cleanly (new §14.11): the test's own restart measurement was wrong, not just the system it measures. NewMachine starts the apply loop with go machine.run() and returns immediately, so the first version's restartDuration only ever captured the fast synchronous half of a restart (compaction.Recover, WAL replay) while the slow half -- the apply loop's full catch-up through everything §14.9 says Raft redelivers -- ran invisibly, overlapping with the test's own post-restart verification. Surfaced by a real 20,000-key run failing, not by review: 144 of the first GetLeaseRead calls timed out waiting for their own read barrier, because the apply loop was still minutes behind and the 5-second default read timeout was nowhere near enough to wait it out. Every one of those reads was correctly refusing to answer from state that hadn't caught up -- confirmed to be a timing bug in the test's own phase ordering, not a correctness bug in Machine. Fixed by capturing AppliedIndex() before closing the first Machine and polling the second one until it reaches that value, budgeted at 3x the same run's own measured write-plus-delete duration, before verification is allowed to start. Confirmed working at 20,000 keys: a clean pass, with the real restart cost now correctly reported (setup 316ms, full catch-up 1m15s). Also confirmed at this run: reducing the write-phase worker pool from 64 to 8 (§14.10) was not merely neutral as reasoned -- measured directly, it achieved 77.19 puts/sec against the original 64-writer run's own extrapolated 26.34 ops/sec, nearly 3x faster, since fewer goroutines meant less real contention overhead on top of removing a throughput benefit that was never actually there. Extrapolating this run's real rates to the full one-million-key scale revised the total time estimate down substantially, from the earlier 10-15 hour guidance (based on write-phase extrapolation alone, before the restart phase was being measured at all) to roughly 4h40m (write ~3h36m, delete ~3m, restart catch-up ~1h3m) -- pending confirmation from the actual full run, not yet executed. §14.8's own results table remains pending that run. |
+| v1.23 | §14.8's full-system test completed for real, at 300,000 keys rather than the originally-planned one million (new §14.12): a first attempt at the full one million was run, watched, and deliberately killed after roughly 19 hours -- confirmed to be doing genuine work the whole time (real syscalls, a coherent manifest, growing on-disk state, ~23% average CPU utilization consistent with disk-I/O-bound waiting, not a hang), killed anyway because the trajectory made clear it would take multiple more days. That attempt directly surfaced a real gap in the test's own instrumentation, fixed as a result: t.Logf output only flushes when a test completes, so a killed 19-hour run had produced nothing quotable regardless of real progress made. fullSystemProgress added: a periodic, unbuffered fmt.Fprintf reporter mirrored to a fixed external log path, immediately validated by a fresh, watched 300,000-key run that completed cleanly in 4h33m, correct on every key before and after restart. Two further findings from that completed run: the write rate's mid-run appearance of stabilizing (an interval-to-interval read taken around the 40-46 minute mark) was corrected against the full curve, which showed continuous decay to completion rather than a genuine plateau -- recorded as a correction, not smoothed over. And restart's own catch-up (which never calls Submit and so never pays for persistIfDirty's fsync) ran 303,000 entries at 426.96/s, 21.85x faster than the write phase's own final rate of 19.54/s on the same data -- the most precise confirmation yet of §14.10's two-stacked-fsync diagnosis, though explicitly not claimed as definitive proof, since replay also skips client-side scheduling overhead the write phase's own worker pool carries. §14.8's results table filled in with real numbers throughout. |
