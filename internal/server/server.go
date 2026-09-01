@@ -6,15 +6,17 @@
 // This is a translation layer and nothing more: it does not reimplement
 // any read or write logic. Every RPC calls straight through to an
 // existing Machine method (Get, GetLeaseRead, Put, Delete, Scan,
-// ScanLeaseRead -- all built and tested in Phase H and F-6) and
-// translates the Go return values into wire types and gRPC status
-// codes. Watch is Phase F-7's job; embedding
-// heliosv1.UnimplementedHeliosServer means that one RPC correctly
-// answers codes.Unimplemented until then, without this package needing
-// a stub of its own for it.
+// ScanLeaseRead, Watch -- all built and tested in Phase H, F-6, and F-7)
+// and translates the Go return values into wire types and gRPC status
+// codes. As of F-7, every RPC helios.proto defines has a real
+// implementation; heliosv1.UnimplementedHeliosServer stays embedded
+// only because HeliosServer's own interface requires it (Go's forward-
+// compatibility convention for gRPC service interfaces), not because
+// anything still falls through to it.
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -28,8 +30,12 @@ import (
 
 // Server implements heliosv1.HeliosServer.
 type Server struct {
-	// Watch (F-7) falls through to this until implemented here -- see
-	// the package doc. Scan no longer does, as of F-6.
+	// Embedded only to satisfy heliosv1.HeliosServer's own forward-
+	// compatibility requirement (every implementation must embed
+	// UnimplementedHeliosServer, so a FUTURE new RPC added to the
+	// service doesn't break existing implementations at compile time).
+	// As of F-7, every RPC below is implemented for real; nothing
+	// currently falls through to this.
 	heliosv1.UnimplementedHeliosServer
 
 	n *raft.Node
@@ -229,6 +235,127 @@ func (s *Server) Scan(ctx context.Context, req *heliosv1.ScanRequest) (*heliosv1
 // agree, not one shared piece of state; see Server.Scan's own doc.
 // Equally UNMEASURED against a real workload (DESIGN.md §12).
 const defaultScanLimit = 100
+
+// watchBatchSize bounds how many events Server.Watch groups into one
+// WatchResponse -- both for replaying retained history and for
+// draining a burst of live events before sending. UNMEASURED, same as
+// every other constant on this list (DESIGN.md §12). Matches
+// WatchResponse's own doc: batching amortizes stream frame overhead
+// under bursty writes, the same argument already measured for
+// AppendEntries coalescing (§10).
+const watchBatchSize = 100
+
+// Watch streams every Put/Delete whose key has req's own KeyPrefix,
+// starting from StartRevision (0 = live only, matching WatchRequest's
+// own documented zero value).
+//
+// NOT LEADER-GATED -- Machine.Watch's own doc gives the full argument:
+// Watch does not need linearizability, only the in-order, exactly-once
+// delivery Raft's own state machine safety property already guarantees
+// on every node that applies a given entry, leader or follower.
+//
+// A REJECTED StartRevision (already evicted from Machine's retained
+// history) is codes.OutOfRange, not codes.Unavailable/NotLeader or a
+// generic error -- gRPC's own status code for exactly this shape of
+// problem: the request itself is fine, but the specific range it asks
+// for is no longer servable. The message tells the client what to do
+// about it (resync via Scan, then retry Watch from a current
+// revision), since silently starting the watch with an undetectable
+// gap in it would be worse than refusing outright.
+func (s *Server) Watch(req *heliosv1.WatchRequest, stream heliosv1.Helios_WatchServer) error {
+	prefix := req.GetKeyPrefix()
+	startRevision := int(req.GetStartRevision())
+
+	replay, live, cancel, ok := s.m.Watch(startRevision)
+	defer cancel()
+	if !ok {
+		return status.Errorf(codes.OutOfRange,
+			"start_revision %d has already been compacted out of this node's retained watch history; "+
+				"resync via Scan and retry Watch with a current revision", startRevision)
+	}
+
+	send := func(events []*heliosv1.WatchEvent) error {
+		if len(events) == 0 {
+			return nil
+		}
+		return stream.Send(&heliosv1.WatchResponse{Events: events})
+	}
+
+	// Replay first, batched in groups of watchBatchSize -- a historical
+	// backlog delivered as a handful of frames, not one per event.
+	var batch []*heliosv1.WatchEvent
+	for _, ev := range replay {
+		if !bytes.HasPrefix(ev.Key, prefix) {
+			continue
+		}
+		batch = append(batch, toWireWatchEvent(ev))
+		if len(batch) >= watchBatchSize {
+			if err := send(batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
+		}
+	}
+	if err := send(batch); err != nil {
+		return err
+	}
+
+	// Then live, one event at a time as they arrive, with a quick
+	// non-blocking drain of whatever else is already buffered before
+	// each send -- the same batching-under-bursts intent, applied to
+	// the live path instead of the replay backlog. stream.Context()
+	// is what ends this loop under ordinary operation: it is canceled
+	// the moment the client disconnects or its own RPC deadline
+	// expires, exactly the same context gRPC already threads through
+	// every unary handler, just read directly here since a streaming
+	// handler has no ctx parameter of its own to use instead. live
+	// closing (chOk == false) means THIS Machine shut down
+	// (Machine.Close, watch.go's own closeAll) -- ending the stream
+	// cleanly rather than blocking on a subsystem that no longer
+	// exists to deliver anything.
+	for {
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case ev, chOk := <-live:
+			if !chOk {
+				return nil
+			}
+			batch = batch[:0]
+			if bytes.HasPrefix(ev.Key, prefix) {
+				batch = append(batch, toWireWatchEvent(ev))
+			}
+		drain:
+			for len(batch) < watchBatchSize {
+				select {
+				case ev2, chOk2 := <-live:
+					if !chOk2 {
+						break drain
+					}
+					if bytes.HasPrefix(ev2.Key, prefix) {
+						batch = append(batch, toWireWatchEvent(ev2))
+					}
+				default:
+					break drain
+				}
+			}
+			if err := send(batch); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func toWireWatchEvent(ev kvstore.WatchEvent) *heliosv1.WatchEvent {
+	we := &heliosv1.WatchEvent{Key: ev.Key, Revision: int64(ev.Revision)}
+	if ev.Tombstone {
+		we.Type = heliosv1.WatchEvent_DELETE
+	} else {
+		we.Type = heliosv1.WatchEvent_PUT
+		we.Value = ev.Value
+	}
+	return we
+}
 
 // translateErr maps a kvstore error to a gRPC status.
 //

@@ -562,6 +562,130 @@ func TestScanAndScanAllAgainstARealSingleNodeServer(t *testing.T) {
 	}
 }
 
+// fakeWatchServer scripts a Watch RPC's behavior the same way
+// fakeServer/fakeScanServer script Get/Scan -- either an immediate
+// NotLeader (this peer is a follower, in the scenario the test below
+// sets up), or one real event followed by blocking until the client
+// disconnects (this peer is "the leader").
+type fakeWatchServer struct {
+	heliosv1.UnimplementedHeliosServer
+	notLeader bool
+	leaderID  int64
+}
+
+func (f *fakeWatchServer) Watch(req *heliosv1.WatchRequest, stream heliosv1.Helios_WatchServer) error {
+	if f.notLeader {
+		st := status.New(codes.Unavailable, "not the leader")
+		withDetails, err := st.WithDetails(&heliosv1.NotLeaderDetail{LeaderId: f.leaderID})
+		if err != nil {
+			return st.Err()
+		}
+		return withDetails.Err()
+	}
+	if err := stream.Send(&heliosv1.WatchResponse{Events: []*heliosv1.WatchEvent{
+		{Type: heliosv1.WatchEvent_PUT, Key: []byte("a"), Value: []byte("1"), Revision: 1},
+	}}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+// TestWatchFollowsKnownLeaderHintBeforeTheStreamStarts proves the one
+// piece of retry logic Watch actually has -- see Watch's own doc for
+// why it does not use do's full retry loop for anything beyond this:
+// a NotLeader response to the initial stream-open attempt is followed
+// exactly once, the same hint-following behavior
+// TestGetFollowsKnownLeaderHintImmediately already proves for unary
+// calls, checked here for the bespoke logic Watch needed of its own.
+func TestWatchFollowsKnownLeaderHintBeforeTheStreamStarts(t *testing.T) {
+	leaderAddr := startFakeServer(t, &fakeWatchServer{})
+	followerAddr := startFakeServer(t, &fakeWatchServer{notLeader: true, leaderID: 2})
+
+	c, err := New(Config{
+		Peers:        map[int]string{1: followerAddr, 2: leaderAddr},
+		InitialGuess: 1, // deliberately start at the follower
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	events, errs := c.Watch(ctx, nil, 0)
+	select {
+	case ev := <-events:
+		if string(ev.Key) != "a" || string(ev.Value) != "1" || ev.Type != WatchPut {
+			t.Fatalf("event = %+v, want Put(a, 1)", ev)
+		}
+	case err := <-errs:
+		t.Fatalf("Watch errored before delivering the event: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event from the redirected leader")
+	}
+}
+
+// TestWatchAgainstARealSingleNodeServer is Scan's own real end-to-end
+// test, for Watch: a real node, a real Machine, a real Server, over
+// real gRPC, proving the whole stack -- including the client's own
+// prefix-agnostic delivery (filtering already happens server-side,
+// §19's own Scan precedent for where a wire-facing concern like this
+// belongs) -- works together, not just each layer's own unit tests in
+// isolation.
+func TestWatchAgainstARealSingleNodeServer(t *testing.T) {
+	addr := startRealServer(t)
+	c, err := New(Config{Peers: map[int]string{1: addr}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	events, errs := c.Watch(ctx, []byte("user/"), 0)
+
+	// A generous pause for the watch goroutine to actually establish
+	// the stream server-side before writing -- startRevision 0 is
+	// live-only, no replay, so a write landing before the stream is
+	// fully up would never be observed. The same bounded-sleep
+	// pattern already used at internal/server's own equivalent test.
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := c.Put(context.Background(), []byte("user/1"), []byte("alice")); err != nil {
+		t.Fatalf("Put(user/1): %v", err)
+	}
+	if _, err := c.Put(context.Background(), []byte("other/1"), []byte("nope")); err != nil {
+		t.Fatalf("Put(other/1): %v", err)
+	}
+
+	select {
+	case ev := <-events:
+		if string(ev.Key) != "user/1" || string(ev.Value) != "alice" {
+			t.Fatalf("event = (%q, %q), want (\"user/1\", \"alice\")", ev.Key, ev.Value)
+		}
+		if ev.Type != WatchPut {
+			t.Errorf("event.Type = %v, want WatchPut", ev.Type)
+		}
+		if ev.Revision <= 0 {
+			t.Errorf("event.Revision = %d, want > 0", ev.Revision)
+		}
+	case err := <-errs:
+		t.Fatalf("Watch ended with an error before delivering any event: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the watched event")
+	}
+
+	cancel()
+	select {
+	case <-errs: // either a cancellation-derived error arrives, or the channel closes with none -- both mean the watch ended
+	case <-time.After(2 * time.Second):
+		t.Fatal("errs did not settle within 2s of context cancellation")
+	}
+}
+
 // TestNewRejectsEmptyPeers and TestNewRejectsUnknownInitialGuess lock in
 // Config validation directly, rather than only via whatever error a
 // misconfigured Client would eventually produce three layers down.

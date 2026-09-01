@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	heliosv1 "github.com/ekushal02/helios/api/helios/v1"
@@ -234,22 +235,140 @@ func TestPutBeforeAnyElectionReportsNotLeader(t *testing.T) {
 	}
 }
 
-// TestWatchIsUnimplemented locks in the embedding-based scope fence
-// for the one RPC still deferred: Server never overrides Watch, so it
-// must fall through to heliosv1.UnimplementedHeliosServer's own
-// codes.Unimplemented answer until F-7 implements it for real. Scan's
-// own half of this test was here until F-6 implemented it -- see the
-// Scan tests below instead.
-func TestWatchIsUnimplemented(t *testing.T) {
+// fakeWatchStream implements heliosv1.Helios_WatchServer (a
+// grpc.ServerStreamingServer[WatchResponse]) directly -- the identical
+// "direct method call, not a real gRPC connection" testing convention
+// every other test in this file already uses for Get/Put/Delete/Scan.
+// Only Context() and Send() are ever actually exercised by
+// Server.Watch's own implementation; the rest of grpc.ServerStream's
+// interface is satisfied with no-ops purely to compile.
+type fakeWatchStream struct {
+	ctx context.Context
+
+	mu  sync.Mutex
+	got []*heliosv1.WatchResponse
+}
+
+func (f *fakeWatchStream) Send(resp *heliosv1.WatchResponse) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.got = append(f.got, resp)
+	return nil
+}
+func (f *fakeWatchStream) Context() context.Context   { return f.ctx }
+func (f *fakeWatchStream) SetHeader(metadata.MD) error  { return nil }
+func (f *fakeWatchStream) SendHeader(metadata.MD) error { return nil }
+func (f *fakeWatchStream) SetTrailer(metadata.MD)       {}
+func (f *fakeWatchStream) SendMsg(m interface{}) error  { return nil }
+func (f *fakeWatchStream) RecvMsg(m interface{}) error  { return nil }
+
+func (f *fakeWatchStream) events() []*heliosv1.WatchEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var all []*heliosv1.WatchEvent
+	for _, r := range f.got {
+		all = append(all, r.GetEvents()...)
+	}
+	return all
+}
+
+// TestWatchStreamsOnlyMatchingPrefixLive proves the actual point of
+// this task at the RPC boundary: a live Watch delivers a Put matching
+// its own KeyPrefix and does NOT deliver one that doesn't, with the
+// correct Type/Key/Value on the wire.
+func TestWatchStreamsOnlyMatchingPrefixLive(t *testing.T) {
 	dir := t.TempDir()
 	n := newTestNode(t, dir)
 	n.Start()
 	s := newTestServer(t, dir, n)
 	waitForLeader(t, s, 3*time.Second)
 
-	err := s.Watch(&heliosv1.WatchRequest{}, nil)
-	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unimplemented {
-		t.Errorf("Watch: err = %v, want codes.Unimplemented", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fs := &fakeWatchStream{ctx: ctx}
+
+	watchDone := make(chan error, 1)
+	go func() {
+		watchDone <- s.Watch(&heliosv1.WatchRequest{KeyPrefix: []byte("user/")}, fs)
+	}()
+
+	// A short, generous pause for the goroutine above to actually reach
+	// Machine.Watch's own subscribe call before either Put below runs
+	// -- Watch(0) is live-only, no replay, so a write that lands before
+	// subscription completes would never be seen at all. The same
+	// bounded-sleep-before-a-background-goroutine pattern
+	// integration_test.go's own snapshot tests already use.
+	time.Sleep(150 * time.Millisecond)
+
+	if _, err := s.Put(context.Background(), &heliosv1.PutRequest{Key: []byte("user/1"), Value: []byte("alice")}); err != nil {
+		t.Fatalf("Put(user/1): %v", err)
+	}
+	if _, err := s.Put(context.Background(), &heliosv1.PutRequest{Key: []byte("other/1"), Value: []byte("nope")}); err != nil {
+		t.Fatalf("Put(other/1): %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for len(fs.events()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-watchDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Watch did not return after its own context was canceled")
+	}
+
+	events := fs.events()
+	if len(events) != 1 {
+		t.Fatalf("got %d event(s), want exactly 1 (only the \"user/\"-prefixed Put)", len(events))
+	}
+	if string(events[0].GetKey()) != "user/1" || string(events[0].GetValue()) != "alice" {
+		t.Errorf("event = (%q, %q), want (\"user/1\", \"alice\")", events[0].GetKey(), events[0].GetValue())
+	}
+	if events[0].GetType() != heliosv1.WatchEvent_PUT {
+		t.Errorf("event.Type = %v, want PUT", events[0].GetType())
+	}
+	if events[0].GetRevision() <= 0 {
+		t.Errorf("event.Revision = %d, want > 0", events[0].GetRevision())
+	}
+}
+
+// TestWatchReportsOutOfRangeForAnEvictedStartRevision is
+// Machine.Watch's own ok=false path (internal/kvstore/watch_test.go's
+// TestWatchReportsGapWhenStartRevisionHasBeenEvicted), checked at the
+// RPC boundary: it must surface as codes.OutOfRange, not a generic
+// error or a silently-degraded watch.
+func TestWatchReportsOutOfRangeForAnEvictedStartRevision(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+
+	cache := sstable.NewBlockCache(1 << 20)
+	opts := kvstore.DefaultOptions
+	opts.WatchHistoryCapacity = 5
+	m, err := kvstore.NewMachine(n, filepath.Join(dir, "kv"), cache, opts)
+	if err != nil {
+		t.Fatalf("NewMachine: %v", err)
+	}
+	t.Cleanup(func() { m.Close() })
+	s := New(n, m)
+	waitForLeader(t, s, 3*time.Second)
+
+	for i := 0; i < 20; i++ {
+		key := []byte{byte('a' + i)}
+		if _, err := s.Put(context.Background(), &heliosv1.PutRequest{Key: key, Value: []byte("v")}); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	fs := &fakeWatchStream{ctx: context.Background()}
+	err = s.Watch(&heliosv1.WatchRequest{StartRevision: 1}, fs)
+	if err == nil {
+		t.Fatal("Watch(start_revision=1): err = nil, want codes.OutOfRange")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.OutOfRange {
+		t.Errorf("Watch(start_revision=1): err = %v, want codes.OutOfRange", err)
 	}
 }
 

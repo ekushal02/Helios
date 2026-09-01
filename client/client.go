@@ -22,16 +22,16 @@
 // types stay an internal implementation detail of this package, never
 // part of its public surface.
 //
-// Watch has no client method yet -- F-7's job, matching the identical
-// scope fence internal/server.Server still applies on the server side
-// for that one RPC (embedding UnimplementedHeliosServer rather than
-// stubbing it out). Scan gained one as of F-6.
+// Watch gained a client method as of F-7 -- see that method's own doc
+// for why it is NOT wrapped in do's retry loop the way every other
+// method here is.
 package client
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"sort"
 	"sync"
@@ -432,6 +432,159 @@ func (c *Client) ScanAll(ctx context.Context, startKey, endKey []byte, limit int
 		}
 		pageToken = next
 	}
+}
+
+// WatchEventType mirrors heliosv1.WatchEvent_Type, kept as this
+// package's own type for the same reason KeyValue is -- the generated
+// protobuf types stay an internal detail, never part of this package's
+// public surface (package doc).
+type WatchEventType int
+
+const (
+	WatchPut WatchEventType = iota + 1
+	WatchDelete
+)
+
+// WatchEvent mirrors kvstore.WatchEvent one layer up -- the same
+// pattern KeyValue already follows for Scan's own results.
+type WatchEvent struct {
+	Type     WatchEventType
+	Key      []byte
+	Value    []byte
+	Revision int64
+}
+
+// Watch streams every Put/Delete whose key has keyPrefix, starting
+// from startRevision (0 = live only, matching WatchRequest's own
+// documented zero value). Returns a channel of events and a channel
+// that receives exactly one error (or is closed with none) when the
+// watch ends -- by ctx being canceled, by the server closing the
+// stream, or by a real failure. The events channel is always closed
+// once Watch is done sending to it, whatever the reason.
+//
+// UNLIKE Get/Put/Delete/Scan, WATCH IS NOT WRAPPED IN do'S RETRY LOOP
+// -- A DELIBERATE, NAMED SCOPE BOUNDARY, NOT AN OVERSIGHT. do's own
+// retry-with-backoff design (§17.3) fits a single request/response
+// call: a failed attempt is simply retried, since nothing about a
+// unary call has state that could be lost. A long-lived stream is
+// different -- if it dies partway through and this method silently
+// reconnected, the reconnection would need its own gap-detection story
+// (did the disconnect happen between two events? was anything missed
+// during the gap before the new stream's own replay could start
+// covering it again?) that this method does not attempt to solve.
+// What Watch DOES do: follow a single NotLeader redirect before the
+// stream is established (mirroring do's own hint-following branch,
+// §17.3), since that failure mode is well-understood and cheap to
+// handle correctly. Once the stream is running, any failure --
+// including a NotLeader that shows up mid-stream, which should not
+// happen against a stable leader but is not assumed impossible -- ends
+// the watch and is reported on the error channel, for the caller to
+// decide how to resume (typically: Scan to resync, then call Watch
+// again with a current revision).
+func (c *Client) Watch(ctx context.Context, keyPrefix []byte, startRevision int64) (<-chan WatchEvent, <-chan error) {
+	events := make(chan WatchEvent, defaultWatchClientBufferSize)
+	errs := make(chan error, 1)
+
+	deliver := func(resp *heliosv1.WatchResponse) error {
+		for _, we := range resp.GetEvents() {
+			select {
+			case events <- fromWireWatchEvent(we):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+
+	go func() {
+		defer close(events)
+		defer close(errs)
+
+		peer := int(c.leaderGuess.Load())
+		req := &heliosv1.WatchRequest{KeyPrefix: keyPrefix, StartRevision: startRevision}
+
+		for attempt := 0; attempt < 2; attempt++ { // at most one redirect before the stream starts
+			cli, err := c.clientFor(peer)
+			if err != nil {
+				errs <- err
+				return
+			}
+
+			stream, err := cli.Watch(ctx, req)
+			if err != nil {
+				// Opening a server-streaming call almost never fails
+				// here on its own -- this only establishes the
+				// underlying transport. The server's own application-
+				// level outcome, including a NotLeaderDetail, surfaces
+				// on the first Recv below, not at this call.
+				errs <- err
+				return
+			}
+
+			// The first Recv is where a NotLeader response actually
+			// shows up for a streaming call -- checked here,
+			// specifically, rather than at the point the stream was
+			// opened above.
+			resp, err := stream.Recv()
+			if err != nil {
+				if attempt == 0 {
+					if st, isStatus := status.FromError(err); isStatus && st.Code() == codes.Unavailable {
+						if hintID, ok := notLeaderHint(st); ok {
+							if _, known := c.peers[hintID]; known {
+								peer = hintID
+								c.leaderGuess.Store(int64(peer))
+								continue // one redirect, then try opening the stream again
+							}
+						}
+					}
+				}
+				if err != io.EOF {
+					errs <- err
+				}
+				return
+			}
+
+			c.leaderGuess.Store(int64(peer)) // a real response arrived -- this peer is (or was) the leader
+			if err := deliver(resp); err != nil {
+				errs <- err
+				return
+			}
+
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					if err != io.EOF {
+						errs <- err
+					}
+					return
+				}
+				if err := deliver(resp); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}
+	}()
+
+	return events, errs
+}
+
+// defaultWatchClientBufferSize is UNMEASURED, joining every other
+// "asserted, not yet chosen" constant this project tracks (DESIGN.md
+// §12). A buffered events channel means a burst of server-sent events
+// does not have to wait for the caller's own consumption pace one at a
+// time before Watch's own goroutine can call stream.Recv again.
+const defaultWatchClientBufferSize = 64
+
+func fromWireWatchEvent(we *heliosv1.WatchEvent) WatchEvent {
+	ev := WatchEvent{Key: we.GetKey(), Revision: we.GetRevision()}
+	if we.GetType() == heliosv1.WatchEvent_DELETE {
+		ev.Type = WatchDelete
+	} else {
+		ev.Type = WatchPut
+		ev.Value = we.GetValue()
+	}
+	return ev
 }
 
 // -----------------------------------------------------------------------

@@ -63,6 +63,19 @@ type Options struct {
 	// is the honest way to exercise that pipeline as it would actually
 	// run, not as a stripped-down demo of it.
 	Compression sstable.CompressionType
+
+	// WatchHistoryCapacity bounds how many recently-applied WatchEvents
+	// (F-7) this Machine retains for replaying a Watch that requests a
+	// past start_revision. UNMEASURED against a real workload, joining
+	// every other "asserted, not yet chosen" constant on DESIGN.md §12.
+	WatchHistoryCapacity int
+
+	// WatchSubscriberBufferSize is the buffered channel capacity given
+	// to every new Watch subscriber (F-7). A subscriber whose own
+	// buffer fills -- a watcher that cannot keep up -- is disconnected
+	// rather than allowed to block the apply path (watch.go's own doc
+	// on notify explains why). UNMEASURED, same as above.
+	WatchSubscriberBufferSize int
 }
 
 // DefaultOptions is what NewMachine uses for any field left at its zero
@@ -75,6 +88,8 @@ var DefaultOptions = Options{
 	CompactionInterval:         time.Second,
 	WALSyncPolicy:              wal.SyncAlways,
 	Compression:                sstable.CompressionFlate,
+	WatchHistoryCapacity:       1000,
+	WatchSubscriberBufferSize:  64,
 }
 
 func (o Options) withDefaults() Options {
@@ -86,6 +101,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.CompactionInterval <= 0 {
 		o.CompactionInterval = DefaultOptions.CompactionInterval
+	}
+	if o.WatchHistoryCapacity <= 0 {
+		o.WatchHistoryCapacity = DefaultOptions.WatchHistoryCapacity
+	}
+	if o.WatchSubscriberBufferSize <= 0 {
+		o.WatchSubscriberBufferSize = DefaultOptions.WatchSubscriberBufferSize
 	}
 	// WALSyncPolicy's zero value, SyncAlways (wal.SyncPolicy's own
 	// iota ordering, §13.1), is already the correct default -- no
@@ -147,6 +168,13 @@ type Machine struct {
 	// a real, named limitation, not an oversight (DESIGN.md §12).
 	dedup map[uint64]uint64
 
+	// watch is F-7's whole mechanism: recently-applied WatchEvents plus
+	// live fan-out to every currently-subscribed Watch RPC. See
+	// watch.go's own doc for the full design -- notably, why delivery
+	// to a subscriber must never block the apply path this field's own
+	// notify() call sits inside of.
+	watch *watchState
+
 	bg *compaction.Background
 
 	done chan struct{}
@@ -205,11 +233,22 @@ func NewMachine(n *raft.Node, dir string, cache *sstable.BlockCache, opts Option
 		sstReaders:   sstReaders,
 		appliedTerms: make(map[int]int),
 		dedup:        make(map[uint64]uint64),
+		watch:        newWatchState(opts.WatchHistoryCapacity, opts.WatchSubscriberBufferSize),
 		done:         make(chan struct{}),
 	}
 
 	machine.bg = compaction.StartBackground(manifestPath, dir,
 		compaction.Options{MaxFilesPerLevel: opts.CompactionMaxFilesPerLevel}, opts.CompactionInterval)
+
+	// F-7: this Machine's watch history starts knowing nothing above
+	// whatever snapshot floor n already had from a prior run -- see
+	// watchState.markFloor's own doc for why this specific call, at
+	// this specific moment (before replay/live traffic begins), is
+	// what keeps an early start_revision request from silently getting
+	// an incomplete replay on a freshly-restarted node.
+	if floor, _ := n.SnapshotFloor(); floor > 0 {
+		machine.watch.markFloor(floor)
+	}
 
 	go machine.run()
 
@@ -223,6 +262,15 @@ func (m *Machine) Close() error {
 	m.bg.Stop()
 	m.n.Stop()
 	<-m.done
+
+	// F-7: close every live watcher's channel BEFORE taking m.mu below
+	// -- watchState has its own, separate lock, so this does not need
+	// m.mu at all, and doing it before touching storage means a
+	// Server.Watch goroutine still ranging over its own channel sees
+	// closure (chOk == false, its own doc's clean-shutdown path)
+	// promptly, rather than only after Close has also torn down the
+	// WAL and every SSTable reader underneath it.
+	m.watch.closeAll()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -344,6 +392,30 @@ func (m *Machine) applyCommand(msg raft.ApplyMsg) {
 	}
 
 	m.recordApplied(msg.CommandIndex, msg.CommandTerm)
+
+	// F-7: every watcher subscribed to this Machine sees this write,
+	// non-blocking (watch.go's own notify doc explains why that
+	// matters here specifically -- this is the single, serial apply
+	// path). Revision is msg.CommandIndex directly, the exact index
+	// this write committed at -- not the AppliedIndex()-after-the-call
+	// approximation Get/Put/Delete/Scan's own responses carry, since
+	// this event is built here, inside the one place that already
+	// knows the exact index without needing to guess at it afterward.
+	//
+	// Key and Value are explicitly copied here, unlike their direct,
+	// uncopied use in m.writer.Put/Delete just above: dec.Key/dec.Value
+	// are subslices of msg.Command itself, safe to reference for the
+	// duration of this synchronous call, but a WatchEvent outlives it
+	// -- retained in the ring buffer until evicted, and read from a
+	// subscriber's channel on its own schedule, potentially long after
+	// this function returns and msg.Command's own backing array is no
+	// longer this function's to answer for.
+	m.watch.notify(WatchEvent{
+		Tombstone: dec.Tombstone,
+		Key:       append([]byte(nil), dec.Key...),
+		Value:     append([]byte(nil), dec.Value...),
+		Revision:  msg.CommandIndex,
+	})
 
 	if m.active.ApproxSize() >= m.opts.FlushThresholdBytes {
 		if err := m.freezeAndFlushLocked(); err != nil && m.fault == "" {

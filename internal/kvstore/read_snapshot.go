@@ -326,7 +326,13 @@ func (m *Machine) take() {
 			m.fault = fmt.Sprintf("Snapshot(%d) refused: %v", appliedIndex, err)
 		}
 		m.mu.Unlock()
+		return
 	}
+
+	// F-7: this node's own snapshot floor just advanced to
+	// appliedIndex -- watchState.markFloor's own doc explains why
+	// Watch's retained history needs to know that.
+	m.watch.markFloor(appliedIndex)
 }
 
 var errNothingAppliedYet = errors.New("kvstore: nothing applied yet")
@@ -451,4 +457,11 @@ func (m *Machine) installSnapshot(msg raft.ApplyMsg) {
 	// image itself now carries.
 	m.dedup = dedup
 	m.recordApplied(msg.SnapshotIndex, msg.SnapshotTerm)
+
+	// F-7: an installed snapshot advances this node's own floor to
+	// msg.SnapshotIndex exactly as surely as a self-taken one does
+	// (Machine.take's own identical call) -- watchState.markFloor's
+	// own doc explains why Watch's retained history needs to know
+	// that.
+	m.watch.markFloor(msg.SnapshotIndex)
 }
