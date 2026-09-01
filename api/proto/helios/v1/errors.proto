@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package helios.v1;
+
+option go_package = "github.com/ekushal02/helios/api/helios/v1;heliosv1";
+
+// NotLeaderDetail is what helios.proto's own service comment already
+// promised: "F-2 attaches leader-hint metadata to the gRPC status
+// (details) rather than a field on every response." Not an RPC request
+// or response -- attached to a codes.Unavailable status via
+// google.golang.org/grpc/status's WithDetails, so a client library
+// (F-3) can retrieve it programmatically (status.FromError, then
+// st.Details()) instead of parsing an error string. A separate file
+// from helios.proto, deliberately: this is additive tooling around the
+// error path, not a change to the RPC surface F-1 already froze.
+message NotLeaderDetail {
+  // The peer ID this node currently believes leads, or -1 if unknown
+  // (raft.None -- no election has completed yet, or this node's belief
+  // was just reset by stepping down or becoming a candidate).
+  //
+  // DELIBERATELY NOT AN ADDRESS. Resolving a peer ID to a dialable
+  // network address needs a cluster address book, which does not exist
+  // anywhere in this project yet -- internal/raft's own Transport has
+  // never had a real network implementation (see cmd/helios's own doc).
+  // That book belongs to whichever layer actually dials a peer, which
+  // is the client library, not this node -- F-3 ("Go client library:
+  // connect, discover the leader, retry with backoff on NotLeader") is
+  // exactly where it's designed to live, not guessed at here.
+  int64 leader_id = 1;
+}

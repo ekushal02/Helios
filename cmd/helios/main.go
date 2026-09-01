@@ -1,32 +1,44 @@
 // Command helios starts a single Helios node: a real raft.Node, backed
 // by real on-disk persistence, with the full storage engine (§13)
-// wired in as its state machine via internal/kvstore -- the first time
-// every piece built across this project runs together as one program,
-// not just as tests exercising it.
+// wired in as its state machine via internal/kvstore, and now (§16) a
+// real gRPC server in front of it -- the first time every piece built
+// across this project runs together as one program, not just as tests
+// exercising it.
 //
-// SINGLE-NODE ONLY, DELIBERATELY, NOT AS A LIMITATION OF THIS COMMAND
+// SINGLE-NODE RAFT, DELIBERATELY, NOT AS A LIMITATION OF THIS COMMAND
 // BUT OF THE PROJECT'S CURRENT SCOPE. Raft's own Transport interface
 // (internal/raft/rpc.go) has never had a real network implementation --
 // every multi-node test in package raft runs against an in-memory fake
-// transport built for testing, and a gRPC API, chaos testing, and
-// multi-node deployment are explicitly later phases this project has
-// not reached yet. A no-op Transport is therefore not a shortcut taken
-// here; it is the only transport that honestly exists to use, for a
-// cluster of one node that never has a peer to reach.
+// transport built for testing, and multi-node deployment and chaos
+// testing are explicitly later phases this project has not reached
+// yet. A no-op Transport is therefore not a shortcut taken here; it is
+// the only transport that honestly exists to use, for a cluster of one
+// node that never has a Raft peer to reach.
+//
+// THE GRPC SERVER IS REAL, EVEN THOUGH RAFT ITSELF IS STILL SINGLE-NODE.
+// internal/server's NotLeader handling and leader-hint plumbing do not
+// depend on multi-node Raft existing -- they depend only on Node's own
+// leadership state, which is real and correct on one node today (see
+// internal/raft/leaderhint_test.go's own pre-election-window test for
+// the case that actually exercises it on a single node).
 package main
 
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
 
+	heliosv1 "github.com/ekushal02/helios/api/helios/v1"
 	"github.com/ekushal02/helios/internal/kvstore"
 	"github.com/ekushal02/helios/internal/raft"
+	"github.com/ekushal02/helios/internal/server"
 	"github.com/ekushal02/helios/internal/storage/sstable"
+	"google.golang.org/grpc"
 )
 
 // noopTransport never sends anything. See the package doc for why this
@@ -50,9 +62,13 @@ func main() {
 	if len(os.Args) > 1 {
 		dataDir = os.Args[1]
 	}
+	grpcAddr := ":50051"
+	if len(os.Args) > 2 {
+		grpcAddr = os.Args[2]
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	fmt.Printf("HELIOS starting -- data directory: %s\n", dataDir)
+	fmt.Printf("HELIOS starting -- data directory: %s, gRPC address: %s\n", dataDir, grpcAddr)
 
 	raftDir := filepath.Join(dataDir, "raft")
 	kvDir := filepath.Join(dataDir, "kv")
@@ -84,18 +100,45 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("HELIOS ready (single-node). Ctrl+C to stop.")
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		logger.Error("listen for gRPC", "addr", grpcAddr, "err", err)
+		m.Close()
+		os.Exit(1)
+	}
 
-	// No client-facing API exists yet (gRPC is later roadmap work,
-	// per this package's own doc) -- this command demonstrates the
-	// full vertical wiring is real and correct, waiting for a shutdown
-	// signal rather than exercising Put/Delete/Get itself, which the
-	// tests in internal/kvstore already do thoroughly.
+	grpcServer := grpc.NewServer()
+	heliosv1.RegisterHeliosServer(grpcServer, server.New(n, m))
+
+	// Serve on its own goroutine -- Serve blocks until Stop/GracefulStop,
+	// which only happens from the shutdown-signal handling below, the
+	// same "one goroutine runs the thing, main blocks on a stop signal"
+	// shape n.Start()'s own background loops already use.
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- grpcServer.Serve(lis)
+	}()
+
+	fmt.Printf("HELIOS ready (single-node Raft, real gRPC on %s). Ctrl+C to stop.\n", grpcAddr)
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	select {
+	case <-stop:
+		fmt.Println("\nHELIOS stopping...")
+	case err := <-serveErr:
+		// The gRPC server exited on its own (a real bind/accept failure
+		// after startup, not the ordinary shutdown path) -- worth
+		// logging distinctly from an operator-requested stop, though
+		// the shutdown sequence below is identical either way.
+		logger.Error("gRPC server stopped unexpectedly", "err", err)
+	}
 
-	fmt.Println("\nHELIOS stopping...")
+	// GracefulStop before m.Close(): let in-flight RPCs finish against a
+	// still-open Machine rather than racing a request against Close()
+	// tearing down the storage engine underneath it.
+	grpcServer.GracefulStop()
+
 	if err := m.Close(); err != nil {
 		logger.Error("close state machine", "err", err)
 	}
