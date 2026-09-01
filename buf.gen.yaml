@@ -1,0 +1,13 @@
+version: v2
+inputs:
+  - directory: api/proto
+plugins:
+  # Local plugins (installed via `go install`), not buf.build remote
+  # plugins — no reason to add a network dependency on buf.build's plugin
+  # registry for a fully offline, from-scratch build.
+  - local: protoc-gen-go
+    out: api
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: api
+    opt: paths=source_relative

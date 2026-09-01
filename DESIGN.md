@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.23 — leader election, log replication, the apply path, linearizable
+**Status:** v1.24 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -28,9 +28,11 @@ which pays for only one of the two — ran 21.85× faster than live writes on th
 silently measuring the wrong thing, found from a real run's reads timing out rather
 than from review (§14.11). All findings correct on every value checked at every scale
 tested; all costing (or previously hiding the cost of) more than a well-scoped system
-should. No client-facing network API exists yet either — that, a
-background flush goroutine, and a handful of "asserted, not yet measured against a
-real workload" constants are what remain, tracked explicitly in §12 and §14.7.
+should. The client-facing gRPC wire contract is now defined — `Get`, `Put`, `Delete`,
+`Scan`, `Watch` (§15) — but nothing serves or calls it yet: no gRPC server, no client
+library, no leader-hint or idempotency handling. That, a background flush goroutine,
+and a handful of "asserted, not yet measured against a real workload" constants are
+what remain, tracked explicitly in §12, §14.7, and §15.5.
 
 ---
 
@@ -3370,7 +3372,107 @@ reshuffling of the physical bytes representing the same logical data is expected
 
 ---
 
-## 15. Revision log
+## 15. The gRPC API surface
+
+### 15.1 The wire contract, and why it's five RPCs and nothing more yet
+
+`api/proto/helios/v1/helios.proto` defines `helios.v1.Helios`: `Get`, `Put`,
+`Delete`, `Scan` (unary), and `Watch` (server-streaming). Generated Go lives at
+`api/helios/v1/` — deliberately **not** under `internal/`, the one place in this
+project's layout where that matters: every other package can afford to be
+unimportable from outside the module, but the client library a later task builds
+has to import these generated types from outside `internal/`'s boundary, so the
+public/internal line had to be drawn here before any server or client code
+existed to get it wrong. This section records the schema; nothing serves or calls
+it yet. `internal/kvstore.Machine` (§14) is untouched — this RPC layer will sit in
+front of it, not replace anything about how it works.
+
+### 15.2 Revision is Raft's own log index, not a new counter
+
+Every response that names a value also carries a `revision`. It is not a new
+piece of state: it is `commitIndex`/`lastApplied` (§6, §8) — already the
+authoritative answer to "when did this write become durable and visible" —
+exposed at the API boundary under a client-facing name. A second, independently
+maintained MVCC version counter was the alternative not taken, for the same
+reason §14.2's memtable-swap fix reused the apply path instead of adding a
+parallel one: two mechanisms claiming to answer the same question is two things
+that can disagree, and Raft's log index was already correct and already tested
+before this task started.
+
+### 15.3 Consistency is a per-request field, mapped onto reads already built and measured
+
+`GetRequest` and `ScanRequest` each carry a `Consistency` enum —
+`CONSISTENCY_LINEARIZABLE` or `CONSISTENCY_STALE` — rather than a connection- or
+cluster-wide mode. This is not a new read path; it is a selector over the two
+that §9 already implements and measured: the committed-index barrier read and the
+lease read bounded by a documented clock-skew assumption. `CONSISTENCY_UNSPECIFIED`
+(proto3's required zero value) resolves to linearizable once a server exists to
+resolve it (§15.5) — the unset case defaults to the expensive, safe path rather
+than the cheap one, so a client that forgets to set the field gets correctness,
+not a silent staleness bug. A cluster-wide setting was rejected because it would
+force every caller sharing one client connection to accept the same tradeoff; a
+dashboard reader and a read-your-writes caller have no reason to.
+
+### 15.4 Scan is unary with an opaque continuation token, not a stream
+
+`ScanRequest` takes `start_key` (inclusive), `end_key` (exclusive), `limit`, and
+`page_token`; `ScanResponse` returns a page of `KeyValue` plus `next_page_token`,
+empty when the scan is exhausted. This task only commits to that shape — the
+token's actual encoding is unimplemented, an explicit scope fence for a later
+task ("Scan with pagination over the sorted key space") rather than a guess made
+now and possibly thrown away. Server-streaming was the alternative, rejected
+because a client-driven token gives the client control over page timing and a
+clean, idempotent retry point for a single dropped page; a stream that dies
+mid-scan has no such point without inventing the same token concept anyway, just
+later and under worse conditions.
+
+### 15.5 Watch: one prefix per stream, explicitly not etcd's multiplexed protocol
+
+`WatchRequest` takes a `key_prefix` and a `start_revision` — zero means "start
+from now," non-zero means replay committed changes from that revision forward
+before switching to live delivery, which is what lets a reconnecting client
+resume a watch without a gap. Cancellation is closing the stream; there is no
+explicit create/cancel message. `WatchEvent`s arrive batched inside
+`WatchResponse` rather than one per frame, the same amortization argument
+already measured for AppendEntries coalescing (§10, replication). etcd's own
+watch protocol multiplexes many watches over one bidirectional stream with
+explicit watch IDs — a real design, deliberately not this one. That protocol
+earns its cost at a scale of concurrent watches per connection this project has
+never named as a target (it is not one of the measured numbers in §1's own
+goals), and it is a second protocol surface that would need proving correct
+under the fault injection this project has not yet reached (Phase G). Revisit if
+a later phase's benchmark plan actually calls for it — not before.
+
+### 15.6 What this task deliberately leaves for later tasks, not forgotten
+
+**Idempotency.** No `client_id` or `sequence_number` field exists yet on `Put` or
+`Delete`. Adding one later is a non-breaking, additive wire change, and this
+project's own open-questions list (§12, "Duplicate commands") already names the
+dedup-table design as unsettled — guessing its shape here, before that task
+specs it, would mean redoing it. **The `NotLeader` error.** Not a field on any
+response message. It will be carried as gRPC status detail metadata once a
+server exists (the next task), which keeps every success-path message free of a
+field that only means something on failure, and applies uniformly across all
+five RPCs instead of five separately-invented `leader_hint` fields.
+**`DeleteResponse`'s missing previous value.** It returns `found` (a bool,
+mirroring `GetResponse.found`'s comma-ok shape) but not the value that was
+deleted. etcd's `DeleteRange` supports this as an optional `prev_kv`; deferred
+here the same way, as a same-shape additive field, until a real caller's
+ergonomics actually need it.
+
+**Implemented** at `api/proto/helios/v1/helios.proto` (schema) and generated
+into `api/helios/v1/` via `buf` (config: `buf.yaml`, `buf.gen.yaml`) driving
+local `protoc-gen-go` and `protoc-gen-go-grpc` — not `buf.build`'s remote
+plugins, so generation has no dependency on network access beyond the two
+`go install`s. Tested at `api/helios/v1/smoke_test.go`, hand-written and never
+touched by regeneration: a marshal/unmarshal round trip for every message,
+`GetResponse`'s zero value read as absent-not-empty, `Consistency`'s zero value
+read as unspecified-not-a-real-choice, and a compile-time check
+(`var _ HeliosServer = (*fakeServer)(nil)`) that `Watch` generated as
+server-streaming rather than silently becoming unary if the `.proto`'s `stream`
+keyword were ever dropped in a future edit.
+
+## 16. Revision log
 
 
 | Version | Change |
@@ -3401,3 +3503,4 @@ reshuffling of the physical bytes representing the same logical data is expected
 | v1.21 | A second real finding from §14.8's full-system test, surfaced by its actual first attempt at real scale (new §14.10): every applied write pays for two separate, sequential, lock-held fsyncs, not the one the test's original design accounted for -- raft.Node.Submit's own appendChecked holds n.mu through persistIfDirty's synchronous fsync (a pre-existing, already-documented open question, now confirmed at real-system scale rather than only in isolation), and Machine.applyCommand separately holds its own Machine.mu through the storage engine's own WAL fsync. Confirmed via the go test timeout's own goroutine dump, not assumed: dozens of writer goroutines queued on two ordinary mutexes with climbing (not frozen) indices -- the signature of contention behind one serialized bottleneck, not a deadlock. A connected design mistake corrected before the test shipped its second version: the original 64-goroutine writer pool assumed concurrent Submit calls would pipeline real throughput, which is false here -- Submit is not cheap to call concurrently, since appendChecked holds n.mu for its own fsync before returning. Measured directly: 8 writers and 64 writers reached materially identical throughput (409 vs 405 puts/sec), so the pool was reduced to 8 -- legibility on a future timeout's dump, not a throughput fix, since none is available without touching Raft's own persistIfDirty. HELIOS_FULLSYSTEM_KEYS added to the test as a direct result: an environment-variable override letting a real throughput number be measured, on whatever machine the full run will happen on, at a scale that finishes in minutes, before committing hours to the full one. Two new open questions recorded in §12: persistIfDirty's cost confirmed at full-system scale (connected to the pre-existing entry on it), and a further one connecting this finding to v1.20's own restart-replay finding -- fixing both together could plausibly remove one of the two fsync boundaries entirely, rather than only batching each independently; neither attempted under the time pressure of the task that found the connection. |
 | v1.22 | A third real finding from getting §14.8's full-system test to run cleanly (new §14.11): the test's own restart measurement was wrong, not just the system it measures. NewMachine starts the apply loop with go machine.run() and returns immediately, so the first version's restartDuration only ever captured the fast synchronous half of a restart (compaction.Recover, WAL replay) while the slow half -- the apply loop's full catch-up through everything §14.9 says Raft redelivers -- ran invisibly, overlapping with the test's own post-restart verification. Surfaced by a real 20,000-key run failing, not by review: 144 of the first GetLeaseRead calls timed out waiting for their own read barrier, because the apply loop was still minutes behind and the 5-second default read timeout was nowhere near enough to wait it out. Every one of those reads was correctly refusing to answer from state that hadn't caught up -- confirmed to be a timing bug in the test's own phase ordering, not a correctness bug in Machine. Fixed by capturing AppliedIndex() before closing the first Machine and polling the second one until it reaches that value, budgeted at 3x the same run's own measured write-plus-delete duration, before verification is allowed to start. Confirmed working at 20,000 keys: a clean pass, with the real restart cost now correctly reported (setup 316ms, full catch-up 1m15s). Also confirmed at this run: reducing the write-phase worker pool from 64 to 8 (§14.10) was not merely neutral as reasoned -- measured directly, it achieved 77.19 puts/sec against the original 64-writer run's own extrapolated 26.34 ops/sec, nearly 3x faster, since fewer goroutines meant less real contention overhead on top of removing a throughput benefit that was never actually there. Extrapolating this run's real rates to the full one-million-key scale revised the total time estimate down substantially, from the earlier 10-15 hour guidance (based on write-phase extrapolation alone, before the restart phase was being measured at all) to roughly 4h40m (write ~3h36m, delete ~3m, restart catch-up ~1h3m) -- pending confirmation from the actual full run, not yet executed. §14.8's own results table remains pending that run. |
 | v1.23 | §14.8's full-system test completed for real, at 300,000 keys rather than the originally-planned one million (new §14.12): a first attempt at the full one million was run, watched, and deliberately killed after roughly 19 hours -- confirmed to be doing genuine work the whole time (real syscalls, a coherent manifest, growing on-disk state, ~23% average CPU utilization consistent with disk-I/O-bound waiting, not a hang), killed anyway because the trajectory made clear it would take multiple more days. That attempt directly surfaced a real gap in the test's own instrumentation, fixed as a result: t.Logf output only flushes when a test completes, so a killed 19-hour run had produced nothing quotable regardless of real progress made. fullSystemProgress added: a periodic, unbuffered fmt.Fprintf reporter mirrored to a fixed external log path, immediately validated by a fresh, watched 300,000-key run that completed cleanly in 4h33m, correct on every key before and after restart. Two further findings from that completed run: the write rate's mid-run appearance of stabilizing (an interval-to-interval read taken around the 40-46 minute mark) was corrected against the full curve, which showed continuous decay to completion rather than a genuine plateau -- recorded as a correction, not smoothed over. And restart's own catch-up (which never calls Submit and so never pays for persistIfDirty's fsync) ran 303,000 entries at 426.96/s, 21.85x faster than the write phase's own final rate of 19.54/s on the same data -- the most precise confirmation yet of §14.10's two-stacked-fsync diagnosis, though explicitly not claimed as definitive proof, since replay also skips client-side scheduling overhead the write phase's own worker pool carries. §14.8's results table filled in with real numbers throughout. |
+| v1.24 | The gRPC wire contract defined (new §15), the first task of Phase F: `helios.v1.Helios` -- `Get`, `Put`, `Delete`, `Scan` (unary), `Watch` (server-streaming) -- in `api/proto/helios/v1/helios.proto`, generated into public `api/helios/v1/` via `buf` driving local `protoc-gen-go`/`protoc-gen-go-grpc`. Schema only; no server or client exists yet. Every response's `revision` field is Raft's own commitIndex/lastApplied (§6, §8) exposed at the boundary, not a second counter. `Consistency` (`LINEARIZABLE`/`STALE`) is a per-request field on `Get`/`Scan` selecting between the two read paths §9 already implements and measured, defaulting to linearizable when unset. `Scan` is unary plus an opaque continuation token rather than a stream, committing only to the shape -- the token's real encoding is explicit deferred scope for a later task. `Watch` is single-prefix server-streaming, deliberately not etcd's multiplexed bidirectional protocol, which was rejected as unjustified complexity against this project's own stated goals and benchmark plan (§1). Idempotency fields and the `NotLeader` error's wire shape are named as deferred, not designed here, matching §12's own "Duplicate commands" open question. Tested at `api/helios/v1/smoke_test.go`: a marshal/unmarshal round trip per message, the zero-value contracts for `GetResponse.found` and `Consistency`, and a compile-time check that `Watch` generated as streaming rather than unary. |

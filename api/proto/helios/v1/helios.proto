@@ -1,0 +1,183 @@
+syntax = "proto3";
+
+// package helios.v1 — the "v1" is load-bearing, not decorative: it's how we
+// version the wire contract independently of the Go module. A breaking change
+// to a request/response shape means a new "v1" -> "v2" package, not an edit
+// in place, so old clients talking to a rolling-upgraded cluster don't
+// silently misparse frames mid-deploy.
+package helios.v1;
+
+// paths=source_relative (see buf.gen.yaml) means this generates into
+// api/helios/v1/, mirroring api/proto/helios/v1/ exactly. The Go package
+// alias is "heliosv1" so callers write heliosv1.NewHeliosClient(...) rather
+// than the awkward v1.NewHeliosClient.
+option go_package = "github.com/ekushal02/helios/api/helios/v1;heliosv1";
+
+// Consistency selects the read guarantee for a Get or Scan.
+//
+// The Raft layer already implements two read strategies (Phase C):
+// a committed-index barrier read and a lease read bounded by a measured
+// clock-skew assumption. This enum is what lets a client choose between
+// them instead of the server silently picking one. CONSISTENCY_UNSPECIFIED
+// resolves to CONSISTENCY_LINEARIZABLE server-side — the safe default is
+// the expensive one, not the fast one, so a client that forgets to set this
+// field gets correctness, not a surprise staleness bug.
+enum Consistency {
+  CONSISTENCY_UNSPECIFIED = 0;
+  // Linearizable: goes through the read-index/lease-read path. Every reader
+  // sees every write that completed before the read started.
+  CONSISTENCY_LINEARIZABLE = 1;
+  // Stale: served from local state without a leader round trip. May not
+  // reflect the most recent committed writes. Useful for read-heavy,
+  // staleness-tolerant workloads (dashboards, metrics scraping).
+  CONSISTENCY_STALE = 2;
+}
+
+// Every KV response carries a "revision": the Raft log index at which that
+// value was committed. It's a free, already-existing monotonic counter —
+// we're not inventing a new versioning scheme, just exposing commitIndex/
+// lastApplied (concepts already load-bearing inside internal/raft) at the
+// API boundary. This is what a client-side watcher or a future MVCC layer
+// would key off of.
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+  int64 revision = 3;
+}
+
+// ---- Get ------------------------------------------------------------------
+
+message GetRequest {
+  bytes key = 1;
+  Consistency consistency = 2;
+}
+
+message GetResponse {
+  bytes value = 1;
+  // Proto3 can't distinguish "empty value" from "field not set", so a
+  // missing key needs its own signal. `found` is that signal — check it
+  // before trusting `value`, the same way a Go map's comma-ok idiom works.
+  bool found = 2;
+  // 0 when found == false. Otherwise the revision this value was written at.
+  int64 revision = 3;
+}
+
+// ---- Put --------------------------------------------------------------
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  // TODO(F-4): client_id + sequence_number land here for idempotent
+  // retries. Left out now — F-1 only defines the RPC shape, and adding a
+  // field later is non-breaking, so there's no reason to guess at the
+  // dedup design before that task actually specs it.
+}
+
+message PutResponse {
+  // The revision the write committed at. Lets a client that wants
+  // read-your-writes pass this straight back in a later GetRequest's
+  // consistency handling, without us needing a separate "read your own
+  // write" mode.
+  int64 revision = 1;
+}
+
+// ---- Delete -----------------------------------------------------------
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {
+  // Whether the key existed immediately before this delete. Mirrors
+  // GetResponse.found so callers reuse the same mental model instead of
+  // inferring existence from a zero revision.
+  bool found = 1;
+  int64 revision = 2;
+}
+
+// ---- Scan -------------------------------------------------------------
+//
+// Scan is unary + a continuation token, not server-streaming. F-6
+// ("Scan with pagination over the sorted key space") is the task that
+// actually implements the pagination behavior server-side — this task
+// only has to commit to the *shape*, and unary-with-token is the shape
+// that supports both "give me everything, driven by the client" and
+// "give me a bounded page for a UI list" without two separate RPCs.
+
+message ScanRequest {
+  // Inclusive lower bound. Empty means "from the beginning of the keyspace".
+  bytes start_key = 1;
+  // Exclusive upper bound. Empty means "no upper bound".
+  bytes end_key = 2;
+  // Max pairs to return in this response. 0 lets the server pick a default
+  // page size rather than the client guessing one.
+  int32 limit = 3;
+  // Opaque — set from the previous ScanResponse.next_page_token to
+  // continue. Clients must not construct or parse this token themselves;
+  // its internal encoding is a server implementation detail (F-6) that can
+  // change without breaking this schema.
+  bytes page_token = 4;
+  Consistency consistency = 5;
+}
+
+message ScanResponse {
+  repeated KeyValue pairs = 1;
+  // Empty when the scan is exhausted; non-empty means "call again with
+  // this as page_token for the next page".
+  bytes next_page_token = 2;
+}
+
+// ---- Watch --------------------------------------------------------------
+//
+// One prefix per Watch call; cancel by closing the stream. etcd's watch
+// protocol multiplexes many watches over one bidirectional stream with
+// explicit create/cancel messages — that earns its complexity at etcd's
+// scale of concurrent watches per connection. Nothing here targets that
+// scale (it's not in the benchmark plan in DESIGN.md), so a plain
+// server-streaming RPC is the honest choice, not a shortcut: one fewer
+// protocol layer to prove correct under the Phase G fault injection.
+
+message WatchRequest {
+  bytes key_prefix = 1;
+  // 0 means "start watching from now". A non-zero value replays committed
+  // changes from that revision forward before switching to live delivery —
+  // this is what lets a client resume a watch after a reconnect without
+  // missing writes that happened during the gap.
+  int64 start_revision = 2;
+}
+
+message WatchEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    PUT = 1;
+    DELETE = 2;
+  }
+  Type type = 1;
+  bytes key = 2;
+  // Empty for DELETE events.
+  bytes value = 3;
+  int64 revision = 4;
+}
+
+message WatchResponse {
+  // Batched rather than one event per message: under bursty writes this
+  // cuts stream frames roughly in proportion to batch size, the same
+  // amortization argument already measured for AppendEntries coalescing
+  // in the Raft layer (DESIGN.md, replication coalescing).
+  repeated WatchEvent events = 1;
+}
+
+// ---- Service ------------------------------------------------------------
+//
+// NotLeader errors are NOT modeled as a message here. F-2 attaches leader-hint
+// metadata to the gRPC status (google.golang.org/grpc/status details) rather
+// than a field on every response — that keeps the success-path messages above
+// free of a field that's only meaningful on failure, and every RPC gets the
+// behavior uniformly instead of five separate ad hoc "leader_hint" fields.
+service Helios {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+}
