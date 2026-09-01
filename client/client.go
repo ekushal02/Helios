@@ -14,17 +14,18 @@
 // same "same shape one layer up" pattern this project has used at every
 // boundary since codec.go first framed a Command the same way the WAL and
 // SSTable already framed their own payloads. Get/GetStale/Put/Delete
-// return plain Go values (value, ok, revision, err), the identical shape
-// Machine.Get/GetLeaseRead/Put/Delete already have -- a caller who has
-// used Machine directly (every existing test in internal/kvstore) already
-// knows this API. The generated protobuf types stay an internal
-// implementation detail of this package, never part of its public
-// surface.
+// return plain Go values (value, ok, revision, err); Scan/ScanStale
+// return ([]KeyValue, nextPageToken, err) -- the identical shapes
+// Machine.Get/GetLeaseRead/Put/Delete/Scan/ScanLeaseRead already have --
+// a caller who has used Machine directly (every existing test in
+// internal/kvstore) already knows this API. The generated protobuf
+// types stay an internal implementation detail of this package, never
+// part of its public surface.
 //
-// Scan and Watch have no client methods yet -- F-6 and F-7's jobs,
-// matching the identical scope fence internal/server.Server already
-// applies on the server side (embedding UnimplementedHeliosServer rather
-// than stubbing either RPC out).
+// Watch has no client method yet -- F-7's job, matching the identical
+// scope fence internal/server.Server still applies on the server side
+// for that one RPC (embedding UnimplementedHeliosServer rather than
+// stubbing it out). Scan gained one as of F-6.
 package client
 
 import (
@@ -348,6 +349,89 @@ func (c *Client) Delete(ctx context.Context, key []byte) (revision int64, err er
 		return 0, err
 	}
 	return resp.GetRevision(), nil
+}
+
+// KeyValue is one entry returned by Scan/ScanStale/ScanAll -- the plain
+// Go shape mirroring kvstore.KeyValue one layer up (see the package
+// doc's own "same shape one layer up" note), not the generated
+// heliosv1.KeyValue this package keeps as an internal detail.
+type KeyValue struct {
+	Key      []byte
+	Value    []byte
+	Revision int64
+}
+
+// Scan is the network-facing mirror of Machine.Scan (F-6): one page of
+// up to limit pairs over [startKey, endKey), CONSISTENCY_LINEARIZABLE.
+// endKey == nil means no upper bound. limit <= 0 lets the server choose
+// its own default (Server.Scan's own defaultScanLimit). pageToken,
+// when non-nil, is a previous call's own nextPageToken -- pass nil for
+// the first page. nextPageToken is nil when the range is exhausted.
+//
+// ONE PAGE PER CALL, DELIBERATELY, MATCHING THE WIRE CONTRACT'S OWN
+// DESIGN INTENT -- not auto-paginated internally. F-1's own proto doc
+// named two distinct use cases for Scan: "give me everything, driven
+// by the client" and "give me a bounded page for a UI list." A single-
+// page method serves both -- a caller building a UI list calls it once
+// per page it actually wants to render; a caller wanting everything
+// loops, or calls ScanAll below, which does exactly that loop. Folding
+// looping into Scan itself would take the second use case away from
+// nobody, but would take the first away from every caller who cannot
+// return partial results.
+func (c *Client) Scan(ctx context.Context, startKey, endKey []byte, limit int, pageToken []byte) (pairs []KeyValue, nextPageToken []byte, err error) {
+	return c.scan(ctx, startKey, endKey, limit, pageToken, heliosv1.Consistency_CONSISTENCY_LINEARIZABLE)
+}
+
+// ScanStale is Scan with CONSISTENCY_STALE -- the identical relationship
+// GetStale has to Get, carrying the identical caveat (client.go's own
+// GetStale doc): still served by the still-leader-only GetLeaseRead
+// today, not a true follower-servable stale read.
+func (c *Client) ScanStale(ctx context.Context, startKey, endKey []byte, limit int, pageToken []byte) (pairs []KeyValue, nextPageToken []byte, err error) {
+	return c.scan(ctx, startKey, endKey, limit, pageToken, heliosv1.Consistency_CONSISTENCY_STALE)
+}
+
+func (c *Client) scan(ctx context.Context, startKey, endKey []byte, limit int, pageToken []byte, consistency heliosv1.Consistency) (pairs []KeyValue, nextPageToken []byte, err error) {
+	req := &heliosv1.ScanRequest{
+		StartKey:    startKey,
+		EndKey:      endKey,
+		Limit:       int32(limit),
+		PageToken:   pageToken,
+		Consistency: consistency,
+	}
+	resp, err := do[heliosv1.ScanRequest, heliosv1.ScanResponse](ctx, c, req, heliosv1.HeliosClient.Scan)
+	if err != nil {
+		return nil, nil, err
+	}
+	wire := resp.GetPairs()
+	pairs = make([]KeyValue, len(wire))
+	for i, kv := range wire {
+		pairs[i] = KeyValue{Key: kv.GetKey(), Value: kv.GetValue(), Revision: kv.GetRevision()}
+	}
+	return pairs, resp.GetNextPageToken(), nil
+}
+
+// ScanAll is the "give me everything" use case Scan's own doc names --
+// a convenience loop calling Scan repeatedly, feeding each page's
+// nextPageToken into the next call, until the range is exhausted.
+// Aggregates every page into one slice, so it is only appropriate for a
+// range small enough to hold in memory at once; a caller scanning a
+// genuinely large range should call Scan directly and process each
+// page as it arrives instead. limit here controls the page size used
+// internally, not a cap on the total returned.
+func (c *Client) ScanAll(ctx context.Context, startKey, endKey []byte, limit int) ([]KeyValue, error) {
+	var all []KeyValue
+	var pageToken []byte
+	for {
+		pairs, next, err := c.Scan(ctx, startKey, endKey, limit, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, pairs...)
+		if len(next) == 0 {
+			return all, nil
+		}
+		pageToken = next
+	}
 }
 
 // -----------------------------------------------------------------------

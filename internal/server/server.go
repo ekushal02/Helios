@@ -5,12 +5,13 @@
 //
 // This is a translation layer and nothing more: it does not reimplement
 // any read or write logic. Every RPC calls straight through to an
-// existing Machine method (Get, GetLeaseRead, Put, Delete -- all built
-// and tested in Phase H) and translates the Go return values into wire
-// types and gRPC status codes. Scan and Watch are Phase F-6 and F-7's
-// jobs; embedding heliosv1.UnimplementedHeliosServer means those two
-// RPCs correctly answer codes.Unimplemented until then, without this
-// package needing a stub of its own for either.
+// existing Machine method (Get, GetLeaseRead, Put, Delete, Scan,
+// ScanLeaseRead -- all built and tested in Phase H and F-6) and
+// translates the Go return values into wire types and gRPC status
+// codes. Watch is Phase F-7's job; embedding
+// heliosv1.UnimplementedHeliosServer means that one RPC correctly
+// answers codes.Unimplemented until then, without this package needing
+// a stub of its own for it.
 package server
 
 import (
@@ -27,8 +28,8 @@ import (
 
 // Server implements heliosv1.HeliosServer.
 type Server struct {
-	// Scan and Watch (F-6, F-7) fall through to this until implemented
-	// here -- see the package doc.
+	// Watch (F-7) falls through to this until implemented here -- see
+	// the package doc. Scan no longer does, as of F-6.
 	heliosv1.UnimplementedHeliosServer
 
 	n *raft.Node
@@ -162,6 +163,72 @@ func (s *Server) Delete(ctx context.Context, req *heliosv1.DeleteRequest) (*heli
 	}
 	return &heliosv1.DeleteResponse{Found: false, Revision: int64(s.m.AppliedIndex())}, nil
 }
+
+// Scan serves ScanRequest's own pagination contract (F-1, §15.4; F-6
+// implements it): PageToken, when set, takes over as the effective
+// StartKey -- it IS the next page's own inclusive lower bound (see
+// kvstore.Machine.scanLocked's own doc for exactly why a plain
+// "continue from here" key, not an offset or an opaque cursor in the
+// usual sense, is what this storage engine's iterators can actually
+// support without a Seek method neither has). Limit <= 0 (including
+// the ScanRequest zero value) resolves to defaultScanLimit, mirroring
+// Machine.Scan's own identical default so the two layers never
+// disagree about what "unset" means. Consistency selects Machine.Scan
+// (linearizable) or Machine.ScanLeaseRead (lease) exactly the way Get
+// already does -- see Server.Get's own doc for the full argument,
+// unchanged here.
+//
+// Every KeyValue.Revision in the response is the SAME
+// AppliedIndex()-after-the-call approximation Get's Revision already
+// uses (Server.getResponse's own doc) -- one value for the whole page,
+// not tracked per key, the identical named gap.
+func (s *Server) Scan(ctx context.Context, req *heliosv1.ScanRequest) (*heliosv1.ScanResponse, error) {
+	limit := int(req.GetLimit())
+	if limit <= 0 {
+		limit = defaultScanLimit
+	}
+	startKey := req.GetStartKey()
+	if len(req.GetPageToken()) > 0 {
+		startKey = req.GetPageToken()
+	}
+
+	var (
+		pairs      []kvstore.KeyValue
+		nextCursor []byte
+		err        error
+	)
+	if req.GetConsistency() == heliosv1.Consistency_CONSISTENCY_STALE {
+		var leaseValid bool
+		pairs, nextCursor, leaseValid, err = s.m.ScanLeaseRead(startKey, req.GetEndKey(), limit)
+		if err == nil && !leaseValid {
+			// Identical reasoning to Server.Get's own STALE branch: this
+			// node might still be leader, just without a lease fresh
+			// enough to answer locally right now.
+			return nil, status.Error(codes.Unavailable,
+				"lease read unavailable right now; retry, or request CONSISTENCY_LINEARIZABLE")
+		}
+	} else {
+		pairs, nextCursor, err = s.m.Scan(startKey, req.GetEndKey(), limit)
+	}
+	if err != nil {
+		return nil, s.translateErr(err)
+	}
+
+	revision := int64(s.m.AppliedIndex())
+	wire := make([]*heliosv1.KeyValue, len(pairs))
+	for i, kv := range pairs {
+		wire[i] = &heliosv1.KeyValue{Key: kv.Key, Value: kv.Value, Revision: revision}
+	}
+	return &heliosv1.ScanResponse{Pairs: wire, NextPageToken: nextCursor}, nil
+}
+
+// defaultScanLimit mirrors kvstore.defaultScanPageSize -- kept as its
+// own constant rather than importing the unexported one, since a gRPC
+// server choosing a wire-level default and a Machine method choosing
+// its own Go-level default are two separate decisions that happen to
+// agree, not one shared piece of state; see Server.Scan's own doc.
+// Equally UNMEASURED against a real workload (DESIGN.md §12).
+const defaultScanLimit = 100
 
 // translateErr maps a kvstore error to a gRPC status.
 //

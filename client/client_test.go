@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"sync"
@@ -59,6 +60,29 @@ func (f *fakeServer) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// fakeScanServer scripts Scan responses the same way fakeServer scripts
+// Get -- kept as its own small type rather than folded into fakeServer,
+// since a scripted Scan response has a different shape than a scripted
+// Get one and forcing them to share one responses slice would need an
+// awkward union type for no real benefit given how few tests need it.
+type fakeScanServer struct {
+	heliosv1.UnimplementedHeliosServer
+	mu        sync.Mutex
+	responses []func() (*heliosv1.ScanResponse, error)
+	calls     int
+}
+
+func (f *fakeScanServer) Scan(ctx context.Context, req *heliosv1.ScanRequest) (*heliosv1.ScanResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.calls >= len(f.responses) {
+		return nil, status.Errorf(codes.Internal, "fakeScanServer: call %d exceeds %d scripted responses", f.calls+1, len(f.responses))
+	}
+	fn := f.responses[f.calls]
+	f.calls++
+	return fn()
 }
 
 // startFakeServer serves srv on a real, local, randomly-assigned TCP
@@ -440,6 +464,101 @@ func TestPutSucceedsAfterRetryingThroughPreElectionNotLeader(t *testing.T) {
 	}
 	if !ok || string(value) != "1" {
 		t.Fatalf("Get(a) = (%q, ok=%v), want (\"1\", true)", value, ok)
+	}
+}
+
+// TestScanFollowsKnownLeaderHintImmediately proves do[] works correctly
+// instantiated with ScanRequest/ScanResponse -- Scan is the first RPC
+// besides Get to actually exercise the generic retry loop; this is the
+// same hint-following branch TestGetFollowsKnownLeaderHintImmediately
+// already proves for Get, checked here for Scan specifically rather
+// than assumed to carry over untested.
+func TestScanFollowsKnownLeaderHintImmediately(t *testing.T) {
+	leaderAddr := startFakeServer(t, &fakeScanServer{responses: []func() (*heliosv1.ScanResponse, error){
+		func() (*heliosv1.ScanResponse, error) {
+			return &heliosv1.ScanResponse{Pairs: []*heliosv1.KeyValue{
+				{Key: []byte("a"), Value: []byte("1"), Revision: 1},
+			}}, nil
+		},
+	}})
+	follower := &fakeScanServer{responses: []func() (*heliosv1.ScanResponse, error){
+		func() (*heliosv1.ScanResponse, error) {
+			st := status.New(codes.Unavailable, "not the leader")
+			withDetails, err := st.WithDetails(&heliosv1.NotLeaderDetail{LeaderId: 2})
+			if err != nil {
+				return nil, st.Err()
+			}
+			return nil, withDetails.Err()
+		},
+	}}
+	followerAddr := startFakeServer(t, follower)
+
+	c, err := New(Config{
+		Peers:        map[int]string{1: followerAddr, 2: leaderAddr},
+		InitialGuess: 1,
+		Retry:        fastRetryConfig,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	pairs, next, err := c.Scan(context.Background(), nil, nil, 0, nil)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(next) != 0 {
+		t.Errorf("nextPageToken = %q, want empty", next)
+	}
+	if len(pairs) != 1 || string(pairs[0].Key) != "a" || string(pairs[0].Value) != "1" {
+		t.Fatalf("Scan = %+v, want one pair (a, 1)", pairs)
+	}
+}
+
+// TestScanAndScanAllAgainstARealSingleNodeServer is the real end-to-end
+// counterpart to internal/kvstore's and internal/server's own Scan
+// tests, proven through the actual client a real caller uses: Scan
+// returning one bounded page, and ScanAll aggregating every page into
+// the full set.
+func TestScanAndScanAllAgainstARealSingleNodeServer(t *testing.T) {
+	addr := startRealServer(t)
+	c, err := New(Config{Peers: map[int]string{1: addr}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.Close()
+
+	const count = 17
+	for i := 0; i < count; i++ {
+		key := []byte(fmt.Sprintf("key-%02d", i))
+		if _, err := c.Put(context.Background(), key, []byte("v")); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	pairs, next, err := c.Scan(context.Background(), nil, nil, 5, nil)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(pairs) != 5 {
+		t.Fatalf("Scan(limit=5) returned %d pairs, want 5", len(pairs))
+	}
+	if len(next) == 0 {
+		t.Fatal("Scan(limit=5) nextPageToken is empty, want a continuation (17 keys exist)")
+	}
+
+	all, err := c.ScanAll(context.Background(), nil, nil, 5)
+	if err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+	if len(all) != count {
+		t.Fatalf("ScanAll returned %d pairs, want %d", len(all), count)
+	}
+	for i, kv := range all {
+		want := fmt.Sprintf("key-%02d", i)
+		if string(kv.Key) != want {
+			t.Errorf("all[%d].Key = %q, want %q", i, kv.Key, want)
+		}
 	}
 }
 

@@ -234,25 +234,144 @@ func TestPutBeforeAnyElectionReportsNotLeader(t *testing.T) {
 	}
 }
 
-// TestScanAndWatchAreUnimplemented locks in the embedding-based scope
-// fence itself: Server never overrides Scan or Watch, so both must fall
-// through to heliosv1.UnimplementedHeliosServer's own codes.Unimplemented
-// answer until F-6 and F-7 implement them for real.
-func TestScanAndWatchAreUnimplemented(t *testing.T) {
+// TestWatchIsUnimplemented locks in the embedding-based scope fence
+// for the one RPC still deferred: Server never overrides Watch, so it
+// must fall through to heliosv1.UnimplementedHeliosServer's own
+// codes.Unimplemented answer until F-7 implements it for real. Scan's
+// own half of this test was here until F-6 implemented it -- see the
+// Scan tests below instead.
+func TestWatchIsUnimplemented(t *testing.T) {
 	dir := t.TempDir()
 	n := newTestNode(t, dir)
 	n.Start()
 	s := newTestServer(t, dir, n)
 	waitForLeader(t, s, 3*time.Second)
 
-	_, err := s.Scan(context.Background(), &heliosv1.ScanRequest{})
-	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unimplemented {
-		t.Errorf("Scan: err = %v, want codes.Unimplemented", err)
-	}
-
-	err = s.Watch(&heliosv1.WatchRequest{}, nil)
+	err := s.Watch(&heliosv1.WatchRequest{}, nil)
 	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unimplemented {
 		t.Errorf("Watch: err = %v, want codes.Unimplemented", err)
+	}
+}
+
+// TestScanReturnsPairsInRange is Scan's own basic round trip at the RPC
+// boundary -- the kvstore-level mechanism is already thoroughly tested
+// in internal/kvstore/scan_test.go; this and the tests below exist to
+// prove the translation (wire types, defaults, pagination cursor
+// handoff) is correct, not to re-prove the merge itself.
+func TestScanReturnsPairsInRange(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n)
+	waitForLeader(t, s, 3*time.Second)
+
+	for _, k := range []string{"a", "b", "c"} {
+		if _, err := s.Put(context.Background(), &heliosv1.PutRequest{Key: []byte(k), Value: []byte("v-" + k)}); err != nil {
+			t.Fatalf("Put(%q): %v", k, err)
+		}
+	}
+
+	// StartKey: "a" -- not the ScanRequest zero value, which is
+	// unbounded from the very beginning of the key space. waitForLeader
+	// (above) itself Puts a real, durable "__probe__" key to detect
+	// leader election, and "_" (0x5F) sorts before "a" (0x61), so an
+	// unbounded scan would silently pick it up as a fourth pair.
+	resp, err := s.Scan(context.Background(), &heliosv1.ScanRequest{StartKey: []byte("a")})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(resp.GetNextPageToken()) != 0 {
+		t.Errorf("NextPageToken = %q, want empty (everything fit in one page)", resp.GetNextPageToken())
+	}
+	pairs := resp.GetPairs()
+	if len(pairs) != 3 {
+		t.Fatalf("Scan returned %d pairs, want 3", len(pairs))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if string(pairs[i].GetKey()) != want || string(pairs[i].GetValue()) != "v-"+want {
+			t.Errorf("pairs[%d] = (%q, %q), want (%q, %q)", i, pairs[i].GetKey(), pairs[i].GetValue(), want, "v-"+want)
+		}
+		if pairs[i].GetRevision() <= 0 {
+			t.Errorf("pairs[%d].Revision = %d, want > 0", i, pairs[i].GetRevision())
+		}
+	}
+}
+
+// TestScanPaginatesUsingNextPageTokenAsTheNextStartKey is F-6's own
+// pagination contract, checked at the wire boundary: repeatedly calling
+// Scan with each response's own NextPageToken fed back as the next
+// request's PageToken must converge to the full set, matching a single
+// unlimited Scan exactly.
+func TestScanPaginatesUsingNextPageTokenAsTheNextStartKey(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n)
+	waitForLeader(t, s, 3*time.Second)
+
+	const count = 23
+	for i := 0; i < count; i++ {
+		key := fmt.Sprintf("key-%03d", i)
+		if _, err := s.Put(context.Background(), &heliosv1.PutRequest{Key: []byte(key), Value: []byte("v")}); err != nil {
+			t.Fatalf("Put(%d): %v", i, err)
+		}
+	}
+
+	var got []string
+	var pageToken []byte
+	pages := 0
+	for {
+		pages++
+		if pages > count {
+			t.Fatalf("did not converge after %d pages -- pagination is looping", pages)
+		}
+		// StartKey: "a" matters only for the first page (PageToken is
+		// empty then); every later page's PageToken overrides it
+		// anyway. Without it, page one would pick up waitForLeader's
+		// own "__probe__" key -- see TestScanReturnsPairsInRange's own
+		// comment on why.
+		resp, err := s.Scan(context.Background(), &heliosv1.ScanRequest{StartKey: []byte("a"), Limit: 4, PageToken: pageToken})
+		if err != nil {
+			t.Fatalf("Scan (page %d): %v", pages, err)
+		}
+		for _, p := range resp.GetPairs() {
+			got = append(got, string(p.GetKey()))
+		}
+		pageToken = resp.GetNextPageToken()
+		if len(pageToken) == 0 {
+			break
+		}
+	}
+
+	if len(got) != count {
+		t.Fatalf("paginated Scan returned %d keys across %d pages, want %d", len(got), pages, count)
+	}
+	for i, key := range got {
+		want := fmt.Sprintf("key-%03d", i)
+		if key != want {
+			t.Errorf("got[%d] = %q, want %q", i, key, want)
+		}
+	}
+}
+
+// TestScanBeforeAnyElectionReportsNotLeader mirrors the identical
+// pre-election test already established for Get and Put
+// (TestGetBeforeAnyElectionReportsNotLeaderWithHint,
+// TestPutBeforeAnyElectionReportsNotLeader) -- Scan goes through the
+// same ReadIndex barrier Get does, so it must fail the same way before
+// any leader exists.
+func TestScanBeforeAnyElectionReportsNotLeader(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n)
+
+	_, err := s.Scan(context.Background(), &heliosv1.ScanRequest{})
+	if err == nil {
+		t.Fatal("Scan before any election: err = nil, want NotLeader")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unavailable {
+		t.Errorf("Scan before any election: err = %v, want a codes.Unavailable status", err)
 	}
 }
 
