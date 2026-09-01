@@ -121,6 +121,32 @@ type Machine struct {
 	appliedTerms map[int]int // pruned to entries above the snapshot floor on every install/take
 	fault        string
 
+	// dedup is F-4's whole mechanism: clientID -> the highest
+	// sequenceNumber this Machine has applied for that client. A
+	// command whose sequenceNumber is at or below the recorded value
+	// for its clientID has already been applied -- by an earlier
+	// attempt at the identical logical write, reaching this apply path
+	// through a DIFFERENT log entry than the one that originally
+	// succeeded (see applyCommand's own doc for exactly why that
+	// happens) -- and is skipped rather than applied again. clientID
+	// 0 is never a key here; it is the "no session" sentinel every
+	// non-idempotent Put/Delete call uses, checked before this map is
+	// ever consulted. Rebuilt for free by ordinary log replay on
+	// restart (§5/§6's own "no prefix is ever applied twice" property
+	// means replaying every entry through this exact same check
+	// reconstructs the identical table), so it needs no separate
+	// persistence of its own outside the snapshot image -- but IS
+	// captured inside that image (snapshot.go), because a follower
+	// caught up via InstallSnapshot, or a node restarting from a
+	// snapshot floor, never replays the entries a snapshot compacted
+	// away and would otherwise lose every dedup entry for a write
+	// whose original log index is now gone. UNBOUNDED: no entry is
+	// ever evicted, so a long-running cluster's memory (and every
+	// snapshot's size) grows with the number of DISTINCT client
+	// sessions it has ever seen, not the number of keys it holds --
+	// a real, named limitation, not an oversight (DESIGN.md §12).
+	dedup map[uint64]uint64
+
 	bg *compaction.Background
 
 	done chan struct{}
@@ -178,6 +204,7 @@ func NewMachine(n *raft.Node, dir string, cache *sstable.BlockCache, opts Option
 		writer:       engine.NewWriter(w, m),
 		sstReaders:   sstReaders,
 		appliedTerms: make(map[int]int),
+		dedup:        make(map[uint64]uint64),
 		done:         make(chan struct{}),
 	}
 
@@ -268,6 +295,31 @@ func (m *Machine) applyCommand(msg raft.ApplyMsg) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// F-4: a command whose clientID is non-zero and whose
+	// sequenceNumber is at or below what this Machine has already
+	// applied for that clientID is a duplicate -- the retry case this
+	// whole task exists for. THIS is the reason a duplicate is not
+	// caught earlier, at the gRPC server (internal/server) or in
+	// Machine.PutIdempotent itself: two concurrent submissions of the
+	// identical (clientID, sequenceNumber) pair -- an original attempt
+	// still in flight and a retry issued because the client could not
+	// tell whether the original had committed -- can both reach n.Submit
+	// and both get appended as SEPARATE, distinct log entries at
+	// different indices, since Raft has no concept of "this command is
+	// the same as that one." The only place both entries are ever seen
+	// one at a time, in a fixed order, by a single decision-maker is
+	// here, in the apply path -- exactly the same "one choke point,
+	// not several independent guesses" reasoning §8 gives for the
+	// commitTo funnel. The caller waiting on THIS entry's own index
+	// (Machine.write's waitForApplied) still gets an ordinary,
+	// successful return either way -- it cannot tell, and does not need
+	// to, whether its write actually mutated storage or was recognized
+	// as already done.
+	if dec.ClientID != 0 && dec.SequenceNumber <= m.dedup[dec.ClientID] {
+		m.recordApplied(msg.CommandIndex, msg.CommandTerm)
+		return
+	}
+
 	var applyErr error
 	if dec.Tombstone {
 		applyErr = m.writer.Delete(dec.Key)
@@ -280,6 +332,15 @@ func (m *Machine) applyCommand(msg raft.ApplyMsg) {
 		}
 		m.recordApplied(msg.CommandIndex, msg.CommandTerm)
 		return
+	}
+
+	// Recorded only AFTER a successful apply, deliberately: if the
+	// write itself failed, a future retry carrying the same
+	// (clientID, sequenceNumber) must still be free to actually
+	// attempt the write, not be dismissed as an already-done duplicate
+	// of something that never really happened.
+	if dec.ClientID != 0 {
+		m.dedup[dec.ClientID] = dec.SequenceNumber
 	}
 
 	m.recordApplied(msg.CommandIndex, msg.CommandTerm)

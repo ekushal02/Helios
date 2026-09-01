@@ -115,12 +115,24 @@ func (s *Server) getResponse(value []byte, ok bool) *heliosv1.GetResponse {
 	return resp
 }
 
-// Put writes through Machine.Put. Revision carries the same
-// AppliedIndex()-after-the-call approximation Get's doc explains above,
-// applied here to a write's own commit index instead of a read's
-// barrier index -- the identical gap, not a second one.
+// Put writes through Machine.Put (ClientId == 0) or Machine.PutIdempotent
+// (F-4): a client_id of 0 means the caller carries no session -- direct
+// grpcurl, a future admin tool, anything not going through
+// client.Client -- and gets exactly the pre-F-4 behavior, never
+// deduplicated. Revision carries the same AppliedIndex()-after-the-call
+// approximation Get's doc explains above, applied here to a write's own
+// commit index instead of a read's barrier index -- the identical gap,
+// not a second one, and unaffected by which of the two paths below ran:
+// a deduplicated write still advances AppliedIndex() by way of its own
+// (skipped-but-still-recorded) log entry, see machine.go's applyCommand.
 func (s *Server) Put(ctx context.Context, req *heliosv1.PutRequest) (*heliosv1.PutResponse, error) {
-	if err := s.m.Put(req.GetKey(), req.GetValue()); err != nil {
+	var err error
+	if req.GetClientId() == 0 {
+		err = s.m.Put(req.GetKey(), req.GetValue())
+	} else {
+		err = s.m.PutIdempotent(req.GetKey(), req.GetValue(), req.GetClientId(), req.GetSequenceNumber())
+	}
+	if err != nil {
 		return nil, s.translateErr(err)
 	}
 	return &heliosv1.PutResponse{Revision: int64(s.m.AppliedIndex())}, nil
@@ -139,7 +151,13 @@ func (s *Server) Put(ctx context.Context, req *heliosv1.PutRequest) (*heliosv1.P
 // engine.Writer.Delete itself reporting prior existence -- deferred
 // rather than approximated with a race here.
 func (s *Server) Delete(ctx context.Context, req *heliosv1.DeleteRequest) (*heliosv1.DeleteResponse, error) {
-	if err := s.m.Delete(req.GetKey()); err != nil {
+	var err error
+	if req.GetClientId() == 0 {
+		err = s.m.Delete(req.GetKey())
+	} else {
+		err = s.m.DeleteIdempotent(req.GetKey(), req.GetClientId(), req.GetSequenceNumber())
+	}
+	if err != nil {
 		return nil, s.translateErr(err)
 	}
 	return &heliosv1.DeleteResponse{Found: false, Revision: int64(s.m.AppliedIndex())}, nil

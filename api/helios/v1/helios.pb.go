@@ -322,11 +322,29 @@ func (x *GetResponse) GetRevision() int64 {
 }
 
 type PutRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// F-4: identifies this write for duplicate suppression across a
+	// client's own retries. client_id = 0 means "no client session" --
+	// the write is NOT deduplicated, the same behavior every PutRequest
+	// had before this field existed. A real client_id is never 0 (see
+	// client.Client's own doc on how it is generated); 0 is reserved
+	// exactly so a caller not using this project's client library --
+	// direct grpcurl, a future admin tool, anything constructing a raw
+	// PutRequest -- keeps working unchanged rather than being forced to
+	// either opt in or be rejected.
+	ClientId uint64 `protobuf:"varint,3,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
+	// Monotonically increasing per client_id, assigned once per LOGICAL
+	// write and reused, unchanged, across every retry of that same write
+	// -- never per RPC attempt. The state machine (internal/kvstore)
+	// remembers the highest sequence_number it has applied for each
+	// client_id; a request at or below that value is recognized as
+	// already applied and is not applied again, even if it reaches a
+	// different node or a different Raft term than the original did.
+	SequenceNumber uint64 `protobuf:"varint,4,opt,name=sequence_number,json=sequenceNumber,proto3" json:"sequence_number,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PutRequest) Reset() {
@@ -371,6 +389,20 @@ func (x *PutRequest) GetValue() []byte {
 		return x.Value
 	}
 	return nil
+}
+
+func (x *PutRequest) GetClientId() uint64 {
+	if x != nil {
+		return x.ClientId
+	}
+	return 0
+}
+
+func (x *PutRequest) GetSequenceNumber() uint64 {
+	if x != nil {
+		return x.SequenceNumber
+	}
+	return 0
 }
 
 type PutResponse struct {
@@ -422,10 +454,17 @@ func (x *PutResponse) GetRevision() int64 {
 }
 
 type DeleteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// Identical contract to PutRequest's own fields of the same name (F-4)
+	// -- see that message's doc. A delete is a write (§13.7's own
+	// argument, all the way up to this, its client-facing surface), so it
+	// needs the identical duplicate-suppression treatment a Put does, not
+	// a different one.
+	ClientId       uint64 `protobuf:"varint,2,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
+	SequenceNumber uint64 `protobuf:"varint,3,opt,name=sequence_number,json=sequenceNumber,proto3" json:"sequence_number,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *DeleteRequest) Reset() {
@@ -463,6 +502,20 @@ func (x *DeleteRequest) GetKey() []byte {
 		return x.Key
 	}
 	return nil
+}
+
+func (x *DeleteRequest) GetClientId() uint64 {
+	if x != nil {
+		return x.ClientId
+	}
+	return 0
+}
+
+func (x *DeleteRequest) GetSequenceNumber() uint64 {
+	if x != nil {
+		return x.SequenceNumber
+	}
+	return 0
 }
 
 type DeleteResponse struct {
@@ -847,15 +900,19 @@ const file_helios_v1_helios_proto_rawDesc = "" +
 	"\vGetResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x14\n" +
 	"\x05found\x18\x02 \x01(\bR\x05found\x12\x1a\n" +
-	"\brevision\x18\x03 \x01(\x03R\brevision\"4\n" +
+	"\brevision\x18\x03 \x01(\x03R\brevision\"z\n" +
 	"\n" +
 	"PutRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\")\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x1b\n" +
+	"\tclient_id\x18\x03 \x01(\x04R\bclientId\x12'\n" +
+	"\x0fsequence_number\x18\x04 \x01(\x04R\x0esequenceNumber\")\n" +
 	"\vPutResponse\x12\x1a\n" +
-	"\brevision\x18\x01 \x01(\x03R\brevision\"!\n" +
+	"\brevision\x18\x01 \x01(\x03R\brevision\"g\n" +
 	"\rDeleteRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\"B\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1b\n" +
+	"\tclient_id\x18\x02 \x01(\x04R\bclientId\x12'\n" +
+	"\x0fsequence_number\x18\x03 \x01(\x04R\x0esequenceNumber\"B\n" +
 	"\x0eDeleteResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\x03R\brevision\"\xb2\x01\n" +

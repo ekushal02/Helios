@@ -253,3 +253,43 @@ func TestScanAndWatchAreUnimplemented(t *testing.T) {
 		t.Errorf("Watch: err = %v, want codes.Unimplemented", err)
 	}
 }
+
+// TestPutIsIdempotentAcrossARetriedRPC (F-4) is server_test.go's own
+// bridge between internal/kvstore's mechanism-level tests
+// (idempotency_test.go) and what a real client.Client retry actually
+// produces on the wire: two SEPARATE Put RPCs, same ClientId and
+// SequenceNumber, different Value -- exactly the shape client.go's do[]
+// loop builds when the first attempt's response is lost and it retries.
+// The second call must succeed (not error) and must NOT have changed
+// the stored value.
+func TestPutIsIdempotentAcrossARetriedRPC(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n)
+	waitForLeader(t, s, 3*time.Second)
+
+	const clientID, seq = 99, 1
+	if _, err := s.Put(context.Background(), &heliosv1.PutRequest{
+		Key: []byte("a"), Value: []byte("v1"), ClientId: clientID, SequenceNumber: seq,
+	}); err != nil {
+		t.Fatalf("original Put: %v", err)
+	}
+
+	// The "retry": identical ClientId/SequenceNumber, a different Value
+	// -- if this were mistakenly applied again, Get would come back
+	// "v2", not "v1".
+	if _, err := s.Put(context.Background(), &heliosv1.PutRequest{
+		Key: []byte("a"), Value: []byte("v2"), ClientId: clientID, SequenceNumber: seq,
+	}); err != nil {
+		t.Fatalf("retried Put: %v (a deduplicated write must still return success)", err)
+	}
+
+	resp, err := s.Get(context.Background(), &heliosv1.GetRequest{Key: []byte("a")})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !resp.GetFound() || string(resp.GetValue()) != "v1" {
+		t.Fatalf("Get(a) = (%q, found=%v), want (\"v1\", true) -- the retried Put must not have overwritten the original", resp.GetValue(), resp.GetFound())
+	}
+}

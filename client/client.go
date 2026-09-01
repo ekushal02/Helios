@@ -117,11 +117,20 @@ type Config struct {
 	// defaultRetryConfig.
 	Retry RetryConfig
 
-	// Seed sets the backoff jitter's random source. Zero (the default)
-	// derives a seed from time.Now().UnixNano(). Set explicitly for a
-	// deterministic, reproducible test -- the identical reason every
-	// seeded rand.Rand throughout internal/raft is never the global
-	// math/rand source (see election.go's own doc on this).
+	// Seed sets this Client's random source: backoff jitter (§17's own
+	// full-jitter doc) AND, as of F-4, this Client's own clientID.
+	// Zero (the default) derives a seed from time.Now().UnixNano().
+	// Set explicitly for a deterministic, reproducible test -- the
+	// identical reason every seeded rand.Rand throughout internal/raft
+	// is never the global math/rand source (see election.go's own doc
+	// on this). Setting Seed does NOT make clientID predictable across
+	// two Clients built with the same Seed collide with each other on
+	// purpose -- it makes ONE Client's own behavior reproducible run to
+	// run, which is what a test needs; two Clients sharing a Seed would
+	// also share a clientID, which is a test-authoring hazard, not a
+	// feature, so tests that need multiple distinct clientIDs use
+	// distinct Seeds (or leave Seed unset and let each Client draw its
+	// own from real entropy).
 	Seed int64
 }
 
@@ -141,6 +150,48 @@ type Client struct {
 
 	rngMu sync.Mutex
 	rng   *rand.Rand
+
+	// clientID identifies this Client's own write session for
+	// duplicate suppression (F-4) -- a random, non-zero uint64 drawn
+	// once at construction, kept only in memory for this Client's
+	// process lifetime. It does not need to survive a process restart:
+	// idempotency here protects a retry within a single Client
+	// instance's own retry loop (do's own doc), not a resumed session
+	// after a crash, so there is nothing a persisted identity would
+	// buy that a fresh random one on the next process doesn't already
+	// give (a fresh clientID simply starts its own independent dedup
+	// history with the server, at seq 1 again).
+	clientID uint64
+
+	// seqCounter is one shared, monotonic sequence space for every
+	// write this Client issues -- Put and Delete both draw from it,
+	// not two separate spaces per RPC kind, since uniqueness across
+	// this clientID's own history is all the dedup table on the server
+	// side actually needs (machine.go's own applyCommand doc).
+	seqCounter atomic.Uint64
+
+	// writeMu serializes Put and Delete -- the WHOLE call, including
+	// every retry attempt inside do's own loop, not just the seq number
+	// assignment. THIS IS WHAT MAKES "sequence numbers commit in the
+	// order they were assigned" AN ACTUAL INVARIANT RATHER THAN AN
+	// ASSUMPTION. Without it, two goroutines calling Put concurrently on
+	// the same Client could draw seq=5 and seq=6 independently and have
+	// their underlying Raft entries commit in either order -- and the
+	// dedup check in machine.go's applyCommand ("at or below the
+	// highest sequence number already applied") is only correct under
+	// in-order delivery per clientID; out-of-order arrival would let a
+	// higher, already-applied seq silently suppress a lower, genuinely
+	// distinct write that simply committed later. Holding writeMu for
+	// each write's full duration -- submission through every retry to
+	// final success or failure -- means seq N+1 is never even
+	// SUBMITTED until seq N's call has completely finished, so they can
+	// never commit out of order. The cost is real: writes from one
+	// Client are now fully serialized, not just ordered. A caller
+	// wanting concurrent write throughput uses multiple Client
+	// instances, each with its own independent clientID and therefore
+	// its own independent dedup history -- the documented way to get
+	// concurrency back, not a workaround for a bug.
+	writeMu sync.Mutex
 }
 
 // New validates cfg and returns a Client. It does not connect to
@@ -185,13 +236,27 @@ func New(cfg Config) (*Client, error) {
 		peers[id] = addr
 	}
 
+	rng := rand.New(rand.NewSource(seed))
+
+	// clientID must be non-zero -- 0 is the server's own "no session,
+	// do not deduplicate" sentinel (internal/server.Server.Put's own
+	// doc). rng.Uint64() landing on exactly 0 is a 1-in-2^64 event, but
+	// checked rather than trusted, the same "believed impossible is
+	// checked, not assumed" standard this project has held its own
+	// Raft invariants to since §8.
+	clientID := rng.Uint64()
+	for clientID == 0 {
+		clientID = rng.Uint64()
+	}
+
 	c := &Client{
 		peers:     peers,
 		sortedIDs: sortedIDs,
 		dialOpts:  dialOpts,
 		retry:     retry,
 		conns:     make(map[int]*grpc.ClientConn),
-		rng:       rand.New(rand.NewSource(seed)),
+		rng:       rng,
+		clientID:  clientID,
 	}
 	c.leaderGuess.Store(int64(initial))
 	return c, nil
@@ -243,9 +308,22 @@ func (c *Client) GetStale(ctx context.Context, key []byte) (value []byte, ok boo
 	return resp.GetValue(), resp.GetFound(), resp.GetRevision(), nil
 }
 
-// Put is the network-facing mirror of Machine.Put.
+// Put is the network-facing mirror of Machine.Put, with duplicate
+// suppression (F-4) built in automatically -- every retry do's own loop
+// issues for this call carries the identical ClientId and
+// SequenceNumber, since req is built once, here, before do ever runs,
+// and the same *PutRequest is reused across every attempt.
+//
+// writeMu is held for this call's ENTIRE duration, not just while
+// assigning seq -- see the Client struct's own doc on writeMu for why
+// that is what makes "this Client's sequence numbers commit in the
+// order they were assigned" a real guarantee rather than a hope.
 func (c *Client) Put(ctx context.Context, key, value []byte) (revision int64, err error) {
-	req := &heliosv1.PutRequest{Key: key, Value: value}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	seq := c.seqCounter.Add(1)
+	req := &heliosv1.PutRequest{Key: key, Value: value, ClientId: c.clientID, SequenceNumber: seq}
 	resp, err := do[heliosv1.PutRequest, heliosv1.PutResponse](ctx, c, req, heliosv1.HeliosClient.Put)
 	if err != nil {
 		return 0, err
@@ -253,13 +331,18 @@ func (c *Client) Put(ctx context.Context, key, value []byte) (revision int64, er
 	return resp.GetRevision(), nil
 }
 
-// Delete is the network-facing mirror of Machine.Delete. Its own
-// Found field is unimplemented server-side (always false -- see
+// Delete is the network-facing mirror of Machine.Delete, with the
+// identical duplicate-suppression contract Put's own doc describes.
+// Its own Found field is unimplemented server-side (always false -- see
 // internal/server/server.go's own doc on Server.Delete); this client
 // does not invent a different answer, it returns exactly what the wire
 // carries.
 func (c *Client) Delete(ctx context.Context, key []byte) (revision int64, err error) {
-	req := &heliosv1.DeleteRequest{Key: key}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	seq := c.seqCounter.Add(1)
+	req := &heliosv1.DeleteRequest{Key: key, ClientId: c.clientID, SequenceNumber: seq}
 	resp, err := do[heliosv1.DeleteRequest, heliosv1.DeleteResponse](ctx, c, req, heliosv1.HeliosClient.Delete)
 	if err != nil {
 		return 0, err

@@ -67,10 +67,24 @@ message GetResponse {
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
-  // TODO(F-4): client_id + sequence_number land here for idempotent
-  // retries. Left out now — F-1 only defines the RPC shape, and adding a
-  // field later is non-breaking, so there's no reason to guess at the
-  // dedup design before that task actually specs it.
+  // F-4: identifies this write for duplicate suppression across a
+  // client's own retries. client_id = 0 means "no client session" --
+  // the write is NOT deduplicated, the same behavior every PutRequest
+  // had before this field existed. A real client_id is never 0 (see
+  // client.Client's own doc on how it is generated); 0 is reserved
+  // exactly so a caller not using this project's client library --
+  // direct grpcurl, a future admin tool, anything constructing a raw
+  // PutRequest -- keeps working unchanged rather than being forced to
+  // either opt in or be rejected.
+  uint64 client_id = 3;
+  // Monotonically increasing per client_id, assigned once per LOGICAL
+  // write and reused, unchanged, across every retry of that same write
+  // -- never per RPC attempt. The state machine (internal/kvstore)
+  // remembers the highest sequence_number it has applied for each
+  // client_id; a request at or below that value is recognized as
+  // already applied and is not applied again, even if it reaches a
+  // different node or a different Raft term than the original did.
+  uint64 sequence_number = 4;
 }
 
 message PutResponse {
@@ -85,6 +99,13 @@ message PutResponse {
 
 message DeleteRequest {
   bytes key = 1;
+  // Identical contract to PutRequest's own fields of the same name (F-4)
+  // -- see that message's doc. A delete is a write (§13.7's own
+  // argument, all the way up to this, its client-facing surface), so it
+  // needs the identical duplicate-suppression treatment a Put does, not
+  // a different one.
+  uint64 client_id = 2;
+  uint64 sequence_number = 3;
 }
 
 message DeleteResponse {

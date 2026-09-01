@@ -31,8 +31,8 @@ const (
 // encodePut and encodeDelete build the []byte a client hands to
 // raft.Node.Submit. The wire shape --
 //
-//	Put:    [opType(1B)][keyLen(4B)][key][valueLen(4B)][value]
-//	Delete: [opType(1B)][keyLen(4B)][key]
+//	Put:    [opType(1B)][clientID(8B)][sequenceNumber(8B)][keyLen(4B)][key][valueLen(4B)][value]
+//	Delete: [opType(1B)][clientID(8B)][sequenceNumber(8B)][keyLen(4B)][key]
 //
 // -- is deliberately the same length-prefixed, opaque-payload shape
 // record.go's WAL payloads and block.go's entry framing already use, for
@@ -45,19 +45,38 @@ const (
 // might actually Put, and conflating it with "this is a delete" would be
 // exactly the read bug the WAL and SSTable formats were both built to
 // avoid one layer down.
-func encodePut(key, value []byte) []byte {
-	buf := make([]byte, 0, 1+4+len(key)+4+len(value))
+//
+// clientID and sequenceNumber (F-4) are fixed-width, not length-prefixed
+// -- they are always exactly 8 bytes each, the identical reasoning
+// snapshot.go's own header (AppliedIndex, NumEntries) already uses for
+// the same kind of always-this-size field. clientID == 0 means "no
+// client session, do not deduplicate this command" -- Machine.Put and
+// Machine.Delete's own zero-value calls use exactly this, so a caller
+// that never opts into idempotency (any test in this package predating
+// this task, any raw RPC caller) keeps working unchanged.
+func encodePut(key, value []byte, clientID, sequenceNumber uint64) []byte {
+	buf := make([]byte, 0, 1+8+8+4+len(key)+4+len(value))
 	buf = append(buf, byte(opPut))
+	buf = appendUint64(buf, clientID)
+	buf = appendUint64(buf, sequenceNumber)
 	buf = appendLenPrefixed(buf, key)
 	buf = appendLenPrefixed(buf, value)
 	return buf
 }
 
-func encodeDelete(key []byte) []byte {
-	buf := make([]byte, 0, 1+4+len(key))
+func encodeDelete(key []byte, clientID, sequenceNumber uint64) []byte {
+	buf := make([]byte, 0, 1+8+8+4+len(key))
 	buf = append(buf, byte(opDelete))
+	buf = appendUint64(buf, clientID)
+	buf = appendUint64(buf, sequenceNumber)
 	buf = appendLenPrefixed(buf, key)
 	return buf
+}
+
+func appendUint64(dst []byte, v uint64) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	return append(dst, b[:]...)
 }
 
 func appendLenPrefixed(dst, b []byte) []byte {
@@ -73,11 +92,16 @@ func appendLenPrefixed(dst, b []byte) []byte {
 // Delete(Key), decided by Tombstone, mirroring blockEntry's own shape in
 // sstable/block.go (§13.2) rather than inventing a third way to spell
 // "this is a Put or a Delete" in a fourth format this codebase would
-// then have to keep consistent with the other three.
+// then have to keep consistent with the other three. ClientID and
+// SequenceNumber (F-4) travel alongside for the apply path's own dedup
+// check (machine.go's applyCommand) to use -- decoding them here, once,
+// rather than a second parse pass over the raw command bytes.
 type decodedCommand struct {
-	Key       []byte
-	Value     []byte
-	Tombstone bool
+	Key            []byte
+	Value          []byte
+	Tombstone      bool
+	ClientID       uint64
+	SequenceNumber uint64
 }
 
 // decodeCommand reverses encodePut/encodeDelete. Every command this
@@ -94,6 +118,13 @@ func decodeCommand(cmd []byte) (decodedCommand, error) {
 	op := opType(cmd[0])
 	rest := cmd[1:]
 
+	if len(rest) < 16 {
+		return decodedCommand{}, fmt.Errorf("kvstore: decode: %d bytes remain, want at least 16 for client_id+sequence_number", len(rest))
+	}
+	clientID := binary.LittleEndian.Uint64(rest[0:8])
+	sequenceNumber := binary.LittleEndian.Uint64(rest[8:16])
+	rest = rest[16:]
+
 	key, rest, err := readLenPrefixed(rest)
 	if err != nil {
 		return decodedCommand{}, fmt.Errorf("kvstore: decode key: %w", err)
@@ -105,9 +136,9 @@ func decodeCommand(cmd []byte) (decodedCommand, error) {
 		if err != nil {
 			return decodedCommand{}, fmt.Errorf("kvstore: decode value: %w", err)
 		}
-		return decodedCommand{Key: key, Value: value}, nil
+		return decodedCommand{Key: key, Value: value, ClientID: clientID, SequenceNumber: sequenceNumber}, nil
 	case opDelete:
-		return decodedCommand{Key: key, Tombstone: true}, nil
+		return decodedCommand{Key: key, Tombstone: true, ClientID: clientID, SequenceNumber: sequenceNumber}, nil
 	default:
 		return decodedCommand{}, fmt.Errorf("kvstore: unknown op type %d", op)
 	}

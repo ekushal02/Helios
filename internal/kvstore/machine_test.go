@@ -57,7 +57,7 @@ func waitForLeader(t *testing.T, n *raft.Node, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
-		if _, _, isLeader := n.Submit(encodePut([]byte("__probe__"), nil)); isLeader {
+		if _, _, isLeader := n.Submit(encodePut([]byte("__probe__"), nil, 0, 0)); isLeader {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)

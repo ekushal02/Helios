@@ -40,8 +40,14 @@ const defaultReadTimeout = 5 * time.Second
 // and reports whether the write actually landed as this caller's own
 // submission (see raft.Node.Submit's own doc on the claim-ticket
 // contract) rather than being silently overwritten by a later leader.
+//
+// Equivalent to PutIdempotent with clientID=0 -- the "no client
+// session, do not deduplicate" sentinel (F-4) -- so every caller that
+// predates this task, or that simply has no retry-deduplication need
+// (a one-off internal write, a test), keeps working completely
+// unchanged.
 func (m *Machine) Put(key, value []byte) error {
-	return m.write(encodePut(key, value))
+	return m.write(encodePut(key, value, 0, 0))
 }
 
 // Delete durably records key as deleted, the identical write path Put
@@ -49,7 +55,34 @@ func (m *Machine) Put(key, value []byte) error {
 // a write, not some other kind of operation, all the way up to this,
 // its client-facing surface.
 func (m *Machine) Delete(key []byte) error {
-	return m.write(encodeDelete(key))
+	return m.write(encodeDelete(key, 0, 0))
+}
+
+// PutIdempotent is Put with a (clientID, sequenceNumber) pair attached
+// (F-4). If this Machine has already applied this exact pair -- the
+// retry case this task exists for, a caller resubmitting because it
+// could not tell whether an earlier attempt committed -- the apply path
+// (machine.go's applyCommand) skips writing again, and this call still
+// returns success once its own log entry's turn comes: indistinguishable,
+// from this caller's own point of view, from a genuine first
+// application. clientID must be non-zero -- 0 is reserved as the
+// "no session" sentinel Put's own zero-value call already uses, and
+// silently accepting it here would let every non-idempotent caller
+// collide in the same dedup bucket as every other.
+func (m *Machine) PutIdempotent(key, value []byte, clientID, sequenceNumber uint64) error {
+	if clientID == 0 {
+		return fmt.Errorf("kvstore: PutIdempotent: clientID must be non-zero")
+	}
+	return m.write(encodePut(key, value, clientID, sequenceNumber))
+}
+
+// DeleteIdempotent is Delete with the identical (clientID,
+// sequenceNumber) contract PutIdempotent has -- see that method's doc.
+func (m *Machine) DeleteIdempotent(key []byte, clientID, sequenceNumber uint64) error {
+	if clientID == 0 {
+		return fmt.Errorf("kvstore: DeleteIdempotent: clientID must be non-zero")
+	}
+	return m.write(encodeDelete(key, clientID, sequenceNumber))
 }
 
 func (m *Machine) write(cmd []byte) error {
@@ -309,6 +342,15 @@ func (m *Machine) buildImage() (blob []byte, appliedIndex int, err error) {
 	}
 	appliedIndex = m.appliedIndex
 	sources := append([]sstable.Source{m.active.NewIterator()}, sstableSourcesLocked(m.reconcileSSTReadersLocked())...)
+	// A copy, not the live map (F-4): encoding runs unlocked below, and
+	// m.dedup can keep changing (new applies) for as long as that takes
+	// -- the identical reason the key/value sources above are captured
+	// as iterators over structures that are never mutated in place
+	// rather than read live.
+	dedup := make(map[uint64]uint64, len(m.dedup))
+	for clientID, seq := range m.dedup {
+		dedup[clientID] = seq
+	}
 	m.mu.Unlock()
 
 	// Encoded OUTSIDE the lock, deliberately: this can read every live
@@ -320,7 +362,7 @@ func (m *Machine) buildImage() (blob []byte, appliedIndex int, err error) {
 	// never mutated in place, only ever appended to or superseded
 	// (§13.4).
 	merged := sstable.Merge(sources, true) // dropTombstones: a snapshot is ground truth
-	blob, err = encodeSnapshotImage(appliedIndex, merged)
+	blob, err = encodeSnapshotImage(appliedIndex, merged, dedup)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -385,7 +427,7 @@ func (m *Machine) installSnapshot(msg raft.ApplyMsg) {
 	}
 	freshWriter := engine.NewWriter(freshWAL, fresh)
 
-	imageIndex, err := decodeSnapshotImage(msg.Snapshot, freshWriter.Put)
+	imageIndex, dedup, err := decodeSnapshotImage(msg.Snapshot, freshWriter.Put)
 	if err != nil {
 		m.fault = fmt.Sprintf("install snapshot at %d: decode: %v", msg.SnapshotIndex, err)
 		freshWAL.Close()
@@ -400,5 +442,13 @@ func (m *Machine) installSnapshot(msg raft.ApplyMsg) {
 	m.active = fresh
 	m.activeWAL = freshWAL
 	m.writer = freshWriter
+	// The dedup table (F-4) is REPLACED wholesale, never merged -- the
+	// identical rule this function's own doc already states for every
+	// other piece of state an installed image carries: Raft only ever
+	// sends an image covering entries this node has not already
+	// reached, so whatever this Machine's own m.dedup held before is,
+	// by construction, a strict subset (or exactly equal to) what the
+	// image itself now carries.
+	m.dedup = dedup
 	m.recordApplied(msg.SnapshotIndex, msg.SnapshotTerm)
 }
