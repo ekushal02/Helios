@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.24 — leader election, log replication, the apply path, linearizable
+**Status:** v1.28 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -28,11 +28,32 @@ which pays for only one of the two — ran 21.85× faster than live writes on th
 silently measuring the wrong thing, found from a real run's reads timing out rather
 than from review (§14.11). All findings correct on every value checked at every scale
 tested; all costing (or previously hiding the cost of) more than a well-scoped system
-should. The client-facing gRPC wire contract is now defined — `Get`, `Put`, `Delete`,
-`Scan`, `Watch` (§15) — but nothing serves or calls it yet: no gRPC server, no client
-library, no leader-hint or idempotency handling. That, a background flush goroutine,
-and a handful of "asserted, not yet measured against a real workload" constants are
-what remain, tracked explicitly in §12, §14.7, and §15.5.
+should. `internal/server.Server` (§16) now serves the client-facing gRPC contract
+(§15) for real over `cmd/helios`'s own listener: `Get`, `Put`, and `Delete` call
+straight through to `internal/kvstore.Machine`, and every RPC answers `NotLeader`
+(`codes.Unavailable`, per gRPC's own retry-litmus-test guidance) with a checkable
+leader-hint status detail when this node isn't leading, using a `raft.Node.LeaderHint`
+accessor exposed for the first time by this task. `Scan` and `Watch` correctly answer
+`codes.Unimplemented` — Phase F-6 and F-7's jobs, not built here. `client.Client`
+(§17) now exists to call any of this: connect, cache a leader guess, and retry with
+backoff on `NotLeader` — following a real leader hint immediately, backing off only
+when guessing. Its own address book (peer ID → gRPC address) is exactly what §16.3
+deferred to this task. Every write this client issues is now idempotent (§18): a
+`clientID` and `sequenceNumber`, carried on `PutRequest`/`DeleteRequest` and through
+Raft's own log inside the `Command` itself, let the apply path (`internal/kvstore`'s
+`applyCommand`) recognize a retried write as already applied and skip re-applying it
+— closing §12's own "Duplicate commands" question, open since §5. The dedup table
+survives a snapshot install, not just an uninterrupted process lifetime — it now
+travels inside the snapshot image itself. Proven under real concurrency, not just a
+careful two-call sequence: a 64-goroutine retry storm (§18.7) sharing one
+`clientID`/`sequenceNumber` applies exactly once, at both the state-machine and the
+RPC boundary. Several wire fields (`revision` tracked
+exactly rather than approximated, `Delete`'s `found`, a real `CONSISTENCY_STALE` path)
+remain real, named, deferred gaps rather than solved defaults — see §16.5 and the
+entries in §12 those left behind, joined now by one on the dedup table's own unbounded
+growth. That, a background flush goroutine, and a handful of "asserted, not yet
+measured against a real workload" constants are what
+remain, tracked explicitly in §12, §14.7, and §16.
 
 ---
 
@@ -461,7 +482,10 @@ the same past-tense rule the entry path follows (§8).
 **This answers the replay question that §6 used to defer.** A restarted node does not
 replay from index 1; it replays from the snapshot floor. No prefix is ever applied twice,
 so the state machine needs no idempotence for *replay*. Duplicate commands from a client
-retrying across a leader change remain a separate, open problem (§12).
+retrying across a leader change are a separate problem — closed in §18, not here: this
+section's guarantee is about the LOG never replaying an entry twice, not about two
+DIFFERENT log entries carrying the same client-intended write, which is what a retry
+across an uncertain commit produces.
 
 ---
 
@@ -1298,11 +1322,6 @@ Deliberately unresolved. Each is answered by later work.
   read-heavy workload on a cluster with no usable lease grows the log at write rates. This
   is now the strongest argument for the no-op on election, and it needs a number before it
   is an argument at all.
-- **Duplicate commands.** A client that retries after a leader change can land the same
-  command twice, since the retry is issued without knowing whether the original committed.
-  Both copies apply — invisible for an idempotent write, wrong for anything else. Closed by
-  client identifiers plus a dedup table, which is the same decision as making log replay on
-  restart idempotent. Applied-count assertions currently use `>=` and carry a scope fence.
 - **`persistIfDirty` runs under `n.mu`.** So a node has at most one write outstanding no
   matter how many clients are calling `Submit`, and group commit has nothing to
   coalesce: the batched storage measures 1.00 flushes per write on the real write path,
@@ -1586,6 +1605,57 @@ Deliberately unresolved. Each is answered by later work.
   is exactly right for the byte-string keys this engine has today. A comparator seam
   would only earn its complexity if a future key encoding (composite keys, integer keys
   needing numeric rather than lexicographic order) needed it, and nothing does yet.
+- **`CONSISTENCY_STALE` (§15.3, F-1) is served by `GetLeaseRead`, which is not what it
+  was described as.** F-1's own doc calls `CONSISTENCY_STALE` a read "served from local
+  state without a leader round trip... may not reflect the most recent committed
+  writes" — servable by a follower. `Machine` has no such method; every read it offers
+  (`Get`, `GetLeaseRead`) requires being leader. `internal/server.Server` wires
+  `CONSISTENCY_STALE` to `GetLeaseRead` as the closest available cheaper path — still
+  linearizable under §9's bounded-clock assumption, not actually stale — rather than
+  leave the enum value unservable. A real stale, follower-servable read needs a new
+  `Machine` method with no leadership check at all, real future work.
+- **`revision` (every `GetResponse`/`PutResponse`/`DeleteResponse` field, §15.2) is
+  `Machine.AppliedIndex()` taken right after the call returns, not the exact index the
+  specific key was last written at.** `Machine`'s public API (`Get`, `GetLeaseRead`,
+  the internal `write` behind `Put`/`Delete`) never returns the barrier or commit index
+  it waited on — only `(value, ok, err)`. `AppliedIndex()` immediately afterward is a
+  real, correct lower bound (it is always ≥ whatever index the call's own barrier
+  waited on), not a fabricated number, but it is not per-key precise. Threading the
+  exact index through means widening `Machine`'s signatures, which have call sites
+  across `machine_test.go`, `integration_test.go`, and `fullsystem_test.go` — a real
+  change, deliberately not made as a drive-by part of wiring the gRPC server.
+- **`DeleteResponse.found` (§15.6, F-1) is unimplemented — always `false`.**
+  `Machine.Delete` reports only success or failure, never whether the key existed
+  beforehand. A `Get` immediately before the `Delete` would answer this most of the
+  time but is not atomic with it, and would report a real but misleading answer under a
+  concurrent writer racing between the two calls — worse than an honestly blank field.
+  Correct only via an engine-level change (`engine.Writer.Delete` itself reporting
+  prior existence), not attempted here.
+- **`client.RetryConfig`'s defaults (§17) are reasoned from a real measured number —
+  §10's 150–300ms election timeouts — but are not themselves measured against a real
+  multi-node failover or a real workload.** No real multi-node Raft cluster exists
+  yet to measure a real client failing over against (the same limitation §16.4 already
+  states for the gRPC server itself). `MaxAttempts=8`, `BaseDelay=20ms`,
+  `MaxDelay=500ms` are a considered starting point, joining `targetBlockSize`,
+  `bitsPerKey`, block cache size, and every other "asserted, not yet chosen from a
+  real workload" constant already on this list.
+- **The dedup table (§18, F-4) has no eviction.** `Machine.dedup` (`clientID` →
+  highest applied `sequenceNumber`) never removes an entry — every distinct
+  `clientID` this Machine has ever seen stays in memory, and inside every snapshot
+  image, for the node's entire lifetime. This is a real, unbounded-growth cost, not a
+  rounding error: `clientID` is a random `uint64` generated fresh per `client.Client`
+  instance (client.go's own doc on why), so a long-running cluster whose callers
+  periodically construct new `Client`s — the normal shape of, for instance, a
+  request-scoped web backend creating one per incoming HTTP request — accumulates one
+  permanent dedup entry per `Client` ever constructed, without bound. Real production
+  systems solving the identical problem (etcd's leases, TCP's own connection state)
+  solve it with session expiry: a `clientID` that goes unused past some TTL is evicted,
+  and a caller whose session expired simply starts a fresh one (accepting the small
+  window where a very late retry past that TTL is no longer deduplicated — a
+  deliberate, bounded trade-off, not a hole). No expiry mechanism exists here.
+  Deferred as real future work: this task's own scope was making a retry within one
+  session's practical lifetime never double-apply, not building a session/lease
+  subsystem session management was never asked to have.
 
 ---
 
@@ -3472,7 +3542,343 @@ read as unspecified-not-a-real-choice, and a compile-time check
 server-streaming rather than silently becoming unary if the `.proto`'s `stream`
 keyword were ever dropped in a future edit.
 
-## 16. Revision log
+## 16. The gRPC server, and the `NotLeader` error
+
+### 16.1 `internal/server.Server`: a translation layer, not a second read/write path
+
+`internal/server/server.go` implements `heliosv1.HeliosServer` (§15) by wrapping one
+node's already-existing `*raft.Node` and `*kvstore.Machine`. It reimplements nothing:
+`Get`, `Put`, and `Delete` each call straight through to an existing, already-tested
+`Machine` method (`Get`, `GetLeaseRead`, `Put`, `Delete` — all Phase H) and translate
+the Go return values into wire types and gRPC status codes. `Scan` and `Watch` are not
+implemented here at all — `Server` embeds `heliosv1.UnimplementedHeliosServer`, so both
+correctly answer `codes.Unimplemented` until Phase F-6 and F-7 build them, the
+identical embedding-as-scope-fence shape `TestScanAndWatchAreUnimplemented` locks in
+directly rather than trusting by omission.
+
+### 16.2 `LeaderHint`: the accessor `submit.go` named before this task existed
+
+`internal/raft/leaderhint.go` adds `func (n *Node) LeaderHint() int`, returning
+`leaderID` under `n.mu` — the single line of new production code this task adds to
+`package raft` itself. `leaderID` has existed since the leader-election phase; `submit.go`'s
+own doc has said *"the caller must find the real leader and try again; leaderID is the
+hint for that (F-2)"* since before `internal/server` existed. This accessor is the
+entire change needed to make the field usable from outside the package — nothing about
+how `leaderID` is written changes. It is a hint, not an authoritative answer, the same
+way a stale `nextIndex` guess costs an extra round trip rather than breaking anything
+(§10): a caller acting on it is making a best-effort routing decision, and correctness
+comes from the redirected node's own leadership check when the retry lands there, not
+from this value being current.
+
+### 16.3 `codes.Unavailable`, checked against gRPC's own litmus test, not picked by feel
+
+Every `Get`/`Put`/`Delete` that returns `kvstore.ErrNotLeader` is translated to
+`codes.Unavailable`, not `codes.FailedPrecondition` — a real choice, checked against
+gRPC's own documented guidance rather than either code's name sounding roughly right.
+gRPC's litmus test: use `UNAVAILABLE` when the client can retry just the failing call;
+use `FAILED_PRECONDITION` when the client should not retry until the system state is
+explicitly fixed. F-3's own stated job — *"Go client library: connect, discover the
+leader, retry with backoff on NotLeader"* — is exactly the first case: the failing call
+itself, redirected to a different node, is expected to succeed with nothing else
+needing to change first.
+
+The status carries a `NotLeaderDetail` (`api/proto/helios/v1/errors.proto`, a new file
+so `helios.proto`'s own frozen F-1 contract needed no edit): one field, `leader_id`,
+the peer ID this node currently believes leads, or `-1` (`raft.None`) if it has none.
+Deliberately not an address — resolving a peer ID to a dialable network address needs a
+cluster address book, which exists nowhere in this project yet, and belongs to
+whichever layer actually dials a peer. That is the client library, not this node —
+F-3's own job, not guessed at here.
+
+### 16.4 `cmd/helios` now listens for real
+
+`main.go` takes a second, optional argument (`grpcAddr`, defaulting to `:50051`),
+opens a `net.Listener`, and serves `heliosv1.HeliosServer` on its own goroutine
+alongside the existing `raft.Node` and `kvstore.Machine`. Shutdown order matters and is
+explicit: `grpcServer.GracefulStop()` runs *before* `m.Close()`, so an in-flight RPC
+finishes against a still-open `Machine` rather than racing a request against `Close()`
+tearing down the storage engine underneath it. Still single-node Raft, unchanged from
+§14.6's own reasoning — this task makes the client-facing layer real without touching
+Raft's own transport, which is a separate, later piece of work.
+
+### 16.5 What this task deliberately leaves for later tasks, not forgotten
+
+Three gaps, each a new entry in §12 rather than left implicit: `CONSISTENCY_STALE`
+(§15.3) is served by `GetLeaseRead`, a still-linearizable, still-leader-only path, not
+the follower-servable stale read F-1's own doc described — the closest available
+choice, not a silent redefinition. `revision` on every response is
+`Machine.AppliedIndex()` taken right after the call returns — a real, correct lower
+bound, not the exact per-key commit index, since `Machine`'s public API does not
+return that index to any caller today. `DeleteResponse.found` is unimplemented,
+always `false` — a `Get`-before-`Delete` would answer it most of the time but not
+atomically, and a misleading-under-race answer is worse than an honest blank one.
+
+**Implemented** at `internal/server/server.go` and `internal/raft/leaderhint.go`.
+Tested at `internal/server/server_test.go`: a real leader serving `Put`/`Get`/`Delete`
+end to end including a `CONSISTENCY_STALE` read; `Delete` then `Get` reporting absent;
+`Scan` and `Watch` answering `codes.Unimplemented`; and — the point of this task — a
+real pre-election window on a real single-node cluster producing a real
+`codes.Unavailable` status with a checkable `NotLeaderDetail`, for both the read and
+the write path independently. `internal/raft/leaderhint_test.go` locks in `LeaderHint`
+directly: `None` before any election, this node's own ID after winning one.
+
+## 17. The Go client library
+
+### 17.1 The address book, exactly where §16.3 said it would go
+
+`client.Config.Peers` (`map[int]string`, peer ID → gRPC address) is the cluster
+address book `internal/server`'s own `NotLeaderDetail` deliberately left unresolved:
+a status detail carries a peer ID, never an address, because dialing a peer is the
+caller's concern, not the node answering the RPC. `client` is that caller. This is
+the first piece of code in the whole project that needs to know more than one peer's
+network location at once — `raft.Node`'s own `Transport` has never had a real
+implementation, and `internal/server` only ever serves the one node it wraps — so
+this is also the first place a multi-node cluster's shape is expressed as data rather
+than assumed to be exactly one node.
+
+### 17.2 API shape mirrors `Machine`, not the wire messages
+
+`Get`/`GetStale`/`Put`/`Delete` return plain Go values — `(value, ok, revision,
+err)`, `(revision, err)` — the identical shape `kvstore.Machine.Get`/`GetLeaseRead`/
+`Put`/`Delete` already have, not the generated protobuf structs those calls travel as
+on the wire. The same "same shape one layer up" pattern this project has repeated at
+every boundary since `codec.go` first framed a `Command` the same way the WAL and
+SSTable already framed their own payloads (§13.1, §13.2): a caller who already knows
+`Machine`'s API from `internal/kvstore`'s own tests already knows this one. The
+generated `heliosv1` types stay an internal implementation detail, never part of this
+package's public surface. `GetStale` is its own method rather than a consistency
+parameter on `Get`, matching `Machine`'s own split into two distinctly named methods
+— and it does not paper over §16.5's own gap: `GetStale` is exactly as stale (i.e.,
+today, not very) as the server answering it actually is, a `CONSISTENCY_STALE` value
+served by the still-leader-only `GetLeaseRead`.
+
+`Scan` and `Watch` have no client methods yet — F-6 and F-7's own jobs, the identical
+scope fence `internal/server.Server` already applies by only embedding
+`UnimplementedHeliosServer` rather than stubbing either RPC out.
+
+### 17.3 Two retries, and only one of them waits
+
+Every failure lands in one of a small number of buckets, and each bucket gets a
+different response, argued from what the failure actually means rather than treated
+uniformly:
+
+- **A known leader hint (`codes.Unavailable` + `NotLeaderDetail` naming a peer this
+  Client has an address for) retries immediately, no backoff.** The server just said
+  exactly where to go; waiting on real information is pure wasted latency.
+- **An unhinted `Unavailable`, an unknown-peer hint, or a real dial failure** all
+  cycle to the next peer in a fixed, sorted ring and back off first. A guess, so it
+  waits like one — hammering a struggling or partitioned node as fast as possible
+  helps nobody.
+- **`codes.DeadlineExceeded`** (the server's own read-barrier timeout, §16) retries
+  the *same* peer after backing off — it may well still be leader, just briefly
+  behind, so there is no reason to abandon a guess that was likely correct.
+- **Anything else** (`codes.Internal`, and so on) is not retried at all. Retrying a
+  real bug does not fix the bug.
+
+Backoff itself uses full jitter — a uniform random draw between zero and the capped
+exponential delay, not the delay itself — the standard defense (AWS's own
+architecture write-up on exponential backoff is the usual citation) against every
+client waiting the identical amount and re-colliding on the same instant under
+concurrent load. The jitter's random source is a per-`Client`, explicitly seeded
+`*rand.Rand` — never the global `math/rand` package — the identical convention every
+seeded source in `internal/raft` already follows (`election.go`'s own doc on why),
+applied here for the same reason: reproducibility on demand, by setting `Config.Seed`,
+rather than by accident.
+
+### 17.4 The leader guess is cached and shared, not re-discovered every call
+
+A `Client`'s current best guess is one `atomic.Int64`, read at the start of every
+call and updated whenever a call succeeds or follows a real hint. Concurrent callers
+sharing one `Client` therefore share what has been learned: the first call to
+discover a real leader (by succeeding against it, or by following a hint to it)
+immediately benefits every other call already in flight or issued after — a `Client`
+does not make each goroutine rediscover the cluster's shape independently.
+Connections are cached the same way, one lazily-dialed `*grpc.ClientConn` per peer
+behind a `sync.Mutex`, reused for the `Client`'s whole lifetime rather than redialed
+per call.
+
+### 17.5 Testing strategy: a scripted fake server, and a real one
+
+Most of what this task needs proven is *client-side* behavior in response to a
+specific server response — which peer gets called, how many times, with or without a
+delay. A real single-node cluster cannot script "return `NotLeader` hinting peer 99,
+which does not exist" on demand, so `client_test.go` builds a small `fakeServer`
+(embedding `heliosv1.UnimplementedHeliosServer`, answering `Get` from a scripted,
+ordered list of canned responses) and serves it over a real `net.Listener` and a real
+`grpc.Server` — a real gRPC server, just one whose answers are authored by the test,
+the identical reason the Raft phase itself was built and tested against a fake
+in-memory transport (§2) before any real one existed. Every retry branch in §17.3 has
+its own test against this double, including cycling away from a *genuinely*
+unreachable address (a real listener opened and immediately closed) rather than only
+a scripted `Unavailable`, and a context-cancellation test proving the retry budget
+never overrides the caller's own deadline.
+
+Alongside those, two tests run against the real stack — a real `raft.Node`, a real
+`kvstore.Machine`, a real `internal/server.Server`, over a real gRPC connection:
+`TestPutGetDeleteRoundTripAgainstARealSingleNodeServer`, and — the actual point of
+this task — `TestPutSucceedsAfterRetryingThroughPreElectionNotLeader`, which calls
+`Put` on a real, just-started single-node cluster *before* it has elected itself and
+lets the `Client`'s own retry loop carry it through to a real, eventual success once
+the election completes. No special-casing anywhere for "this is the pre-election
+case" — it is an ordinary `NotLeader` retry that happens to resolve via a real
+election rather than a real redirect to a different node, the full-stack counterpart
+to `internal/raft/leaderhint_test.go`'s own pre-election-window test (§16.5).
+
+**Implemented** at `client/client.go`. Tested at `client/client_test.go`: every
+branch in §17.3 against a scripted fake server, `Config` validation, context
+cancellation, and the two real end-to-end tests above.
+
+## 18. Idempotent client requests
+
+### 18.1 The bug this closes, stated precisely
+
+§5 already guarantees log REPLAY is idempotent: a restarted node never applies the
+same log entry twice. That guarantee says nothing about a client that retries because
+it could not tell whether its ORIGINAL write committed — the network can drop a
+response after the write has already succeeded, and `client.Client`'s own retry loop
+(§17.3) has no way to distinguish that from the write never having been received at
+all. A retry in that situation submits the identical write again, which Raft appends
+as a genuinely SEPARATE log entry at a different index — `n.Submit` has no concept of
+"this command is the same as that one," only "here is another command to append."
+Both entries commit. Both apply, unless something stops the second one. For a Put
+carrying the same value both times, this is invisible. It stops being invisible the
+moment a DIFFERENT client's write lands in between: client A writes `v1`, commits.
+Client B writes `v2` to the same key, commits. A's retry — carrying its own original,
+now-stale `v1` — reaches the apply path with nothing to tell it that a newer value
+exists. Applied naively, it silently overwrites B's `v2` back to A's stale `v1`. This
+is not a hypothetical; `TestRetryDoesNotResurrectAConcurrentWritersNewerValue`
+(`internal/kvstore/idempotency_test.go`) reproduces exactly this sequence and asserts
+against exactly this failure mode.
+
+### 18.2 One choke point, not several independent guesses
+
+The dedup check lives in exactly one place: `internal/kvstore/machine.go`'s
+`applyCommand`, the apply path's own single consumer of `n.ApplyCh()`. This is
+deliberate, not the first place that happened to be convenient. A check at the gRPC
+server (`internal/server.Server.Put`) or inside `Machine.PutIdempotent` itself, before
+`n.Submit`, cannot be correct: two concurrent submissions of the identical
+`(clientID, sequenceNumber)` — an original attempt still in flight and a retry issued
+because the client could not yet tell whether it had committed — can both reach
+`n.Submit` and both be appended as separate log entries before either one's outcome is
+known. The only point in the whole system where every command destined for this
+node's state machine is ever seen, one at a time, in a fixed order, by a single
+decision-maker is the apply path — the identical "commitTo funnel" reasoning §8 gives
+for why `commitIndex` is never assigned directly from more than one code path, applied
+here to a second invariant that needed the same kind of single funnel.
+
+### 18.3 `clientID` and `sequenceNumber` travel inside the `Command` itself
+
+`PutRequest`/`DeleteRequest` (proto) carry the two fields; `codec.go`'s `encodePut`/
+`encodeDelete` carry them into the `Command` bytes that actually cross Raft's log —
+`[opType(1B)][clientID(8B)][sequenceNumber(8B)][keyLen(4B)][key]...`, fixed-width,
+the identical reasoning `snapshot.go`'s own header fields already used for "always
+exactly this size." `clientID == 0` is reserved as "no session, do not deduplicate" —
+`Machine.Put`/`Delete` pass it explicitly, so every caller and every test that
+predates this task keeps working completely unchanged, and a raw RPC caller that
+never opts in (direct `grpcurl`, a future admin tool) is never forced to. A genuinely
+non-zero `clientID` colliding with 0 by chance is not a concern `client.Client`
+leaves to chance either — `New` retries `rng.Uint64()` until it is non-zero,
+"believed impossible is checked, not trusted," the identical standard §8 states for
+Raft's own invariants.
+
+### 18.4 Recorded only after a successful apply
+
+`Machine.dedup[clientID]` is updated only once the underlying `engine.Writer.Put`/
+`Delete` call has actually succeeded — not before. If the write itself fails, a later
+retry carrying the identical `(clientID, sequenceNumber)` must still be free to
+genuinely attempt it, not be waved through as an already-done duplicate of something
+that never really happened. A duplicate, once recognized, still calls
+`recordApplied` for its own log index — the caller waiting on THAT index
+(`Machine.write`'s `waitForApplied`) still returns success, indistinguishably from a
+genuine first application. That indistinguishability is the whole point: a caller
+cannot tell, and does not need to, whether its write actually mutated storage or was
+recognized as already done.
+
+### 18.5 Why the dedup table has to travel inside the snapshot image
+
+Ordinary log replay on restart rebuilds `Machine.dedup` for free — replaying every
+entry through the identical check in `applyCommand` reconstructs the identical table,
+the same "no prefix ever applied twice" property §5 already leans on for the key/value
+data itself. That free reconstruction breaks the moment a node catches up via
+`InstallSnapshot` instead: a lagging follower, or a node restarting from its own
+snapshot floor, never replays the entries a snapshot compacted away, and would
+otherwise lose every dedup entry whose original log index fell below that floor. A
+sufficiently late, sufficiently stale retry landing after that point would then be
+re-applied with no record to stop it — resurrecting exactly the bug §18.1 describes,
+just delayed past a snapshot boundary instead of a leader change. `snapshot.go`'s
+image format now appends the whole table as a flat, fixed-width sequence after the
+key/value body; `Machine.installSnapshot` REPLACES `m.dedup` wholesale on install,
+the identical "image replaces, never merges" rule that function's own doc already
+states for every other piece of state an installed image carries.
+`TestDedupTableSurvivesSnapshotInstall` proves this directly: a write's dedup entry
+is still honored on a second Machine that only ever received a snapshot image, never
+replayed the original log entry at all.
+
+### 18.6 `client.Client`: one sequence space, and a real ordering guarantee
+
+`client.Client` draws one shared, monotonic `sequenceNumber` per write — `Put` and
+`Delete` from the same counter, not two separate spaces, since uniqueness within one
+`clientID`'s own history is all the dedup check actually needs. The harder question
+is ORDERING: the dedup check ("at or below the highest sequence number already
+applied") is only correct if sequence numbers commit in the order they were assigned.
+Two goroutines calling `Put` concurrently on the same `Client` could otherwise draw,
+say, `seq=5` and `seq=6` independently and have their underlying Raft entries commit
+in either order — letting a higher, already-applied `seq` silently suppress a lower,
+genuinely distinct write that simply happened to commit later. `writeMu` closes this
+by construction rather than by assumption: it is held for a `Put`/`Delete` call's
+ENTIRE duration, submission through every retry to final success or failure, so
+`seq N+1` is never even submitted until `seq N`'s call has completely finished. The
+real cost is real: writes from one `Client` are now fully serialized, not merely
+ordered. A caller wanting concurrent write throughput uses multiple `Client`
+instances — each with its own independently-drawn `clientID` and therefore its own
+independent dedup history with the server — the documented way to get concurrency
+back, not a workaround for a limitation.
+
+### 18.7 The retry storm test: exactly-once proven under real concurrency, not just in sequence
+
+Every test above proves the dedup check is correct given one attempt, then one
+carefully-sequenced retry. None of them exercise the actual race `applyCommand`'s own
+doc names as the reason the check cannot live anywhere earlier than the apply path:
+many concurrent submissions of the identical `(clientID, sequenceNumber)` reaching
+`n.Submit` before any of them knows whether an earlier one has committed, landing as
+separate log entries Raft must still apply one at a time.
+`TestRetryStormAppliesExactlyOnce` (`internal/kvstore`) and its RPC-boundary
+counterpart `TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary`
+(`internal/server`) close that gap: 64 goroutines — the project's own recurring
+"real worker pool" number (§14.10) — released from a shared `ready` channel at the
+same instant, each submitting under the identical `clientID`/`sequenceNumber`.
+
+DISTINCT KEYS PER ATTEMPT, NOT DISTINCT VALUES AT ONE SHARED KEY — WHAT MAKES THE
+ASSERTION A DIRECT COUNT RATHER THAN AN INFERENCE. A shared key would still show a
+single final value even if the dedup check let three of the storm's attempts
+through — `Put`'s own last-writer-wins semantics would simply erase the evidence,
+leaving only the last applied write visible, indistinguishable from one correct
+application. With one distinct key per attempt, the check applies to at most one of
+them no matter what: it is keyed purely on `(clientID, sequenceNumber)`, never on
+key, so every attempt after the first to actually reach `applyCommand`'s write branch
+is skipped regardless of which key it targets. The number of keys that exist
+afterward is therefore a direct, unambiguous count of how many attempts actually
+mutated storage, not something reconstructed from which value happened to win a
+race — the identical reasoning `TestPutIdempotentSuppressesADuplicateSequenceNumber`
+(§18, above) already used with a different value at one key, generalized here to a
+count strong enough to survive real concurrency rather than a careful two-call
+sequence. Both tests also assert every one of the 64 attempts — applied or
+deduplicated — returns success, the storm-scale version of the indistinguishability
+property §18.4 states: a caller cannot tell, and does not need to, which attempt
+actually mutated storage.
+
+**Implemented** at `internal/kvstore/codec.go`, `machine.go`, `read_snapshot.go`,
+`snapshot.go`; `internal/server/server.go` (branches on `ClientId == 0`); `client/
+client.go`; and the new `client_id`/`sequence_number` fields on `PutRequest`/
+`DeleteRequest` (`api/proto/helios/v1/helios.proto`). Tested at
+`internal/kvstore/idempotency_test.go` (the mechanism directly, including §18.1's own
+production-bug scenario, the snapshot-survival case, and §18.7's own retry storm),
+`internal/server/server_test.go`'s `TestPutIsIdempotentAcrossARetriedRPC` and
+`TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary` (the same guarantees proven at
+the actual RPC boundary a real retry crosses), and the updated `codec_test.go` (the
+wire round trip the whole mechanism depends on).
+
+## 19. Revision log
 
 
 | Version | Change |
@@ -3504,3 +3910,7 @@ keyword were ever dropped in a future edit.
 | v1.22 | A third real finding from getting §14.8's full-system test to run cleanly (new §14.11): the test's own restart measurement was wrong, not just the system it measures. NewMachine starts the apply loop with go machine.run() and returns immediately, so the first version's restartDuration only ever captured the fast synchronous half of a restart (compaction.Recover, WAL replay) while the slow half -- the apply loop's full catch-up through everything §14.9 says Raft redelivers -- ran invisibly, overlapping with the test's own post-restart verification. Surfaced by a real 20,000-key run failing, not by review: 144 of the first GetLeaseRead calls timed out waiting for their own read barrier, because the apply loop was still minutes behind and the 5-second default read timeout was nowhere near enough to wait it out. Every one of those reads was correctly refusing to answer from state that hadn't caught up -- confirmed to be a timing bug in the test's own phase ordering, not a correctness bug in Machine. Fixed by capturing AppliedIndex() before closing the first Machine and polling the second one until it reaches that value, budgeted at 3x the same run's own measured write-plus-delete duration, before verification is allowed to start. Confirmed working at 20,000 keys: a clean pass, with the real restart cost now correctly reported (setup 316ms, full catch-up 1m15s). Also confirmed at this run: reducing the write-phase worker pool from 64 to 8 (§14.10) was not merely neutral as reasoned -- measured directly, it achieved 77.19 puts/sec against the original 64-writer run's own extrapolated 26.34 ops/sec, nearly 3x faster, since fewer goroutines meant less real contention overhead on top of removing a throughput benefit that was never actually there. Extrapolating this run's real rates to the full one-million-key scale revised the total time estimate down substantially, from the earlier 10-15 hour guidance (based on write-phase extrapolation alone, before the restart phase was being measured at all) to roughly 4h40m (write ~3h36m, delete ~3m, restart catch-up ~1h3m) -- pending confirmation from the actual full run, not yet executed. §14.8's own results table remains pending that run. |
 | v1.23 | §14.8's full-system test completed for real, at 300,000 keys rather than the originally-planned one million (new §14.12): a first attempt at the full one million was run, watched, and deliberately killed after roughly 19 hours -- confirmed to be doing genuine work the whole time (real syscalls, a coherent manifest, growing on-disk state, ~23% average CPU utilization consistent with disk-I/O-bound waiting, not a hang), killed anyway because the trajectory made clear it would take multiple more days. That attempt directly surfaced a real gap in the test's own instrumentation, fixed as a result: t.Logf output only flushes when a test completes, so a killed 19-hour run had produced nothing quotable regardless of real progress made. fullSystemProgress added: a periodic, unbuffered fmt.Fprintf reporter mirrored to a fixed external log path, immediately validated by a fresh, watched 300,000-key run that completed cleanly in 4h33m, correct on every key before and after restart. Two further findings from that completed run: the write rate's mid-run appearance of stabilizing (an interval-to-interval read taken around the 40-46 minute mark) was corrected against the full curve, which showed continuous decay to completion rather than a genuine plateau -- recorded as a correction, not smoothed over. And restart's own catch-up (which never calls Submit and so never pays for persistIfDirty's fsync) ran 303,000 entries at 426.96/s, 21.85x faster than the write phase's own final rate of 19.54/s on the same data -- the most precise confirmation yet of §14.10's two-stacked-fsync diagnosis, though explicitly not claimed as definitive proof, since replay also skips client-side scheduling overhead the write phase's own worker pool carries. §14.8's results table filled in with real numbers throughout. |
 | v1.24 | The gRPC wire contract defined (new §15), the first task of Phase F: `helios.v1.Helios` -- `Get`, `Put`, `Delete`, `Scan` (unary), `Watch` (server-streaming) -- in `api/proto/helios/v1/helios.proto`, generated into public `api/helios/v1/` via `buf` driving local `protoc-gen-go`/`protoc-gen-go-grpc`. Schema only; no server or client exists yet. Every response's `revision` field is Raft's own commitIndex/lastApplied (§6, §8) exposed at the boundary, not a second counter. `Consistency` (`LINEARIZABLE`/`STALE`) is a per-request field on `Get`/`Scan` selecting between the two read paths §9 already implements and measured, defaulting to linearizable when unset. `Scan` is unary plus an opaque continuation token rather than a stream, committing only to the shape -- the token's real encoding is explicit deferred scope for a later task. `Watch` is single-prefix server-streaming, deliberately not etcd's multiplexed bidirectional protocol, which was rejected as unjustified complexity against this project's own stated goals and benchmark plan (§1). Idempotency fields and the `NotLeader` error's wire shape are named as deferred, not designed here, matching §12's own "Duplicate commands" open question. Tested at `api/helios/v1/smoke_test.go`: a marshal/unmarshal round trip per message, the zero-value contracts for `GetResponse.found` and `Consistency`, and a compile-time check that `Watch` generated as streaming rather than unary. |
+| v1.25 | The gRPC server built (new §16), Phase F-2: `internal/server.Server` implements `heliosv1.HeliosServer`, translating `Get`/`Put`/`Delete` straight through to already-tested `kvstore.Machine` methods -- no reimplemented read/write logic. `Scan`/`Watch` correctly answer `codes.Unimplemented` via embedding `UnimplementedHeliosServer`, an explicit scope fence for F-6/F-7. Every RPC that hits `kvstore.ErrNotLeader` answers `codes.Unavailable` (checked against gRPC's own retry litmus test, not `codes.FailedPrecondition`) carrying a `NotLeaderDetail` status detail with a `leader_id` -- not an address, since no cluster address book exists yet (F-3's job). `raft.Node.LeaderHint()` is the one new line of production code in `package raft` itself: an exported accessor for `leaderID`, a field `submit.go`'s own comment has named this task since before this package had any client-facing layer. `cmd/helios` now opens a real `net.Listener` and serves the API for real, with `GracefulStop()` sequenced before `m.Close()`. Three new open questions recorded in §12, each a real, named gap rather than a silently approximated default: `CONSISTENCY_STALE` is served by the still-leader-only `GetLeaseRead`, not a true follower-servable stale read; every response's `revision` is `Machine.AppliedIndex()` taken after the call returns, a correct lower bound but not the exact per-key commit index; `DeleteResponse.found` is unimplemented, always `false`, since the only way to answer it correctly needs an engine-level change, not a racy `Get`-before-`Delete`. Tested at `internal/server/server_test.go` and `internal/raft/leaderhint_test.go`, including a real pre-election window on a real single-node cluster producing a real, checkable `NotLeaderDetail` for both the read and the write path. |
+| v1.26 | The Go client library built (new §17), Phase F-3: `client.Client` connects, discovers the leader, and retries with backoff on `NotLeader`. `Config.Peers` (peer ID -> gRPC address) is the cluster address book §16.3 deliberately deferred here. `Get`/`GetStale`/`Put`/`Delete` mirror `kvstore.Machine`'s own plain-Go-value shape rather than exposing generated protobuf types; `Scan`/`Watch` have no client methods yet, the same scope fence `internal/server.Server` already applies. Two different retries, argued separately: a known `NotLeaderDetail` hint retries immediately (real information); an unhinted `Unavailable`, an unknown-peer hint, or a real dial failure cycles to the next peer in a fixed sorted ring and backs off with full jitter first (a guess, so it waits like one); `codes.DeadlineExceeded` retries the same peer after backing off; anything else is not retried. The leader guess and every peer connection are cached and shared across concurrent callers on one `Client`, not rediscovered per call. Backoff jitter uses a per-`Client`, explicitly seeded `*rand.Rand`, never the global `math/rand` source -- the identical convention `internal/raft` has followed since the election-timing phase. Tested with a scripted `fakeServer` (embedding `UnimplementedHeliosServer`, serving canned responses over a real `net.Listener`) covering every retry branch independently, including a genuinely unreachable address and a context-cancellation test proving the retry budget never overrides the caller's own deadline; and against the real stack end to end, including `TestPutSucceedsAfterRetryingThroughPreElectionNotLeader` -- the actual point of this task, a real `Put` issued before a real single-node cluster has elected itself, carried through to success by the retry loop alone. One new open question recorded in §12: `RetryConfig`'s defaults are reasoned from §10's own measured election-timeout range but are not themselves measured against a real multi-node failover, since none exists yet to measure against. This revision log entry also folds in v1.25's own DESIGN.md update, inadvertently left uncommitted when F-2 was committed -- the code for that task has been live since v1.25's own commit; only its design-doc entry was delayed to this one. |
+| v1.27 | Idempotent client requests built (new §18), Phase F-4: `clientID`/`sequenceNumber` on `PutRequest`/`DeleteRequest`, carried through Raft's own log inside the `Command` bytes (`codec.go`), so a client's retry after a lost or uncertain response is recognized and skipped rather than re-applied -- closing §12's "Duplicate commands" question and §5's own forward-reference to it, both open since the leader-election phase. The dedup check lives in exactly one place, `machine.go`'s `applyCommand` -- the apply path's single consumer of `n.ApplyCh()` -- because two concurrent submissions of the same `(clientID, sequenceNumber)` can reach `n.Submit` as separate log entries before either's outcome is known, so no earlier point (the gRPC server, `Machine.PutIdempotent` itself) can correctly catch a duplicate; the identical "commitTo funnel" reasoning §8 already gives for `commitIndex`. `Machine.Put`/`Delete` keep their pre-existing signatures unchanged (`clientID=0`, the "no session" sentinel); new `PutIdempotent`/`DeleteIdempotent` methods carry the real values, avoiding a breaking signature change across the dozens of existing call sites in `machine_test.go`/`integration_test.go`/`fullsystem_test.go`. `internal/server.Server.Put`/`Delete` branch on `ClientId == 0`. The dedup table now travels inside the snapshot image itself (`snapshot.go`, a new flat, fixed-width section after the key/value body) -- REPLACED wholesale on `InstallSnapshot`, not merged -- because ordinary log replay rebuilds it for free but a node catching up via a snapshot never replays the entries a snapshot compacted away, and would otherwise lose dedup history for any write whose original index fell below the floor. `client.Client` draws one shared, monotonic sequence number per write and adds `writeMu`, held for a write's entire duration including every retry -- turning "this Client's sequence numbers commit in the order assigned" into an actual invariant rather than an assumption, at the real cost of serializing writes per `Client` (a caller wanting concurrent write throughput uses multiple `Client` instances, each with its own independent `clientID`). One new open question recorded in §12: the dedup table has no eviction and grows without bound over a long-running cluster's lifetime -- real future work (session/lease expiry), out of this task's own scope. Tested at the new `internal/kvstore/idempotency_test.go` (including `TestRetryDoesNotResurrectAConcurrentWritersNewerValue`, reproducing the actual production bug this task exists to prevent, and a snapshot-survival test), `internal/server/server_test.go`'s new `TestPutIsIdempotentAcrossARetriedRPC` (the same guarantee at the real RPC boundary), and an updated `codec_test.go`. |
+| v1.28 | Duplicate-detection test: a forced retry storm, new §18.7. `TestRetryStormAppliesExactlyOnce` (`internal/kvstore`) and `TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary` (`internal/server`) release 64 goroutines from a shared channel at the same instant, all submitting under one shared `clientID`/`sequenceNumber` -- the actual concurrent race `applyCommand`'s own doc names as the reason dedup cannot live anywhere earlier than the apply path, not exercised by any prior idempotency test's careful one-attempt-then-one-retry sequencing. Each goroutine targets a DISTINCT key rather than a distinct value at one shared key, deliberately: a shared key would hide a partial dedup failure behind `Put`'s own last-writer-wins semantics, showing one final value regardless of how many attempts actually got through. With distinct keys, the number that exist afterward is a direct, unambiguous count of how many attempts mutated storage -- both tests assert exactly one, and that every one of the 64 attempts (applied or deduplicated) returned success. Test-only; no production code changed. |

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -291,5 +293,72 @@ func TestPutIsIdempotentAcrossARetriedRPC(t *testing.T) {
 	}
 	if !resp.GetFound() || string(resp.GetValue()) != "v1" {
 		t.Fatalf("Get(a) = (%q, found=%v), want (\"v1\", true) -- the retried Put must not have overwritten the original", resp.GetValue(), resp.GetFound())
+	}
+}
+
+// TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary is
+// TestRetryStormAppliesExactlyOnce (internal/kvstore/idempotency_test.go)
+// proven one layer up, at the boundary a real storm of retries actually
+// crosses: many concurrent Put RPCs sharing one ClientId/SequenceNumber,
+// each targeting a distinct key so "exactly once" is a direct count of
+// keys that exist afterward, not something inferred from which value
+// happened to win an overwrite race (see the kvstore-level test's own
+// doc for the full argument on why distinct keys, not distinct values
+// at one shared key, is what makes this assertion airtight).
+func TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n)
+	waitForLeader(t, s, 3*time.Second)
+
+	const (
+		clientID = 777
+		seq      = 1
+		storm    = 64
+	)
+
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, storm)
+	for i := 0; i < storm; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-ready
+			_, err := s.Put(context.Background(), &heliosv1.PutRequest{
+				Key:            []byte(fmt.Sprintf("storm-key-%02d", i)),
+				Value:          []byte(fmt.Sprintf("storm-value-%02d", i)),
+				ClientId:       clientID,
+				SequenceNumber: seq,
+			})
+			errs[i] = err
+		}(i)
+	}
+	close(ready)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("attempt %d: Put returned an error: %v -- every attempt in the storm must report success", i, err)
+		}
+	}
+
+	applied := 0
+	var appliedKeys []string
+	for i := 0; i < storm; i++ {
+		key := fmt.Sprintf("storm-key-%02d", i)
+		resp, err := s.Get(context.Background(), &heliosv1.GetRequest{Key: []byte(key)})
+		if err != nil {
+			t.Fatalf("Get(%q): %v", key, err)
+		}
+		if resp.GetFound() {
+			applied++
+			appliedKeys = append(appliedKeys, key)
+		}
+	}
+	if applied != 1 {
+		t.Fatalf("a retry storm of %d concurrent Put RPCs sharing (ClientId=%d, SequenceNumber=%d) "+
+			"resulted in %d key(s) actually applied (%v), want exactly 1", storm, clientID, seq, applied, appliedKeys)
 	}
 }

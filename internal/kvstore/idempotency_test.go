@@ -1,6 +1,8 @@
 package kvstore
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -233,5 +235,102 @@ func TestDedupTableSurvivesSnapshotInstall(t *testing.T) {
 	if !ok || string(value) != "original" {
 		t.Fatalf("m2's key after the \"retry\" = (%q, ok=%v), want (\"original\", true) -- "+
 			"the dedup table did not survive the snapshot install", value, ok)
+	}
+}
+
+// TestRetryStormAppliesExactlyOnce is every idempotency test above, at
+// once, under real concurrency, rather than two calls in careful
+// sequence. Every prior test in this file proves the CHECK is correct
+// given one attempt then one retry; this one proves the CHECK is safe
+// under the actual race applyCommand's own doc names as the reason
+// dedup cannot live anywhere earlier than the apply path: many
+// concurrent submissions of the identical (clientID, sequenceNumber)
+// reaching n.Submit before any of them knows whether an earlier one has
+// committed, all landing as separate log entries Raft must apply one at
+// a time.
+//
+// DISTINCT KEYS PER ATTEMPT, NOT DISTINCT VALUES AT ONE SHARED KEY --
+// DELIBERATELY, TO MAKE "EXACTLY ONCE" A DIRECT COUNT RATHER THAN
+// SOMETHING INFERRED FROM AN OVERWRITE RACE. A shared key would still
+// show a single final value even if the dedup check let three of the
+// storm's attempts through -- Put's own last-writer-wins semantics
+// would just erase the evidence, leaving only the LAST applied write
+// visible, indistinguishable from a single correct application. With
+// one distinct key per attempt, dedup applies to at most one of them no
+// matter what -- every attempt after the first to actually reach
+// applyCommand's write branch is skipped regardless of which key it
+// targets, since the check is keyed purely on (clientID,
+// sequenceNumber), never on key. So the number of keys that exist
+// afterward is a direct, unambiguous count of how many attempts
+// actually mutated storage -- not an inference.
+func TestRetryStormAppliesExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	waitForLeader(t, n, 3*time.Second)
+	m := newTestMachine(t, dir, n, DefaultOptions)
+
+	const (
+		clientID = 555
+		seq      = 1
+		storm    = 64 // this project's own recurring "real worker pool" number (§14.10)
+	)
+
+	// Every goroutine blocks on ready until all storm of them are built
+	// and waiting, then all are released in the same instant -- a real
+	// storm, maximally concurrent, not storm sequential calls whose
+	// scheduling happens to interleave.
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, storm)
+	for i := 0; i < storm; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-ready
+			key := []byte(fmt.Sprintf("storm-key-%02d", i))
+			value := []byte(fmt.Sprintf("storm-value-%02d", i))
+			errs[i] = m.PutIdempotent(key, value, clientID, seq)
+		}(i)
+	}
+	close(ready)
+	wg.Wait()
+
+	// Every attempt -- the one that actually applied and every one
+	// deduplicated -- must report success. This is the indistinguishability
+	// property machine.go's own applyCommand doc states directly: a
+	// caller cannot tell, and does not need to, whether its write
+	// mutated storage or was recognized as already done. An error here
+	// would mean the storm broke that promise for at least one attempt.
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("attempt %d: PutIdempotent returned an error: %v -- every attempt in the storm, applied or deduplicated, must report success", i, err)
+		}
+	}
+
+	// waitForApplied's own barrier (inside each returned PutIdempotent
+	// call) already guarantees every one of the storm's log entries has
+	// applied by the time wg.Wait() returns above -- Raft applies
+	// strictly in log order through applyCommand's single consumer, so
+	// the highest-index call among the storm cannot have returned
+	// without every lower-index call already having applied too. These
+	// Get calls are reading fully-settled state, not racing the apply
+	// loop.
+	applied := 0
+	var appliedKeys []string
+	for i := 0; i < storm; i++ {
+		key := fmt.Sprintf("storm-key-%02d", i)
+		_, ok, err := m.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Get(%q): %v", key, err)
+		}
+		if ok {
+			applied++
+			appliedKeys = append(appliedKeys, key)
+		}
+	}
+	if applied != 1 {
+		t.Fatalf("a retry storm of %d concurrent PutIdempotent calls sharing (clientID=%d, sequenceNumber=%d) "+
+			"resulted in %d key(s) actually applied (%v), want exactly 1 -- "+
+			"dedup let more than one attempt through under real concurrency", storm, clientID, seq, applied, appliedKeys)
 	}
 }
