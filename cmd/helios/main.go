@@ -21,6 +21,11 @@
 // leadership state, which is real and correct on one node today (see
 // internal/raft/leaderhint_test.go's own pre-election-window test for
 // the case that actually exercises it on a single node).
+//
+// This binary only ever starts a node; it has no client-facing
+// command-line tool of its own. cmd/heliosctl is that tool -- a
+// separate binary, matching etcd/etcdctl's own established server/CLI
+// split (see cmd/heliosctl/main.go's own doc for the full reasoning).
 package main
 
 import (

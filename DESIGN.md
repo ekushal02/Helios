@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.28 — leader election, log replication, the apply path, linearizable
+**Status:** v1.31 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -33,8 +33,9 @@ should. `internal/server.Server` (§16) now serves the client-facing gRPC contra
 straight through to `internal/kvstore.Machine`, and every RPC answers `NotLeader`
 (`codes.Unavailable`, per gRPC's own retry-litmus-test guidance) with a checkable
 leader-hint status detail when this node isn't leading, using a `raft.Node.LeaderHint`
-accessor exposed for the first time by this task. `Scan` and `Watch` correctly answer
-`codes.Unimplemented` — Phase F-6 and F-7's jobs, not built here. `client.Client`
+accessor exposed for the first time by this task. Every RPC `helios.proto` defines now
+has a real implementation, as of this task: `Watch` (§20) streams live and historical
+`Put`/`Delete` events for a key prefix, the last piece. `client.Client`
 (§17) now exists to call any of this: connect, cache a leader guess, and retry with
 backoff on `NotLeader` — following a real leader hint immediately, backing off only
 when guessing. Its own address book (peer ID → gRPC address) is exactly what §16.3
@@ -47,7 +48,20 @@ survives a snapshot install, not just an uninterrupted process lifetime — it n
 travels inside the snapshot image itself. Proven under real concurrency, not just a
 careful two-call sequence: a 64-goroutine retry storm (§18.7) sharing one
 `clientID`/`sequenceNumber` applies exactly once, at both the state-machine and the
-RPC boundary. Several wire fields (`revision` tracked
+RPC boundary. `Scan` (§19) is a real, paginated range read over the merged, sorted,
+tombstone-free key space, working within a real constraint rather than around it:
+neither `memtable.Iterator` nor `sstable.Iterator` has a `Seek` method, so
+`next_page_token` is literally the next page's own inclusive `start_key`, and each
+page costs O(n) rather than O(log n + limit) — named honestly in §12, not hidden.
+`Watch` is deliberately NOT leader-gated, the one RPC in this project that isn't —
+it needs only the in-order, exactly-once delivery Raft's own state machine safety
+guarantees on any node that applies a given entry, not the linearizability every
+other read requires a leader's own barrier for. Its own retained history is bounded
+(§12): a `start_revision` requesting further back than that returns
+`codes.OutOfRange` rather than silently starting a watch with an undetectable gap.
+`cmd/heliosctl` (§21) is the first way to reach any of this from a terminal —
+`heliosctl get/put/del/scan/status`, a separate binary from `cmd/helios` itself,
+matching etcd/etcdctl's own established split. Several wire fields (`revision` tracked
 exactly rather than approximated, `Delete`'s `found`, a real `CONSISTENCY_STALE` path)
 remain real, named, deferred gaps rather than solved defaults — see §16.5 and the
 entries in §12 those left behind, joined now by one on the dedup table's own unbounded
@@ -1656,6 +1670,55 @@ Deliberately unresolved. Each is answered by later work.
   Deferred as real future work: this task's own scope was making a retry within one
   session's practical lifetime never double-apply, not building a session/lease
   subsystem session management was never asked to have.
+- **`Scan` (§19, F-6) pages cost O(n) each, not O(log n + limit), because neither
+  storage-engine iterator can seek.** `memtable.Iterator` and `sstable.Iterator` both
+  start "positioned before the first entry" (their own docs' words) and offer only
+  `Next`; there is no way to jump directly to a given key, so every page's own merged
+  walk starts from the very beginning of the key space and skips forward by
+  comparison until it reaches that page's `start_key`. A scan across P pages therefore
+  costs O(n·P) in total, the same shape as re-scanning from scratch each time, rather
+  than the O(n) a seek-capable walk would cost once. Correct at every scale tested
+  (`TestScanPaginatesAcrossMultipleCallsWithoutGapsOrDuplicates` exercises 10 pages
+  over 47 keys), but a real, load-bearing cost on a large keyspace or a client that
+  pages all the way through it. A real fix needs a `Seek` method on both iterator
+  types — binary search into the SSTable block index directly (`Reader` already does
+  this for `Get`; `Iterator` does not), and a skip-list search jump for the memtable
+  side — a change to two packages this task had no other reason to touch. Deferred,
+  not attempted here.
+- **`Watch`'s retained history (§20, F-7) is a fixed-capacity ring buffer per Machine
+  (`Options.WatchHistoryCapacity`, default 1000 events), not a sized-by-bytes or
+  time-bounded window.** A `start_revision` older than the oldest retained event
+  returns `codes.OutOfRange` rather than silently starting a watch with a gap — the
+  honest, chosen behavior, not the limitation itself. The limitation is that the
+  window's SIZE is a blunt event count: a burst of very large values could evict a
+  meaningful amount of real history in far fewer than 1000 events, and a quiet
+  cluster wastes the same fixed memory holding events far older than any live
+  watcher plausibly still needs. A byte-bounded or time-bounded window would track
+  the actual cost more precisely; not built here.
+
+  A REAL BUG THIS AREA HAD, AND HOW IT WAS ACTUALLY FIXED, WORTH RECORDING: an
+  earlier draft assumed ordinary restart replay would rebuild the retained history
+  for free the same way §18.5 describes for the dedup table — true as far as it
+  goes, since Raft redelivers every entry above its own snapshot floor through
+  `ApplyCh` again after a restart, and `applyCommand`'s `notify` call runs on every
+  one of them. What that draft missed: nothing redelivers entries AT OR BELOW the
+  floor — they exist only inside the snapshot's own compacted image — so a fresh
+  `watchState` whose ring buffer had simply never been exercised enough to evict
+  anything (a short replay after a restart, well under `WatchHistoryCapacity`) would
+  answer a `start_revision` at or below the floor with `ok=true` and an INCOMPLETE
+  replay, no error, nothing to signal the gap. Fixed by `watchState.markFloor`,
+  called from `NewMachine` (the floor a node already had, at startup),
+  `Machine.take`, and `installSnapshot` (whenever the floor moves): it raises
+  `oldestEvicted` to at least the current snapshot floor directly, independent of
+  whatever the ring buffer's own capacity-based eviction has or hasn't done yet, so
+  the boundary is always reported correctly regardless of replay length or history
+  capacity. `TestWatchReportsGapBelowTheSnapshotFloorEvenWithoutRingBufferEviction`
+  (`internal/kvstore/watch_test.go`) is written to fail without this wiring and pass
+  with it — a `WatchHistoryCapacity` deliberately large enough that capacity-based
+  eviction cannot be what produces the correct answer. `raft.Node.SnapshotFloor`, a
+  new exported accessor mirroring `LeaderHint`'s own shape, is what made the fix
+  possible at all — Machine had no prior way to ask Raft where its own floor
+  currently sits.
 
 ---
 
@@ -3878,7 +3941,304 @@ production-bug scenario, the snapshot-survival case, and §18.7's own retry stor
 the actual RPC boundary a real retry crosses), and the updated `codec_test.go` (the
 wire round trip the whole mechanism depends on).
 
-## 19. Revision log
+## 19. Scan with pagination over the sorted key space
+
+### 19.1 The wire contract was already frozen; this task only had to implement it
+
+F-1's own `ScanRequest`/`ScanResponse` already committed to the shape — `start_key`
+(inclusive), `end_key` (exclusive, empty = unbounded), `limit`, `page_token`,
+`consistency` — with an explicit note that "the token's real encoding is a server
+implementation detail (F-6) that can change without breaking this schema." No proto
+change, no `buf generate`, for this task: `page_token` is opaque to the wire and to
+the client, so this task was free to choose whatever encoding actually fits the
+storage engine underneath it.
+
+### 19.2 The merge that already existed, bounded and paginated
+
+`kvstore.Machine.scanLocked` reuses `sstable.Merge` exactly as `buildImage` (§14, the
+snapshot path) already does: the active memtable's iterator first, then every open
+SSTable reader's, in the manifest's own newest-first order, merged into one sorted,
+deduplicated, tombstone-dropped walk. A snapshot walks the whole thing; `Scan` walks
+it bounded to `[startKey, endKey)` and stops after `limit` pairs. Nothing about the
+merge itself is new — the entire implementation cost of this task is in the boundary
+and pagination logic wrapped around a primitive `buildImage` had already proven
+correct.
+
+### 19.3 `page_token` IS the next page's own `start_key` — the design forced by a real constraint, not a stylistic choice
+
+Neither `memtable.Iterator` nor `sstable.Iterator` exposes `Seek`; both start
+"positioned before the first entry" and must be walked forward with `Next`, one entry
+at a time, from wherever a fresh `Merge` begins. There is no way to jump into the
+middle of the key space. Given that, the only correct meaning `page_token` could
+carry is the plainest one: the exact key the next page should treat as its own
+inclusive `start_key`. `scanLocked` sets it to the first key it encounters beyond the
+current page's `limit` — a key that has NOT been returned yet, so it belongs,
+inclusively, to the next page rather than needing to be skipped past. A more
+conventional "opaque cursor" design (an offset, an internal iterator handle) would
+have implied a capability — resuming without re-walking from the start — that the
+storage engine underneath it does not have; encoding a token that claims more than
+the engine can deliver would be dishonest, not merely unoptimized. §19.4 is the real
+cost of building within this constraint instead.
+
+### 19.4 The real cost, named rather than hidden: O(n) per page, not O(log n + limit)
+
+Because every page's own `Merge` starts from the very beginning of the key space and
+skips forward by comparison to reach its own `start_key`, a scan across P pages costs
+O(n·P) in total — the same shape as re-scanning from scratch on every page, not the
+O(n) a single seek-capable walk would cost once. `TestScanPaginatesAcrossMultipleCallsWithoutGapsOrDuplicates`
+proves correctness at 10 pages over 47 keys; it does not, and could not, prove this
+is cheap. A real fix needs `Seek` on both iterator types — binary search into the
+SSTable block index directly (`Reader.Get` already does this; `Iterator` does not),
+and a skip-list search jump for the memtable side — a change to two packages this
+task had no other reason to touch, recorded as its own entry in §12 rather than
+attempted here.
+
+### 19.5 Consistency, revision, and the client — extending established patterns, not inventing new ones
+
+`Server.Scan` selects `Machine.Scan` (linearizable, the barrier path) or
+`Machine.ScanLeaseRead` (the lease path) on `ScanRequest.Consistency`, exactly the
+branch `Server.Get` already takes — including the identical `CONSISTENCY_STALE` gap
+§16.5 already names: `ScanLeaseRead` is still leader-only and still linearizable, not
+a true follower-servable stale read. Every `KeyValue.Revision` in a page is the same
+`AppliedIndex()`-after-the-call approximation `Server.getResponse` already uses for
+`Get` — one value for the whole page, not tracked per key, the identical named gap,
+not a new one. `client.Client` gained `Scan`, `ScanStale`, and a convenience
+`ScanAll` that loops `Scan` internally until a range is exhausted — `Scan` itself
+stays single-page, matching F-1's own stated design intent that a bounded page (a UI
+list) and "give me everything" (`ScanAll`) are two different callers with two
+different needs, not one method trying to serve both by guessing which one is
+asking.
+
+**Implemented** at `internal/kvstore/scan.go` (`Scan`, `ScanLeaseRead`,
+`scanLocked`); `internal/server/server.go` (`Server.Scan`, `defaultScanLimit`);
+`client/client.go` (`Scan`, `ScanStale`, `ScanAll`). No proto changes. Tested at
+`internal/kvstore/scan_test.go` (sorted order, bounds, tombstone exclusion,
+pagination convergence against an unlimited scan, and a merge spanning a flushed
+SSTable plus the active memtable with a post-flush overwrite), `internal/server/server_test.go`
+(the same pagination contract at the RPC boundary, plus a pre-election `NotLeader`
+check mirroring `Get`/`Put`'s own), and `client/client_test.go` (a real end-to-end
+`Scan`/`ScanAll` round trip, and a fake-server test confirming the generic retry
+loop's hint-following branch works correctly instantiated with `ScanRequest`/
+`ScanResponse` for the first time).
+
+## 20. Watch: stream changes for a key prefix to a client
+
+### 20.1 Not leader-gated — the one RPC in this project that isn't, and why that's correct rather than inconsistent
+
+Every other RPC (`Get`, `Put`, `Delete`, `Scan`) requires leadership, because every
+other RPC needs linearizability: a single authoritative answer as of a point in
+time, which only the leader's own read barrier (§9) can provide. `Watch` offers a
+genuinely different guarantee — "the sequence of writes this node applies, in the
+order it applies them" — which Raft's own state machine safety property already
+makes identical, in order, and exactly-once on every node that applies a given
+entry at all, leader or follower (§8). A watch subscribed on a lagging follower
+delivers events LATE relative to when they committed on the leader, but never out
+of order and never duplicated. Requiring leadership here would reject a request
+Raft's own safety guarantees already make valid to serve, purely to match a pattern
+the other RPCs need for a reason `Watch` does not share. This is a real design
+decision, not an oversight — recorded here rather than left to look like one.
+
+### 20.2 One choke point, again — `notify` inside `applyCommand`, and why it must never block
+
+`internal/kvstore/watch.go`'s `watchState.notify` is called from `applyCommand`
+right after a successful, non-deduplicated write — the identical single-consumer
+apply path §18.2 already argues is the one place a Raft-log-derived event can be
+correctly observed exactly once, in order. `notify` must never block: `applyCommand`
+is the sole, serial consumer of `n.ApplyCh()` for the whole cluster's worth of
+writes on this node, so a slow watcher blocking `notify` would stall every other
+write, not just its own stream. Delivery to each subscriber is therefore
+non-blocking (`select`/`default`): a watcher whose own buffered channel is already
+full is disconnected — its channel closed, dropped from the subscriber set — rather
+than allowed to backpressure the apply path or any other watcher. `Server.Watch`'s
+own stream simply ends when this happens (`live` closes); a real client sees the
+gRPC stream close and knows to resync via `Scan` and re-`Watch`, the same recovery
+path an evicted `start_revision` already requires (§20.4).
+
+`WatchEvent.Revision` is exact, not the `AppliedIndex()`-after-the-call
+approximation `Get`/`Put`/`Delete`/`Scan`'s own responses carry (§16.5's own named
+gap) — built directly inside `applyCommand`, which already knows
+`msg.CommandIndex` is the precise index this specific write committed at, with
+nothing to approximate.
+
+### 20.3 A real bug, found and fixed before it shipped: the snapshot-floor gap
+
+`watchState`'s ring buffer is capacity-bounded (`Options.WatchHistoryCapacity`,
+default 1000), evicting its own oldest entries under `notify`, and a
+`start_revision` at or below the oldest still-retained entry correctly reports
+`ok=false` — `Server.Watch` translates that to `codes.OutOfRange`. An early version
+of this reasoned, correctly, that ordinary restart replay would rebuild this ring
+buffer for free: Raft redelivers every entry above its own snapshot floor through
+`ApplyCh` after a restart (§5/§6's own "no prefix is ever applied twice," which
+constrains what is redelivered, not that nothing is), so `notify` runs again for
+everything above the floor, the identical free-reconstruction property §18.5
+already describes for the dedup table.
+
+What that reasoning missed: nothing redelivers entries AT OR BELOW the floor — they
+exist only inside the snapshot's own compacted image, which `watch.go` does not
+retain event history for. A freshly-restarted node whose replay is short (well
+under `WatchHistoryCapacity`, so the ring buffer's own capacity-based eviction has
+never fired) would answer a `start_revision` at or below the floor with `ok=true`
+and an INCOMPLETE replay — no error, nothing to signal that anything was missing.
+This is not a documented inefficiency like Scan's O(n) pages (§19.4); it is a
+silent, undetectable correctness gap of exactly the kind this project's own
+standard holds "worse than an honestly blank field."
+
+Fixed by `watchState.markFloor`, which raises `oldestEvicted` to at least the
+current snapshot floor directly — independent of whatever the ring buffer's own
+capacity-based eviction has or hasn't done — called from three places whenever that
+floor can move: `NewMachine` (the floor a node already has, at startup, before any
+replay or live traffic begins), `Machine.take` (this node compacting its own log),
+and `installSnapshot` (a floor advancing because of an image received from
+elsewhere). None of the three existed with a way to ask Raft where the floor
+currently sits, so `raft.Node.SnapshotFloor` — a new exported accessor, the
+identical shape `LeaderHint` (§16.2) already established for exposing exactly the
+one piece of otherwise-internal Raft state a higher layer turned out to need —
+is what made the fix possible at all.
+`TestWatchReportsGapBelowTheSnapshotFloorEvenWithoutRingBufferEviction`
+(`internal/kvstore/watch_test.go`) is written specifically to fail without this
+wiring and pass with it: `WatchHistoryCapacity` set deliberately large enough that
+capacity-based eviction cannot be what produces the correct answer, isolating the
+floor-based check as the only mechanism that could.
+
+### 20.4 What a client actually does when the gap happens
+
+`codes.OutOfRange`, not `codes.Unavailable`/`NotLeader` or a bare error — gRPC's own
+status code for exactly this shape of problem: the request itself is well-formed,
+but the specific range it names is no longer servable by this node. The error
+message states the recovery path directly: resync via `Scan`, then retry `Watch`
+with a current revision. This is the identical recovery a disconnected slow watcher
+(§20.2) already needs, so a client only needs one recovery strategy for both
+triggers of the same underlying situation — "I no longer know whether I have seen
+everything" — not two.
+
+### 20.5 The wire and the client — batching, prefix filtering, and a deliberately narrower retry story
+
+`Server.Watch` batches events into groups of `watchBatchSize` (100, unmeasured like
+every other constant on this list) for both the historical-replay backlog and a
+live burst, non-blockingly draining whatever is already buffered on `live` before
+each send — `WatchResponse`'s own F-1 doc named this batching intent directly, the
+same amortization argument already measured for `AppendEntries` coalescing (§10).
+Prefix filtering (`bytes.HasPrefix`) happens here, not inside `kvstore.Machine.Watch`
+— the identical layering `Scan` already uses (`scanLocked` has no idea what a
+client's own bounds mean, it just walks a range it is told to walk; §19.2 draws the
+same line).
+
+`client.Client.Watch` is deliberately NOT wrapped in `do`'s retry-with-backoff loop
+(§17.3) — a named scope boundary, not an oversight. `do`'s design fits a single
+request/response call: a failed attempt is simply retried, since nothing about a
+unary call has state that could be lost across a retry. A long-lived stream is
+different — if it died partway through and this method silently reconnected, the
+reconnection would need its own gap-detection story (did the disconnect happen
+between two events? was anything missed during the gap before a new stream's own
+replay could start covering it again?) that this task does not attempt to solve.
+What `Watch` does do: follow a single `NotLeader` hint before the stream is
+established, mirroring `do`'s own hint-following branch for exactly the
+well-understood part of the problem; once the stream is running, any failure —
+including a `NotLeader` appearing mid-stream, not assumed impossible even though it
+should not happen against a stable leader — ends the watch and is reported on the
+caller's own error channel, for the caller to decide how to resume (typically:
+`Scan` to resync, then `Watch` again from a current revision).
+
+**Implemented** at `internal/kvstore/watch.go` (`WatchEvent`, `watchState`,
+`Machine.Watch`), `internal/kvstore/machine.go` (`notify` call, `Options`
+additions, `Close` wiring), `internal/kvstore/read_snapshot.go` (`markFloor` in
+`take`/`installSnapshot`), `internal/raft/snapshotfloor.go` (`Node.SnapshotFloor`,
+new); `internal/server/server.go` (`Server.Watch`); `client/client.go`
+(`Client.Watch`). No proto change — F-1's `WatchRequest`/`WatchEvent`/
+`WatchResponse` already committed to this shape. Tested at
+`internal/kvstore/watch_test.go` (live delivery, the `start_revision=0` no-replay
+contract, replay-then-live continuity, the evicted-revision gap, Put vs. Delete,
+the slow-watcher-disconnection property directly, clean shutdown on `Machine.Close`,
+and §20.3's own regression test), `internal/raft/snapshotfloor_test.go` (the new
+accessor directly), `internal/server/server_test.go` (prefix filtering and
+`codes.OutOfRange` at the RPC boundary, via a hand-written fake stream matching this
+file's own established direct-call testing convention), and `client/client_test.go`
+(the single-redirect-before-the-stream-starts branch against a scripted fake
+server, and a real end-to-end watch against the full stack).
+
+## 21. `heliosctl`: a command-line client
+
+### 21.1 A separate binary, matching real, well-known prior art
+
+`cmd/heliosctl` is a new, separate binary — not a subcommand of `cmd/helios` (the
+server). This mirrors etcd/etcdctl and Kubernetes' own apiserver/kubectl exactly: a
+server daemon and its own command-line client are conventionally two different
+programs. `cmd/helios` already exists, already named `helios`, and already takes
+positional arguments (a data directory, then a gRPC address) — reshaping its own
+invocation into something like `helios serve <dir> <addr>` just to make room for
+`helios get ...` would be a breaking change to an already-established command, for a
+benefit (one shared binary name) real prior art does not treat as worth that cost.
+
+### 21.2 What "a stranger could follow" actually means here
+
+Three concrete choices, not just an intention stated in a doc comment:
+
+- **A default for `--peers`** (`1=localhost:50051`, matching `cmd/helios`'s own
+  default gRPC address) means someone who just started `helios` with no arguments
+  and then runs `heliosctl get foo` gets exactly what they'd expect without first
+  learning `--peers` exists at all. The flag is there for a real cluster; it is not
+  required to try the tool at all.
+- **Every command's help includes worked examples**, not just a flag list —
+  `TestRunHelpForEachKnownCommand` asserts an `Examples:` section exists for every
+  one of them, so this is checked, not merely intended.
+- **Argument and flag errors are caught before any network call**, with a message
+  naming exactly what was wrong and reprinting that command's own help immediately
+  underneath — `TestSubcommandsRejectWrongArgCount` checks every subcommand fails
+  fast rather than hanging on a connection attempt when what was actually wrong was
+  the invocation itself.
+
+### 21.3 Exit codes: two states, not a taxonomy
+
+`0` on success, `1` on anything else — including a missing key on `get`, a bad flag,
+a connection failure, or an unreachable peer in `status`. A finer-grained scheme
+(distinguishing "not found" from "usage error" from "RPC failure" by exit code, the
+way some Unix tools do) was considered and rejected: this task's own stated bar is
+help text a stranger can follow, and a two-state model — "it worked" or "read
+stderr" — asks less of that stranger than a code table would, for a tool whose
+primary interface is a human at a terminal, not a script parsing exit codes for
+fine-grained branching. `get` on a missing key does print `(key not found)` to
+stdout, matching `redis-cli`'s own well-known convention for exactly this case — a
+directly relevant precedent for a KV store CLI specifically, not an invented one.
+
+### 21.4 `status`: the one command that deliberately does NOT use the resilient client
+
+Every other command (`get`/`put`/`del`/`scan`) builds one ordinary `client.Client`
+and lets its own retry-and-redirect logic (§17.3) find a working peer — that
+resilience, hiding which specific node ends up answering, is exactly what those
+commands want. `status` wants the opposite: per-node visibility. It talks to each
+configured peer individually, via its own single-peer `client.Client` with
+`RetryConfig{MaxAttempts: 1}` — one real RPC against exactly the peer being asked
+about, no retry, no redirect, so the answer for that peer is the whole answer, not a
+partial one still waiting on more attempts.
+
+Distinguishing "reachable, but not the leader" from "genuinely unreachable" needed
+one real check, not a guess: both surface as `codes.Unavailable` (`Server.Get`'s own
+doc: a real dial/network failure surfaces as the identical code a structured
+`NotLeader` answer does), indistinguishable by code alone. Only the presence of a
+`NotLeaderDetail` among the status's own details actually proves the peer was
+reachable and responded — `probePeer` checks for it directly rather than trusting
+the code by itself. When one is found, the note also reports the hinted leader ID
+(or "no leader elected yet" for the `-1` sentinel) rather than a bare "not the
+leader," since a real operator asking about cluster health wants to know who the
+peer in front of them currently believes leads, not just that it isn't itself.
+
+### 21.5 `scan --all` and `--stale`: an honest interaction, not a silent no-op
+
+`client.Client.ScanAll` (§19.5) has no consistency parameter of its own — it always
+calls the linearizable `Scan` internally, looping until exhausted. Combining
+`heliosctl scan --all --stale` therefore has `--stale` do nothing, silently, unless
+told otherwise: `scanHelp`'s own text says so directly ("`--stale` is ignored when
+combined with `--all`") rather than leaving a flag that appears to do nothing for a
+reason the user has no way to discover.
+
+**Implemented** at `cmd/heliosctl/` (`main.go`, `flags.go`, `help.go`, `get.go`,
+`put.go`, `del.go`, `scan.go`, `status.go`). Tested at `flags_test.go` (peer-string
+parsing, every subcommand's own argument validation, help routing, all
+network-free) and `integration_test.go` (every subcommand exercised against a real
+single-node server built the identical way `client_test.go`'s own `startRealServer`
+is, plus a genuinely unreachable peer for `status`).
+
+## 22. Revision log
 
 
 | Version | Change |
@@ -3914,3 +4274,8 @@ wire round trip the whole mechanism depends on).
 | v1.26 | The Go client library built (new §17), Phase F-3: `client.Client` connects, discovers the leader, and retries with backoff on `NotLeader`. `Config.Peers` (peer ID -> gRPC address) is the cluster address book §16.3 deliberately deferred here. `Get`/`GetStale`/`Put`/`Delete` mirror `kvstore.Machine`'s own plain-Go-value shape rather than exposing generated protobuf types; `Scan`/`Watch` have no client methods yet, the same scope fence `internal/server.Server` already applies. Two different retries, argued separately: a known `NotLeaderDetail` hint retries immediately (real information); an unhinted `Unavailable`, an unknown-peer hint, or a real dial failure cycles to the next peer in a fixed sorted ring and backs off with full jitter first (a guess, so it waits like one); `codes.DeadlineExceeded` retries the same peer after backing off; anything else is not retried. The leader guess and every peer connection are cached and shared across concurrent callers on one `Client`, not rediscovered per call. Backoff jitter uses a per-`Client`, explicitly seeded `*rand.Rand`, never the global `math/rand` source -- the identical convention `internal/raft` has followed since the election-timing phase. Tested with a scripted `fakeServer` (embedding `UnimplementedHeliosServer`, serving canned responses over a real `net.Listener`) covering every retry branch independently, including a genuinely unreachable address and a context-cancellation test proving the retry budget never overrides the caller's own deadline; and against the real stack end to end, including `TestPutSucceedsAfterRetryingThroughPreElectionNotLeader` -- the actual point of this task, a real `Put` issued before a real single-node cluster has elected itself, carried through to success by the retry loop alone. One new open question recorded in §12: `RetryConfig`'s defaults are reasoned from §10's own measured election-timeout range but are not themselves measured against a real multi-node failover, since none exists yet to measure against. This revision log entry also folds in v1.25's own DESIGN.md update, inadvertently left uncommitted when F-2 was committed -- the code for that task has been live since v1.25's own commit; only its design-doc entry was delayed to this one. |
 | v1.27 | Idempotent client requests built (new §18), Phase F-4: `clientID`/`sequenceNumber` on `PutRequest`/`DeleteRequest`, carried through Raft's own log inside the `Command` bytes (`codec.go`), so a client's retry after a lost or uncertain response is recognized and skipped rather than re-applied -- closing §12's "Duplicate commands" question and §5's own forward-reference to it, both open since the leader-election phase. The dedup check lives in exactly one place, `machine.go`'s `applyCommand` -- the apply path's single consumer of `n.ApplyCh()` -- because two concurrent submissions of the same `(clientID, sequenceNumber)` can reach `n.Submit` as separate log entries before either's outcome is known, so no earlier point (the gRPC server, `Machine.PutIdempotent` itself) can correctly catch a duplicate; the identical "commitTo funnel" reasoning §8 already gives for `commitIndex`. `Machine.Put`/`Delete` keep their pre-existing signatures unchanged (`clientID=0`, the "no session" sentinel); new `PutIdempotent`/`DeleteIdempotent` methods carry the real values, avoiding a breaking signature change across the dozens of existing call sites in `machine_test.go`/`integration_test.go`/`fullsystem_test.go`. `internal/server.Server.Put`/`Delete` branch on `ClientId == 0`. The dedup table now travels inside the snapshot image itself (`snapshot.go`, a new flat, fixed-width section after the key/value body) -- REPLACED wholesale on `InstallSnapshot`, not merged -- because ordinary log replay rebuilds it for free but a node catching up via a snapshot never replays the entries a snapshot compacted away, and would otherwise lose dedup history for any write whose original index fell below the floor. `client.Client` draws one shared, monotonic sequence number per write and adds `writeMu`, held for a write's entire duration including every retry -- turning "this Client's sequence numbers commit in the order assigned" into an actual invariant rather than an assumption, at the real cost of serializing writes per `Client` (a caller wanting concurrent write throughput uses multiple `Client` instances, each with its own independent `clientID`). One new open question recorded in §12: the dedup table has no eviction and grows without bound over a long-running cluster's lifetime -- real future work (session/lease expiry), out of this task's own scope. Tested at the new `internal/kvstore/idempotency_test.go` (including `TestRetryDoesNotResurrectAConcurrentWritersNewerValue`, reproducing the actual production bug this task exists to prevent, and a snapshot-survival test), `internal/server/server_test.go`'s new `TestPutIsIdempotentAcrossARetriedRPC` (the same guarantee at the real RPC boundary), and an updated `codec_test.go`. |
 | v1.28 | Duplicate-detection test: a forced retry storm, new §18.7. `TestRetryStormAppliesExactlyOnce` (`internal/kvstore`) and `TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary` (`internal/server`) release 64 goroutines from a shared channel at the same instant, all submitting under one shared `clientID`/`sequenceNumber` -- the actual concurrent race `applyCommand`'s own doc names as the reason dedup cannot live anywhere earlier than the apply path, not exercised by any prior idempotency test's careful one-attempt-then-one-retry sequencing. Each goroutine targets a DISTINCT key rather than a distinct value at one shared key, deliberately: a shared key would hide a partial dedup failure behind `Put`'s own last-writer-wins semantics, showing one final value regardless of how many attempts actually got through. With distinct keys, the number that exist afterward is a direct, unambiguous count of how many attempts mutated storage -- both tests assert exactly one, and that every one of the 64 attempts (applied or deduplicated) returned success. Test-only; no production code changed. |
+| v1.29 | Scan with pagination over the sorted key space (new §19), Phase F-6: no proto change needed, F-1's own `ScanRequest`/`ScanResponse` already committed to the shape. `Machine.Scan`/`ScanLeaseRead` (`internal/kvstore/scan.go`) reuse `sstable.Merge` exactly as `buildImage` (§14) already does -- bounded to `[startKey, endKey)`, capped at `limit`. Real finding, checked against the actual iterator source rather than assumed: neither `memtable.Iterator` nor `sstable.Iterator` has a `Seek` method, so `page_token` can only honestly be the next page's own inclusive `start_key` -- not an opaque cursor implying a resume capability the engine doesn't have -- and each page costs O(n), not O(log n + limit); a scan across P pages costs O(n·P) total. Named as a new §12 open question, not hidden: a real fix needs `Seek` on both iterator types, a change to two packages this task had no other reason to touch. `Server.Scan` selects `Machine.Scan`/`ScanLeaseRead` on `Consistency` exactly the way `Server.Get` already does, including the identical `CONSISTENCY_STALE` gap (§16.5); `KeyValue.Revision` reuses the same `AppliedIndex()`-after-the-call approximation `Get` already has, one value per page. `client.Client` gained `Scan`, `ScanStale`, and `ScanAll` (a convenience loop aggregating every page) -- `Scan` itself stays single-page, matching F-1's own stated design intent that a bounded page and "give me everything" are different callers, not one method guessing which is asking. `internal/server`'s old combined `TestScanAndWatchAreUnimplemented` split: `TestWatchIsUnimplemented` remains (F-7's job), Scan gained real tests of its own. Tested at `internal/kvstore/scan_test.go` (sorted order, bounds, tombstone exclusion, pagination convergence against an unlimited scan, and a merge spanning a flushed SSTable plus the active memtable with a post-flush overwrite), `internal/server/server_test.go` (the same pagination contract at the RPC boundary plus a pre-election `NotLeader` check), and `client/client_test.go` (a real end-to-end `Scan`/`ScanAll` round trip, and a fake-server test proving the generic retry loop's hint-following branch works correctly instantiated with `ScanRequest`/`ScanResponse` for the first time). |
+
+| v1.30 | Watch: stream changes for a key prefix to a client (new §20), Phase F-7 -- the last unimplemented RPC in helios.proto. Deliberately NOT leader-gated, the one RPC in this project that isn't: Watch needs only the in-order, exactly-once delivery Raft's own state machine safety already guarantees on any node that applies a given entry, not the linearizability every other read needs a leader's own barrier for. `watchState.notify` (internal/kvstore/watch.go) is called from applyCommand's own single-consumer apply path, non-blocking by design (select/default) -- a slow watcher whose buffered channel fills is disconnected rather than allowed to stall the apply path or any other watcher. WatchEvent.Revision is exact, not the AppliedIndex()-after-the-call approximation Get/Put/Delete/Scan carry, since applyCommand already knows the precise commit index. A real bug found and fixed before shipping, recorded in full in §20.3: an early version assumed restart replay alone would rebuild the retained-history ring buffer for free (true above the snapshot floor, the identical property §18.5 already describes for the dedup table), but missed that nothing redelivers entries AT OR BELOW the floor -- a freshly-restarted node with a short replay could silently answer a start_revision at or below the floor with an INCOMPLETE replay and ok=true, no error. Fixed by watchState.markFloor, called from NewMachine, Machine.take, and installSnapshot whenever the floor can move, backed by a new raft.Node.SnapshotFloor accessor (mirroring LeaderHint's own shape) Machine had no prior way to ask for. TestWatchReportsGapBelowTheSnapshotFloorEvenWithoutRingBufferEviction is written to fail without this wiring and pass with it. Server.Watch batches replay and live events (watchBatchSize), filters by key_prefix (the identical layering Scan already uses), and maps an evicted start_revision to codes.OutOfRange. client.Client.Watch deliberately is NOT wrapped in do's retry loop -- a long-lived stream reconnecting silently would need its own gap-detection story this task does not attempt -- but does follow a single NotLeader hint before the stream opens. New open question in §12: WatchHistoryCapacity is a blunt event-count bound, not byte- or time-sized. Tested at internal/kvstore/watch_test.go (live delivery, the start_revision=0 contract, replay-then-live continuity, the evicted-revision gap, Put vs Delete, slow-watcher disconnection, clean Close shutdown, and the snapshot-floor regression test), internal/raft/snapshotfloor_test.go, internal/server/server_test.go (prefix filtering and OutOfRange via a hand-written fake stream), and client/client_test.go (the redirect branch against a scripted fake server, plus a real end-to-end watch). |
+
+| v1.31 | A CLI, cmd/heliosctl (new §21): heliosctl get/put/del/scan/status, a separate binary from cmd/helios, matching etcd/etcdctl's own established server/CLI split rather than reshaping cmd/helios's already-established invocation. --peers defaults to 1=localhost:50051 (matching cmd/helios's own default gRPC address) so a first-time command works with no flags at all. Every command's help includes worked examples, checked directly (TestRunHelpForEachKnownCommand asserts an Examples: section on every one), and every subcommand validates its own arguments before any network call (TestSubcommandsRejectWrongArgCount). Exit codes are deliberately two-state (0 success, 1 anything else) rather than a finer taxonomy, reasoned as the better fit for a tool whose primary interface is a human reading stderr, not a script branching on codes; get on a missing key prints "(key not found)" to stdout, matching redis-cli's own convention for a KV store CLI specifically. status is the one command that does NOT use the resilient multi-peer client -- it probes each configured peer individually with a single-peer, MaxAttempts=1 client.Client, and distinguishes "reachable but not the leader" from "genuinely unreachable" by checking for a NotLeaderDetail among the status's own details (both cases otherwise share codes.Unavailable), reporting the hinted leader ID when one is present. scan --all silently ignoring --stale (ScanAll has no consistency parameter of its own) is documented directly in scan's own help text rather than left for the user to discover. cmd/helios/main.go gets a one-line pointer to heliosctl now that it exists. Tested at cmd/heliosctl/flags_test.go (peer parsing, argument validation, help routing, all network-free) and integration_test.go (every subcommand against a real single-node server, plus status against a genuinely unreachable peer). |
