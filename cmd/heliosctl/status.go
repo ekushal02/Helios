@@ -9,11 +9,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	heliosv1 "github.com/ekushal02/helios/api/helios/v1"
-	"github.com/ekushal02/helios/client"
 )
 
 func runStatus(args []string, stdout, stderr io.Writer) int {
@@ -44,16 +43,19 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	sort.Ints(ids)
 
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PEER\tADDRESS\tREACHABLE\tLEADER\tNOTE")
+	fmt.Fprintln(tw, "PEER\tADDRESS\tREACHABLE\tSTATE\tTERM\tCOMMIT\tAPPLIED\tLOG_LEN\tSNAPSHOT\tFAULT")
 
 	allReachable := true
 	for _, id := range ids {
 		addr := peers[id]
-		reachable, leader, note := probePeer(cf.timeout, id, addr)
-		if !reachable {
+		row, err := probePeer(cf.timeout, addr)
+		if err != nil {
 			allReachable = false
+			fmt.Fprintf(tw, "%d\t%s\tno\t-\t-\t-\t-\t-\t-\t%s\n", id, addr, err)
+			continue
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", id, addr, yesNo(reachable), leaderColumn(reachable, leader), note)
+		fmt.Fprintf(tw, "%d\t%s\tyes\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+			id, addr, row.state, row.term, row.commit, row.applied, row.logLen, row.snapshot, row.fault)
 	}
 	tw.Flush()
 
@@ -63,73 +65,62 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// probePeer talks to exactly ONE peer, bypassing client.Client's own
-// multi-peer redirect logic entirely. That resilience is exactly what
-// get/put/del/scan want and what status does not: status exists to
-// show what THIS specific node itself answers, not wherever a
-// resilient client would end up after following a hint elsewhere. A
-// single-peer Config with MaxAttempts=1 gives exactly one real RPC
-// against exactly the peer being asked about, no retry, no redirect --
-// this status IS the whole answer for that peer, not a partial one
-// still waiting on more attempts.
-func probePeer(timeout time.Duration, id int, addr string) (reachable, leader bool, note string) {
-	c, err := client.New(client.Config{
-		Peers: map[int]string{id: addr},
-		Retry: client.RetryConfig{MaxAttempts: 1, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond},
-	})
+type statusRow struct {
+	state    string
+	term     int64
+	commit   int64
+	applied  int64
+	logLen   int64
+	snapshot string
+	fault    string
+}
+
+// probePeer talks to exactly ONE peer, over its own raw connection --
+// bypassing client.Client entirely, not just its multi-peer redirect
+// logic (which the old, pre-F-9 version of this function used at
+// MaxAttempts=1 for the identical reason). client.Client only speaks
+// heliosv1.HeliosClient (the data-plane service); Status lives on the
+// separate heliosv1.HeliosAdminClient (admin.proto, F-9), which
+// client.Client has no reason to wrap, since admin introspection is
+// not the resilient, cluster-hiding kind of call that package exists
+// for.
+//
+// Deliberately NOT leader-gated on the server side (Server.Status's own
+// doc), so unlike the old Get-based probe this replaces, a follower's
+// own answer is never confused with "unreachable" -- reachability and
+// leadership are two independent, directly-reported facts now, not one
+// inferred from the other via a gRPC status code.
+func probePeer(timeout time.Duration, addr string) (statusRow, error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return false, false, err.Error()
+		return statusRow{}, fmt.Errorf("dial: %w", err)
 	}
-	defer c.Close()
+	defer conn.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// The key itself is arbitrary and never expected to exist --
-	// this call is a reachability/leadership probe, not a real read.
-	// A successful response (found or not) proves this peer answered
-	// as leader; the interesting case below is what its FAILURE says.
-	_, _, _, err = c.Get(ctx, []byte("__heliosctl_status_probe__"))
-	if err == nil {
-		return true, true, "-"
+	resp, err := heliosv1.NewHeliosAdminClient(conn).Status(ctx, &heliosv1.StatusRequest{})
+	if err != nil {
+		return statusRow{}, fmt.Errorf("unreachable: %w", err)
 	}
 
-	st, isStatus := status.FromError(err)
-	if !isStatus {
-		return false, false, "unreachable: " + err.Error()
+	snapshot := "-"
+	if resp.GetSnapshotIndex() > 0 {
+		snapshot = fmt.Sprintf("%d/%d", resp.GetSnapshotIndex(), resp.GetSnapshotTerm())
 	}
-	if st.Code() != codes.Unavailable {
-		return false, false, st.Message()
+	fault := resp.GetFault()
+	if fault == "" {
+		fault = "-"
 	}
 
-	// codes.Unavailable covers BOTH a structured "I'm just not the
-	// leader" answer AND a genuine connection failure (Server.Get's
-	// own doc: a dial/network failure surfaces as this identical
-	// code) -- indistinguishable by code alone. Only a NotLeaderDetail
-	// actually proves this peer was reachable and responded.
-	for _, d := range st.Details() {
-		nl, isNotLeader := d.(*heliosv1.NotLeaderDetail)
-		if !isNotLeader {
-			continue
-		}
-		if nl.GetLeaderId() < 0 {
-			return true, false, "reachable, not the leader (no leader elected yet)"
-		}
-		return true, false, fmt.Sprintf("reachable, not the leader (believes leader is peer %d)", nl.GetLeaderId())
-	}
-	return false, false, "unreachable: " + st.Message()
-}
-
-func yesNo(b bool) string {
-	if b {
-		return "yes"
-	}
-	return "no"
-}
-
-func leaderColumn(reachable, leader bool) string {
-	if !reachable {
-		return "-"
-	}
-	return yesNo(leader)
+	return statusRow{
+		state:    resp.GetRaftState(),
+		term:     resp.GetTerm(),
+		commit:   resp.GetCommitIndex(),
+		applied:  resp.GetLastApplied(),
+		logLen:   resp.GetLogLength(),
+		snapshot: snapshot,
+		fault:    fault,
+	}, nil
 }

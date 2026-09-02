@@ -600,3 +600,72 @@ func TestPutRetryStormAppliesExactlyOnceAtTheRPCBoundary(t *testing.T) {
 			"resulted in %d key(s) actually applied (%v), want exactly 1", storm, clientID, seq, applied, appliedKeys)
 	}
 }
+
+// TestStatusBeforeAnyElection is the RPC-boundary counterpart to
+// internal/raft/status_test.go's own TestStatusBeforeAnyElection --
+// the real point of Status not being leader-gated (unlike every other
+// RPC's own pre-election test in this file): it must succeed and
+// report real, if early, values, not a NotLeader error.
+func TestStatusBeforeAnyElection(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n) // deliberately no waitForLeader
+
+	resp, err := s.Status(context.Background(), &heliosv1.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status before any election: %v, want success (Status is not leader-gated)", err)
+	}
+	if resp.GetRaftState() != "follower" {
+		t.Errorf("RaftState = %q, want \"follower\"", resp.GetRaftState())
+	}
+	if resp.GetLeaderId() != int64(raft.None) {
+		t.Errorf("LeaderId = %d, want %d (raft.None)", resp.GetLeaderId(), raft.None)
+	}
+	if resp.GetFault() != "" {
+		t.Errorf("Fault = %q, want empty on a healthy, freshly-opened Machine", resp.GetFault())
+	}
+}
+
+// TestStatusAfterWinningAnElectionAndWriting proves every field that
+// SHOULD change with real activity actually does, at the RPC boundary
+// -- the same properties internal/raft/status_test.go already checks
+// directly on Node.Status, checked here through the wire translation
+// instead.
+func TestStatusAfterWinningAnElectionAndWriting(t *testing.T) {
+	dir := t.TempDir()
+	n := newTestNode(t, dir)
+	n.Start()
+	s := newTestServer(t, dir, n)
+	waitForLeader(t, s, 3*time.Second)
+
+	if _, err := s.Put(context.Background(), &heliosv1.PutRequest{Key: []byte("a"), Value: []byte("1")}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	resp, err := s.Status(context.Background(), &heliosv1.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if resp.GetRaftState() != "leader" {
+		t.Errorf("RaftState = %q, want \"leader\"", resp.GetRaftState())
+	}
+	if resp.GetTerm() < 1 {
+		t.Errorf("Term = %d, want >= 1", resp.GetTerm())
+	}
+	if resp.GetCommitIndex() <= 0 || resp.GetLastApplied() <= 0 {
+		t.Errorf("CommitIndex/LastApplied = %d/%d, want both > 0 after a real committed write", resp.GetCommitIndex(), resp.GetLastApplied())
+	}
+	if resp.GetLogLength() < 2 { // the leading placeholder plus at least the one real Put
+		t.Errorf("LogLength = %d, want >= 2", resp.GetLogLength())
+	}
+	if len(resp.GetVoters()) != 1 || resp.GetVoters()[0] != 1 {
+		t.Errorf("Voters = %v, want [1] (this single-node cluster's own id)", resp.GetVoters())
+	}
+	if resp.GetMachineAppliedIndex() <= 0 {
+		t.Errorf("MachineAppliedIndex = %d, want > 0", resp.GetMachineAppliedIndex())
+	}
+	if resp.GetFault() != "" {
+		t.Errorf("Fault = %q, want empty", resp.GetFault())
+	}
+}

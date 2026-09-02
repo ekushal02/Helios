@@ -114,14 +114,29 @@ Examples:
 
 const statusHelp = `heliosctl status [flags]
 
-For each configured peer, report whether it's reachable and whether it
-believes itself to be the leader.
+For each configured peer, report its own Raft and storage state,
+straight from that node's admin endpoint (Status, admin.proto).
 
-Talks to each peer INDIVIDUALLY -- unlike get/put/del/scan, which use
-the cluster resiliently via client.Client and don't care which specific
-node ends up answering, status exists specifically to show per-node
-detail, so it deliberately does not retry or redirect across peers the
-way every other command does.
+Columns:
+  REACHABLE   whether this peer answered at all
+  STATE       "follower", "candidate", or "leader" -- this node's own
+              current role, not inferred from anything else
+  TERM        this node's own current Raft term
+  COMMIT      commit index
+  APPLIED     last applied index (Raft's own bookkeeping)
+  LOG_LEN     entries currently held in this node's own log, including
+              one leading placeholder entry every node keeps
+  SNAPSHOT    "index/term" of the most recent snapshot, or "-" if none
+  FAULT       the first fault this node's storage engine has recorded,
+              or "-" if healthy
+
+Talks to each peer INDIVIDUALLY, over its own connection -- unlike
+get/put/del/scan, which use the cluster resiliently via client.Client
+and don't care which specific node ends up answering, status exists
+specifically to show per-node detail, so it deliberately does not
+retry or redirect across peers the way every other command does. A
+follower's own row is not an error -- Status reports what a node
+itself currently believes, whether or not it's the leader.
 
 Flags:
   --peers, --timeout   see "heliosctl help"

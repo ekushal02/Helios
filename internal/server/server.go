@@ -1,18 +1,21 @@
 // Package server wires heliosv1.HeliosServer (api/proto/helios/v1/helios.proto,
-// Phase F-1) to a single node's *kvstore.Machine and the *raft.Node it's
-// attached to. One Server per node -- cmd/helios constructs exactly one,
-// the same per-node-singleton shape as its own Machine and Node.
+// Phase F-1) AND heliosv1.HeliosAdminServer (admin.proto, F-9) to a
+// single node's *kvstore.Machine and the *raft.Node it's attached to.
+// One Server per node, implementing both services -- cmd/helios
+// registers the same value against both, since an admin endpoint and
+// the data-plane API it inspects both need the identical n/m pair, and
+// nothing about splitting them into two Go types would change what
+// either actually does.
 //
 // This is a translation layer and nothing more: it does not reimplement
-// any read or write logic. Every RPC calls straight through to an
-// existing Machine method (Get, GetLeaseRead, Put, Delete, Scan,
+// any read or write logic. Every data-plane RPC calls straight through
+// to an existing Machine method (Get, GetLeaseRead, Put, Delete, Scan,
 // ScanLeaseRead, Watch -- all built and tested in Phase H, F-6, and F-7)
 // and translates the Go return values into wire types and gRPC status
-// codes. As of F-7, every RPC helios.proto defines has a real
-// implementation; heliosv1.UnimplementedHeliosServer stays embedded
-// only because HeliosServer's own interface requires it (Go's forward-
-// compatibility convention for gRPC service interfaces), not because
-// anything still falls through to it.
+// codes. Status (F-9) is the one exception to "translates a Machine
+// call" -- it reads raft.Node.Status() directly, since cluster/Raft
+// introspection is exactly what that method exists to report, not
+// something Machine has any reason to know about.
 package server
 
 import (
@@ -28,21 +31,24 @@ import (
 	"github.com/ekushal02/helios/internal/raft"
 )
 
-// Server implements heliosv1.HeliosServer.
+// Server implements both heliosv1.HeliosServer and
+// heliosv1.HeliosAdminServer.
 type Server struct {
-	// Embedded only to satisfy heliosv1.HeliosServer's own forward-
-	// compatibility requirement (every implementation must embed
-	// UnimplementedHeliosServer, so a FUTURE new RPC added to the
+	// Embedded only to satisfy each service interface's own forward-
+	// compatibility requirement (every implementation must embed its
+	// own Unimplemented* type, so a FUTURE new RPC added to either
 	// service doesn't break existing implementations at compile time).
-	// As of F-7, every RPC below is implemented for real; nothing
-	// currently falls through to this.
+	// Every RPC both services define has a real implementation as of
+	// F-9; nothing currently falls through to either embed.
 	heliosv1.UnimplementedHeliosServer
+	heliosv1.UnimplementedHeliosAdminServer
 
 	n *raft.Node
 	m *kvstore.Machine
 }
 
 var _ heliosv1.HeliosServer = (*Server)(nil)
+var _ heliosv1.HeliosAdminServer = (*Server)(nil)
 
 // New wraps an already-open Node and Machine. It does not start or stop
 // either -- their lifecycle belongs to the caller (cmd/helios), the
@@ -355,6 +361,45 @@ func toWireWatchEvent(ev kvstore.WatchEvent) *heliosv1.WatchEvent {
 		we.Value = ev.Value
 	}
 	return we
+}
+
+// Status reports this node's own point-in-time view of its Raft and
+// storage state (admin.proto, F-9).
+//
+// DELIBERATELY NOT LEADER-GATED -- THE ONLY OTHER RPC IN THIS PACKAGE
+// THAT ISN'T IS Watch (F-7), FOR A RELATED BUT DISTINCT REASON. Watch
+// doesn't need a leader because Raft's own state machine safety makes
+// its guarantee (in-order, exactly-once delivery) valid on any node.
+// Status doesn't need one because it isn't reporting a CLUSTER fact at
+// all -- it reports what THIS node itself currently believes, which is
+// exactly as true on a follower as on a leader. A follower correctly
+// answering "I am a follower, term 3, leader is peer 2" is the
+// expected, useful response to an admin caller inspecting that
+// specific node -- not a NotLeader error redirecting them somewhere
+// else, which would make it impossible to ever ask a follower "what do
+// YOU currently think is going on."
+func (s *Server) Status(ctx context.Context, req *heliosv1.StatusRequest) (*heliosv1.StatusResponse, error) {
+	st := s.n.Status()
+
+	voters := make([]int64, len(st.Voters))
+	for i, v := range st.Voters {
+		voters[i] = int64(v)
+	}
+
+	return &heliosv1.StatusResponse{
+		NodeId:              int64(st.ID),
+		RaftState:           st.State.String(),
+		Term:                int64(st.Term),
+		LeaderId:            int64(st.LeaderID),
+		CommitIndex:         int64(st.CommitIndex),
+		LastApplied:         int64(st.LastApplied),
+		LogLength:           int64(st.LogLength),
+		SnapshotIndex:       int64(st.SnapshotIndex),
+		SnapshotTerm:        int64(st.SnapshotTerm),
+		Voters:              voters,
+		MachineAppliedIndex: int64(s.m.AppliedIndex()),
+		Fault:               s.m.Fault(),
+	}, nil
 }
 
 // translateErr maps a kvstore error to a gRPC status.

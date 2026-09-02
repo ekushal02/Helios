@@ -113,7 +113,14 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	heliosv1.RegisterHeliosServer(grpcServer, server.New(n, m))
+	heliosSrv := server.New(n, m)
+	heliosv1.RegisterHeliosServer(grpcServer, heliosSrv)
+	// The identical Server value, registered a second time against the
+	// admin service (F-9) -- Server implements both interfaces (see
+	// its own package doc), and both need the same n/m pair, so there
+	// is no reason for cmd/helios to construct two separate objects
+	// just to hand each service its own.
+	heliosv1.RegisterHeliosAdminServer(grpcServer, heliosSrv)
 
 	// Serve on its own goroutine -- Serve blocks until Stop/GracefulStop,
 	// which only happens from the shutdown-signal handling below, the

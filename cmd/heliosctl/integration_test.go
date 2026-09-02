@@ -74,6 +74,10 @@ func startRealServer(t *testing.T) string {
 	s := server.New(n, m)
 	gs := grpc.NewServer()
 	heliosv1.RegisterHeliosServer(gs, s)
+	// F-9: status.go now calls the admin service directly (no longer
+	// the old Get-probe workaround), so the test server needs to
+	// register it too, exactly as cmd/helios/main.go now does.
+	heliosv1.RegisterHeliosAdminServer(gs, s)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 
@@ -184,9 +188,19 @@ func TestEndToEndAgainstARealSingleNodeServer(t *testing.T) {
 	if len(lines) < 2 {
 		t.Fatalf("status stdout = %q, want a header line plus at least one peer line", stdout.String())
 	}
-	peerLine := lines[1]
-	if strings.Count(peerLine, "yes") != 2 {
-		t.Errorf("status peer line = %q, want two \"yes\" fields (reachable and leader) for the only, elected node", peerLine)
+	// PEER ADDRESS REACHABLE STATE TERM COMMIT APPLIED LOG_LEN SNAPSHOT FAULT
+	fields := strings.Fields(lines[1])
+	if len(fields) < 10 {
+		t.Fatalf("status peer line = %q, want 10 fields", lines[1])
+	}
+	if fields[2] != "yes" {
+		t.Errorf("REACHABLE = %q, want \"yes\"", fields[2])
+	}
+	if fields[3] != "leader" {
+		t.Errorf("STATE = %q, want \"leader\" (the only node in a single-node cluster)", fields[3])
+	}
+	if fields[9] != "-" {
+		t.Errorf("FAULT = %q, want \"-\" (healthy)", fields[9])
 	}
 }
 
@@ -217,7 +231,7 @@ func TestStatusReportsUnreachableForADeadPeer(t *testing.T) {
 	// a literal tab-joined substring.
 	fields := strings.Fields(lines[1])
 	if len(fields) < 4 {
-		t.Fatalf("status peer line = %q, want at least 4 fields (peer, address, reachable, leader)", lines[1])
+		t.Fatalf("status peer line = %q, want at least 4 fields (peer, address, reachable, state)", lines[1])
 	}
 	if fields[0] != "1" {
 		t.Errorf("peer id = %q, want \"1\"", fields[0])
@@ -229,6 +243,6 @@ func TestStatusReportsUnreachableForADeadPeer(t *testing.T) {
 		t.Errorf("reachable column = %q, want \"no\"", fields[2])
 	}
 	if fields[3] != "-" {
-		t.Errorf("leader column = %q, want \"-\" (unreachable peers have no leader answer)", fields[3])
+		t.Errorf("state column = %q, want \"-\" (unreachable peers have no state to report)", fields[3])
 	}
 }

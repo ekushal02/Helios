@@ -12,3 +12,13 @@
 
 # Coverage
 coverage.out
+
+# Runtime data directories -- created by running cmd/helios or the
+# various test helpers by hand (go run ./cmd/helios, go run
+# ./cmd/helios ./some-data-dir, etc.), never source. helios-data/ and
+# some-data-dir/ were already tracked before this entry existed --
+# see the commit removing them from the index (git rm -r --cached).
+helios-data/
+some-data-dir/
+*-data/
+*-data-dir/

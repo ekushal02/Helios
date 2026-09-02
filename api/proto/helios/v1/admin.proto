@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package helios.v1;
+
+option go_package = "github.com/ekushal02/helios/api/helios/v1;heliosv1";
+
+// HeliosAdmin is a deliberately separate service from Helios
+// (helios.proto) -- introspection and operations concerns, not the
+// client-facing data-plane reads and writes that service exists for.
+// Kept in its own file and its own service block for the identical
+// reason errors.proto (F-2) was kept separate from helios.proto: this
+// is additive tooling around the cluster, not a change to the
+// client-facing API surface F-1 already froze.
+service HeliosAdmin {
+  // Status reports THIS node's own point-in-time view of its Raft and
+  // storage state. Deliberately NOT leader-gated, unlike every
+  // data-plane RPC in helios.proto -- see internal/server's own doc on
+  // Server.Status for the full reasoning (the same shape Watch's own
+  // F-7 not-leader-gated decision already argued): a follower
+  // correctly reporting "I am a follower, term 3" is exactly what an
+  // admin caller inspecting that node wants, not something to reject.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  // This node's own Raft ID.
+  int64 node_id = 1;
+
+  // "follower", "candidate", or "leader" -- raft.State.String()'s own
+  // three values, spelled as a string rather than a proto enum, since
+  // this is a human-facing status report a caller displays, not a wire
+  // value another program branches its own logic on the way
+  // Consistency's own enum is.
+  string raft_state = 2;
+
+  int64 term = 3;
+
+  // The peer ID this node currently believes leads, or -1 if unknown.
+  // The identical "hint, not authority" meaning NotLeaderDetail.leader_id
+  // (errors.proto, F-2) already carries.
+  int64 leader_id = 4;
+
+  int64 commit_index = 5;
+  int64 last_applied = 6;
+
+  // How many entries this node currently holds in memory, INCLUDING
+  // the one leading placeholder entry every Raft node keeps even
+  // before its first real submission. log_length - 1 is the count of
+  // real, submitted entries currently retained.
+  int64 log_length = 7;
+
+  // 0, 0 if this node has never taken or installed a snapshot.
+  int64 snapshot_index = 8;
+  int64 snapshot_term = 9;
+
+  // The cluster membership this node currently believes is in force --
+  // every voting member's own ID, this node included if it is one.
+  repeated int64 voters = 10;
+
+  // kvstore.Machine's own applied index -- distinct from last_applied
+  // above (Raft's own bookkeeping of what it has handed over to the
+  // state machine, not what the state machine has actually finished
+  // applying). The two can differ briefly; both are reported rather
+  // than assuming they always agree.
+  int64 machine_applied_index = 11;
+
+  // kvstore.Machine.Fault() -- empty if healthy, otherwise the first
+  // fault this Machine has recorded, exactly as that method's own doc
+  // describes it.
+  string fault = 12;
+}
