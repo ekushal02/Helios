@@ -26,11 +26,17 @@
 // command-line tool of its own. cmd/heliosctl is that tool -- a
 // separate binary, matching etcd/etcdctl's own established server/CLI
 // split (see cmd/heliosctl/main.go's own doc for the full reasoning).
+//
+// Logs structured JSON, always (internal/logging.New) -- HELIOS_LOG_LEVEL
+// controls the minimum level, "info" if unset or unrecognized.
+// HELIOS_LOG_LEVEL=debug is what "dumps Raft state transitions" --
+// internal/raft's own setState logs every one at exactly that level;
+// there is no separate flag for it (internal/logging's own doc has the
+// full reasoning).
 package main
 
 import (
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -40,6 +46,7 @@ import (
 
 	heliosv1 "github.com/ekushal02/helios/api/helios/v1"
 	"github.com/ekushal02/helios/internal/kvstore"
+	"github.com/ekushal02/helios/internal/logging"
 	"github.com/ekushal02/helios/internal/raft"
 	"github.com/ekushal02/helios/internal/server"
 	"github.com/ekushal02/helios/internal/storage/sstable"
@@ -72,8 +79,9 @@ func main() {
 		grpcAddr = os.Args[2]
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	fmt.Printf("HELIOS starting -- data directory: %s, gRPC address: %s\n", dataDir, grpcAddr)
+	logLevel := logging.ParseLevel(os.Getenv("HELIOS_LOG_LEVEL"))
+	logger := logging.New(os.Stdout, logLevel)
+	fmt.Printf("HELIOS starting -- data directory: %s, gRPC address: %s, log level: %s\n", dataDir, grpcAddr, logLevel)
 
 	raftDir := filepath.Join(dataDir, "raft")
 	kvDir := filepath.Join(dataDir, "kv")

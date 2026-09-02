@@ -208,7 +208,7 @@ func (n *Node) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshot
 	if n.state == Candidate {
 		n.becomeFollower(args.Term)
 	}
-	n.state = Follower
+	n.setState(Follower, "received InstallSnapshot from a current leader")
 	n.leaderID = args.LeaderID
 	n.lastLeaderContact = time.Now()
 	n.resetElectionTimer()

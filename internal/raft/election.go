@@ -94,10 +94,10 @@ func (n *Node) stepDownIfStale(term int) bool {
 
 // becomeCandidate performs the follower-or-candidate to candidate transition.
 func (n *Node) becomeCandidate() {
-	n.state = Candidate
 	n.leaderID = None
-	n.currentTerm++
+	n.currentTerm++ // incremented BEFORE setState, so the logged term is this candidacy's own, not the prior one
 	n.votedFor = n.id // a real vote, counted toward majority()
+	n.setState(Candidate, "election timeout")
 	n.resetElectionTimer()
 
 	n.markDirty()
@@ -133,7 +133,7 @@ func (n *Node) becomeFollower(term int) {
 		n.markDirty()
 	}
 
-	n.state = Follower
+	n.setState(Follower, "discovered a newer term")
 	n.resetElectionTimer()
 }
 
@@ -142,7 +142,7 @@ func (n *Node) becomeLeader() {
 	if n.state != Candidate {
 		return
 	}
-	n.state = Leader
+	n.setState(Leader, "won election")
 
 	n.leaderID = n.id
 

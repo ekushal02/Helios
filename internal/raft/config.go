@@ -292,7 +292,7 @@ func (n *Node) stepDownIfRemoved() {
 	n.lg().Info("stepping down: not a member of the committed configuration",
 		"configIndex", n.configIndex, "servers", n.servers)
 
-	n.state = Follower
+	n.setState(Follower, "not a member of the committed configuration")
 	n.leaderID = None
 	n.resetElectionTimer()
 }
