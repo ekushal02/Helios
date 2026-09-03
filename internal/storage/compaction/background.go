@@ -10,18 +10,41 @@ import (
 // goroutine, so a caller's write path (engine.Writer, §13.7) never has
 // to trigger or wait on a compaction synchronously.
 //
-// NOTHING ABOUT PUT OR DELETE TOUCHES THE MANIFEST OR AN SSTABLE FILE AT
-// ALL, WHICH IS WHY THIS TYPE NEEDS NO LOCK SHARED WITH A WRITER.
-// engine.Writer's only durable state is its own *wal.WAL and
-// *memtable.Memtable (§13.7); Run only ever touches files already on
-// disk plus the manifest. The two share no lock, no field, nothing --
-// so a Background compactor was never going to contend with Writer.Put
-// or Writer.Delete for anything in-process, by construction rather than
-// by any synchronization added here. What a Background compactor CAN
-// still compete for is the same physical disk every concurrent WAL
-// fsync is also competing for, which is exactly what stall_test.go
-// measures directly, rather than assumes away because "there's no
-// shared lock."
+// NOTHING ABOUT ENGINE.WRITER'S PUT OR DELETE TOUCHES THE MANIFEST OR
+// AN SSTABLE FILE AT ALL, WHICH IS WHY THIS TYPE NEEDS NO LOCK SHARED
+// WITH engine.Writer SPECIFICALLY. engine.Writer's only durable state is
+// its own *wal.WAL and *memtable.Memtable (§13.7); Run only ever touches
+// files already on disk plus the manifest. The two share no lock, no
+// field, nothing -- so a Background compactor was never going to
+// contend with Writer.Put or Writer.Delete for anything in-process, by
+// construction rather than by any synchronization added here.
+//
+// THIS STOPPED BEING THE WHOLE STORY THE MOMENT A SECOND MANIFEST WRITER
+// EXISTED, AND THE CODE DID NOT CATCH UP TO THAT UNTIL A REAL FAILURE
+// FORCED IT TO. kvstore.Machine's own flush trigger
+// (freezeAndFlushLocked) is not engine.Writer -- it loads this exact
+// manifest, appends its own newly-flushed file to level 0, and saves,
+// entirely independently of whatever cycle this type's own loop is
+// running at the same moment. Two unsynchronized load-modify-save
+// cycles against the same file is a lost-update race by definition:
+// whichever Save lands second silently wins, either reverting a
+// just-completed compaction's manifest update back to a stale view that
+// still names files Run has already deleted (kvstore's own
+// TestFlushTriggersOnceTheActiveMemtableExceedsThreshold, "L0 holds 10
+// files" with a run of keys permanently unreadable), or erasing a
+// flush's brand-new file the instant CompactLevel clears the whole
+// level it just wrote into (the same test's other failure mode, "L0 has
+// no files ... the flush trigger never fired," when it had). See
+// manifestMu's own doc, and kvstore/machine.go's freezeAndFlushLocked,
+// for the fix -- exactly the "different, unbuilt layer above this
+// package" manifest.go's own doc names as where this coordination
+// belongs, now built rather than left implicit.
+//
+// What a Background compactor still separately competes for, and always
+// did, is the same physical disk every concurrent WAL fsync is also
+// competing for -- unrelated to the in-process race above, and exactly
+// what stall_test.go measures directly, rather than assumes away
+// because "there's no shared lock."
 type Background struct {
 	manifestPath string
 	dir          string
@@ -31,6 +54,15 @@ type Background struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	done     chan struct{}
+
+	// manifestMu serializes every load-modify-save cycle against
+	// manifestPath, across BOTH writers that touch it: this type's own
+	// Run calls (drainOneCycle, below) and kvstore.Machine's flush path
+	// (via the exported Lock/Unlock this field backs). Neither writer
+	// tolerates the other's update disappearing underneath it -- see
+	// this type's own doc for the two concrete failure shapes an
+	// unguarded race between them produced.
+	manifestMu sync.Mutex
 
 	mu      sync.Mutex
 	lastErr error
@@ -52,6 +84,22 @@ func StartBackground(manifestPath, dir string, opts Options, interval time.Durat
 	go b.loop()
 	return b
 }
+
+// Lock and Unlock give a caller that ALSO mutates the manifest this
+// Background is running compactions against -- currently, exactly one:
+// kvstore.Machine's own flush trigger -- a way to hold out this type's
+// own compaction cycles for the duration of its own load-modify-save
+// sequence, and vice versa. A matched Lock/Unlock pair, rather than a
+// single "run this under lock" callback, because the caller's own
+// sequence spans several steps that must all happen atomically with
+// respect to a concurrent Run (load the manifest, derive the next
+// sequence number from it, write the new SSTable that number names,
+// append it to level 0, save) -- a callback taking a closure over that
+// whole sequence would work too, but would hide, rather than name, that
+// what is actually being held here is the manifest, not some smaller
+// unit of work.
+func (b *Background) Lock()   { b.manifestMu.Lock() }
+func (b *Background) Unlock() { b.manifestMu.Unlock() }
 
 func (b *Background) loop() {
 	defer close(b.done)
@@ -116,7 +164,13 @@ func (b *Background) drainOneCycle() {
 			return
 		default:
 		}
+		// See manifestMu's own doc: held across the whole call, matching
+		// exactly what a concurrent kvstore.Machine flush now also holds
+		// it across, so the two load-modify-save cycles against
+		// manifestPath can never interleave.
+		b.manifestMu.Lock()
 		compacted, err := Run(b.manifestPath, b.dir, b.opts)
+		b.manifestMu.Unlock()
 		if err != nil {
 			b.setErr(fmt.Errorf("compaction: background cycle: %w", err))
 			return

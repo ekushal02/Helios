@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"strings"
 	"sync"
 	"testing"
@@ -13,11 +12,28 @@ import (
 )
 
 // fakeNetwork, an in-memory switchboard between nodes.
+//
+// EVERY FAULT DECISION IT MAKES -- drop this request, delay it by how much,
+// drop this reply -- is a pure function of (seed, kind, from, to, seq), computed
+// by messageHash below. There used to be a single shared *rand.Rand, drawn from
+// under fn.mu in whatever order goroutines happened to reach the lock in. That
+// order is a property of the Go scheduler, not of the seed: election's own
+// runElection fans SendRequestVote out to every peer AT ONCE (one goroutine
+// each), so two runs of the identical seed could -- and, under -shuffle=on
+// -count=3, eventually would -- hand message #1's drop roll to a different
+// logical message each time. The seed still appeared in every log line
+// (testlog_test.go), but pinning it and rerunning did not reproduce the
+// failure it named. Hashing each decision from the message's own identity
+// instead of a stream position removes the scheduler from the answer entirely:
+// replaying seed S reproduces the exact same drops, delays, and reorders,
+// regardless of which goroutine got to fn.mu first. See simreplay_test.go for
+// the test that checks exactly this property, and DESIGN.md §24 for why a
+// per-pair seq is safe to use here despite being assigned under a lock shared
+// across every pair.
 type fakeNetwork struct {
 	mu sync.Mutex
 
 	seed int64
-	rng  *rand.Rand
 
 	nodes map[int]*Node
 
@@ -40,17 +56,163 @@ type fakeNetwork struct {
 	nextSeq     map[[2]int]int //next stamp per directed pair, assigned at send
 	lastArrived map[[2]int]int //highest stamp delivered per directed pair
 	reordered   int            //messages that arrived behind a later-sent one
+
+	trace map[traceKey]decisionRecord //every decision made so far; see decisionTrace
 }
 
 func newFakeNetwork(seed int64) *fakeNetwork {
 	return &fakeNetwork{
 		seed:        seed,
-		rng:         rand.New(rand.NewSource(seed)),
 		nodes:       make(map[int]*Node),
 		reachable:   make(map[int]map[int]bool),
 		nextSeq:     make(map[[2]int]int),
 		lastArrived: make(map[[2]int]int),
 	}
+}
+
+// =============================================================================
+// Deterministic decisions: hashing instead of a shared RNG stream
+// =============================================================================
+
+// messageKind distinguishes the four RPCs sharing this network, so the same
+// (from, to, seq) triple used for, say, a leader's third AppendEntries to a
+// peer doesn't share a hash input with that peer's own third PreVote reply to
+// someone else -- each kind gets its own hash space.
+type messageKind uint8
+
+const (
+	kindRequestVote messageKind = iota
+	kindPreVote
+	kindAppendEntries
+	kindInstallSnapshot
+)
+
+// traceKey identifies one logical message: the seq-th send of this kind from
+// `from` to `to`. seq is assigned once, at route(), regardless of whether the
+// message is ultimately dropped -- see route's own comment on why that
+// assignment is safe to make under a lock shared across every directed pair,
+// not just this one.
+type traceKey struct {
+	kind messageKind
+	from int
+	to   int
+	seq  int
+}
+
+// decisionRecord is what the network decided for one message.
+type decisionRecord struct {
+	requestDropped bool
+	replyDropped   bool
+	delay          time.Duration
+}
+
+// splitmix64 is the same finalizer internal/storage/bloom's mix64 uses to
+// decorrelate its two probe hashes (DESIGN.md §13.5), reused here for the
+// identical reason: a small, fast, well-distributed integer hash that needs no
+// external dependency and, critically, no shared mutable state -- calling it
+// twice with the same input always gives the same output, from any goroutine,
+// in any order.
+func splitmix64(x uint64) uint64 {
+	x += 0x9E3779B97F4A7C15
+	z := x
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// combineHash folds one more integer into a running hash, splitmix64-style.
+func combineHash(h uint64, v int64) uint64 {
+	return splitmix64(h ^ uint64(v))
+}
+
+// Salts distinguish the different QUESTIONS asked about the same message --
+// "was the request dropped", "what was its delay", "was the reply dropped" --
+// so the three answers vary independently even though every other input is
+// shared between them.
+const (
+	saltRequestDrop uint64 = 1
+	saltDelay       uint64 = 2
+	saltReplyDrop   uint64 = 3
+)
+
+// messageHash is the entire source of randomness for one network decision.
+// Nothing here reads real time, and nothing here reads or advances shared
+// state -- it is a pure function of the network's own seed, which RPC this is,
+// its direction, its place in that pair's own sequence, and which question is
+// being asked. That purity is the whole point: see the fakeNetwork doc comment.
+func (fn *fakeNetwork) messageHash(kind messageKind, from, to, seq int, salt uint64) uint64 {
+	h := uint64(fn.seed)
+	h = combineHash(h, int64(kind))
+	h = combineHash(h, int64(from))
+	h = combineHash(h, int64(to))
+	h = combineHash(h, int64(seq))
+	h = combineHash(h, int64(salt))
+	return h
+}
+
+// hashUnitFloat maps a hash to [0, 1) using the standard 53-significant-bit
+// technique -- the same one math/rand's own Float64 uses internally -- so
+// dropRate and replyDropRate keep meaning exactly what they meant before.
+func hashUnitFloat(h uint64) float64 {
+	return float64(h>>11) / (1 << 53)
+}
+
+func (fn *fakeNetwork) rollDrop(kind messageKind, from, to, seq int) bool {
+	if fn.dropRate <= 0 {
+		return false
+	}
+	return hashUnitFloat(fn.messageHash(kind, from, to, seq, saltRequestDrop)) < fn.dropRate
+}
+
+func (fn *fakeNetwork) rollReplyDrop(kind messageKind, from, to, seq int) bool {
+	if fn.replyDropRate <= 0 {
+		return false
+	}
+	return hashUnitFloat(fn.messageHash(kind, from, to, seq, saltReplyDrop)) < fn.replyDropRate
+}
+
+func (fn *fakeNetwork) rollDelay(kind messageKind, from, to, seq int) time.Duration {
+	if fn.maxDelay <= fn.minDelay {
+		return fn.minDelay
+	}
+	span := uint64(fn.maxDelay - fn.minDelay)
+	h := fn.messageHash(kind, from, to, seq, saltDelay)
+	return fn.minDelay + time.Duration(h%span)
+}
+
+// recordRequestLocked and recordReplyLocked build up fn.trace as decisions are
+// made. Callers must hold fn.mu.
+func (fn *fakeNetwork) recordRequestLocked(kind messageKind, from, to, seq int, dropped bool, delay time.Duration) {
+	if fn.trace == nil {
+		fn.trace = make(map[traceKey]decisionRecord)
+	}
+	fn.trace[traceKey{kind, from, to, seq}] = decisionRecord{requestDropped: dropped, delay: delay}
+}
+
+func (fn *fakeNetwork) recordReplyLocked(kind messageKind, from, to, seq int, dropped bool) {
+	if fn.trace == nil {
+		fn.trace = make(map[traceKey]decisionRecord)
+	}
+	rec := fn.trace[traceKey{kind, from, to, seq}]
+	rec.replyDropped = dropped
+	fn.trace[traceKey{kind, from, to, seq}] = rec
+}
+
+// decisionTrace returns a snapshot of every network decision made so far,
+// keyed by the logical message it belongs to. Two runs of the identical
+// scripted scenario at the identical seed produce identical traces -- deep
+// equal, not just similarly shaped -- because every decision folded into it
+// came from messageHash, never from a shared, order-dependent stream. See
+// simreplay_test.go.
+func (fn *fakeNetwork) decisionTrace() map[traceKey]decisionRecord {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+
+	out := make(map[traceKey]decisionRecord, len(fn.trace))
+	for k, v := range fn.trace {
+		out[k] = v
+	}
+	return out
 }
 
 // register adds a node, fully connected to every node already present.
@@ -204,7 +366,7 @@ func (fn *fakeNetwork) endpoint(from int) Transport {
 }
 
 func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	target, delay, seq, ok := e.net.route(e.from, to)
+	target, delay, seq, ok := e.net.route(kindRequestVote, e.from, to)
 	if !ok {
 		return false
 	}
@@ -220,7 +382,7 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 	var replyCopy RequestVoteReply
 	target.RequestVote(&argsCopy, &replyCopy)
 
-	if !e.net.replyDeliverable(to, e.from) {
+	if !e.net.replyDeliverable(kindRequestVote, e.from, to, seq) {
 		return false
 	}
 	mustRoundTrip(&replyCopy, reply)
@@ -228,7 +390,7 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 }
 
 func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	target, delay, seq, ok := e.net.route(e.from, to)
+	target, delay, seq, ok := e.net.route(kindAppendEntries, e.from, to)
 	if !ok {
 		return false
 	}
@@ -245,7 +407,7 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 	var replyCopy AppendEntriesReply
 	target.AppendEntries(&argsCopy, &replyCopy)
 
-	if !e.net.replyDeliverable(to, e.from) {
+	if !e.net.replyDeliverable(kindAppendEntries, e.from, to, seq) {
 		return false
 	}
 	mustRoundTrip(&replyCopy, reply)
@@ -254,7 +416,26 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 
 // route decides whether a message is delivered and returns the target, any
 // delay to apply, and a send-order stamp for the reorder accounting.
-func (fn *fakeNetwork) route(from, to int) (*Node, time.Duration, int, bool) {
+//
+// seq is assigned HERE, unconditionally, before the drop roll -- so it names
+// which attempted send this is between this pair (the seq-th send from `from`
+// to `to`), not which one happened to survive. That assignment is safe to make
+// under fn.mu, a lock shared across every pair in the cluster, DESPITE looking
+// like the same race this file's own doc comment warns about, for a reason
+// specific to this codebase rather than a general property of locks: Raft
+// itself never has two goroutines sending to the same peer at once. A
+// candidate asks each peer for exactly one vote per term (election.go's
+// runElection fans out ONE goroutine per peer, never two to the same one), and
+// a leader keeps at most one AppendEntries round in flight per peer by
+// construction (replication.go's own coalescing rule, "AT MOST ONE ROUND IN
+// FLIGHT PER PEER"). So although many DIFFERENT pairs' goroutines really do
+// race for fn.mu here, any GIVEN pair's own seq values are assigned in the
+// same causal order every replay produces regardless of who else was racing
+// for the lock at the time -- which is exactly what makes it safe to feed into
+// messageHash as if it were deterministic, because for a fixed pair it is.
+// noCoalesce mode is the one path that doesn't hold this invariant: see
+// DESIGN.md §24's open question on it.
+func (fn *fakeNetwork) route(kind messageKind, from, to int) (*Node, time.Duration, int, bool) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 
@@ -263,22 +444,19 @@ func (fn *fakeNetwork) route(from, to int) (*Node, time.Duration, int, bool) {
 	if !fn.reachable[from][to] {
 		return nil, 0, 0, false
 	}
-	if fn.dropRate > 0 && fn.rng.Float64() < fn.dropRate {
-		fn.dropCount++
-		return nil, 0, 0, false
-	}
 
-	delay := fn.minDelay
-	if fn.maxDelay > fn.minDelay {
-		delay += time.Duration(fn.rng.Int63n(int64(fn.maxDelay - fn.minDelay)))
-	}
-
-	// The stamp is assigned here, under the lock, so it records the order the
-	// messages were SENT. arrive records the order they were delivered. The two
-	// disagreeing is the definition of a reorder.
 	pair := [2]int{from, to}
 	seq := fn.nextSeq[pair]
 	fn.nextSeq[pair] = seq + 1
+
+	if fn.rollDrop(kind, from, to, seq) {
+		fn.dropCount++
+		fn.recordRequestLocked(kind, from, to, seq, true, 0)
+		return nil, 0, 0, false
+	}
+
+	delay := fn.rollDelay(kind, from, to, seq)
+	fn.recordRequestLocked(kind, from, to, seq, false, delay)
 
 	return fn.nodes[to], delay, seq, true
 }
@@ -286,9 +464,9 @@ func (fn *fakeNetwork) route(from, to int) (*Node, time.Duration, int, bool) {
 // arrive records a delivery and counts it if an earlier-sent message to the
 // same peer has already gone past.
 //
-// A dropped message consumes a stamp it never delivers, which leaves a
-// permanent hole in the sequence. That is harmless: the hole never arrives, so
-// it can neither cause nor mask a count.
+// A dropped message still consumed a stamp at route() and never delivers,
+// which leaves a permanent hole in the sequence. That is harmless: the hole
+// never arrives, so it can neither cause nor mask a count.
 func (fn *fakeNetwork) arrive(from, to, seq int) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
@@ -308,19 +486,32 @@ func (fn *fakeNetwork) deliverable(from, to int) bool {
 	return fn.reachable[from][to]
 }
 
-// replyDeliverable is deliverable plus the reply-loss roll.
-func (fn *fakeNetwork) replyDeliverable(from, to int) bool {
-	if !fn.deliverable(from, to) {
-		return false
-	}
+// replyDeliverable is deliverable plus the reply-loss roll, both decided for
+// the SAME logical message (kind, from, to, seq) the request itself carried --
+// deterministic for the identical reason route's own decisions are.
+//
+// The reply travels the OPPOSITE direction from the request: from `to` (the
+// request's receiver) back to `from` (the request's original sender).
+// Reachability is checked as (to, from) for that reason, even though the
+// trace key stays (kind, from, to, seq) -- the request's own identity, which
+// is what a replay needs to look this decision up by.
+func (fn *fakeNetwork) replyDeliverable(kind messageKind, from, to, seq int) bool {
+	reachable := fn.deliverable(to, from)
 
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 
-	if fn.replyDropRate > 0 && fn.rng.Float64() < fn.replyDropRate {
-		fn.dropCount++
+	if !reachable {
+		fn.recordReplyLocked(kind, from, to, seq, true)
 		return false
 	}
+
+	if fn.rollReplyDrop(kind, from, to, seq) {
+		fn.dropCount++
+		fn.recordReplyLocked(kind, from, to, seq, true)
+		return false
+	}
+	fn.recordReplyLocked(kind, from, to, seq, false)
 	return true
 }
 

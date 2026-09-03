@@ -14,27 +14,32 @@ import "testing"
 //
 // route now returns a send-order stamp as its third value (C-15). Callers that
 // only care about reachability discard it.
+//
+// route and replyDeliverable both also take a messageKind now (Phase G-2):
+// tests in this file that aren't about any particular RPC just pass
+// kindAppendEntries, an arbitrary representative choice with no bearing on
+// what's being checked.
 
 func TestNetworkConnectivity(t *testing.T) {
 	c := newCluster(t, 3, 1)
 
-	if _, _, _, ok := c.net.route(0, 1); !ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); !ok {
 		t.Fatal("fresh cluster should be fully connected")
 	}
 
 	c.net.disconnect(0)
-	if _, _, _, ok := c.net.route(0, 1); ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); ok {
 		t.Error("0 -> 1 should fail after disconnecting 0")
 	}
-	if _, _, _, ok := c.net.route(1, 0); ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 1, 0); ok {
 		t.Error("1 -> 0 should fail after disconnecting 0 (both directions)")
 	}
-	if _, _, _, ok := c.net.route(1, 2); !ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 1, 2); !ok {
 		t.Error("1 -> 2 should be unaffected by disconnecting 0")
 	}
 
 	c.net.reconnect(0)
-	if _, _, _, ok := c.net.route(0, 1); !ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); !ok {
 		t.Error("0 -> 1 should work again after reconnect")
 	}
 }
@@ -45,30 +50,30 @@ func TestNetworkPartition(t *testing.T) {
 	// Majority {0,1,2} split from minority {3,4}.
 	c.net.partition([]int{0, 1, 2}, []int{3, 4})
 
-	if _, _, _, ok := c.net.route(0, 2); !ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 2); !ok {
 		t.Error("within-majority link should survive")
 	}
-	if _, _, _, ok := c.net.route(3, 4); !ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 3, 4); !ok {
 		t.Error("within-minority link should survive")
 	}
-	if _, _, _, ok := c.net.route(2, 3); ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 2, 3); ok {
 		t.Error("across-partition link should be cut")
 	}
 
 	c.net.heal()
-	if _, _, _, ok := c.net.route(2, 3); !ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 2, 3); !ok {
 		t.Error("heal should restore all links")
 	}
 }
 
-// The seeded rng is what makes a failing test reproducible from its seed alone,
-// so the property is worth pinning: identical seeds must produce identical drop
-// sequences, and different seeds must not.
-//
-// It also pins something subtler. Nothing may consume from fn.rng conditionally
-// in a way that shifts the stream: the reply-drop roll added in C-15 fires only
-// when replyDropRate is above zero, which is why this test still produces the
-// same sequence it did before that knob existed.
+// Determinism is now guaranteed by construction rather than by a shared
+// stream's incidental behavior -- see harness_test.go's own doc comment on
+// fakeNetwork and messageHash for why. This pins the observable consequence,
+// not an implementation detail: identical seeds must produce identical drop
+// sequences, and different seeds must not. There is no longer a "must not
+// consume from a stream conditionally" caveat to also pin here: with no
+// shared stream, there is nothing for a conditional roll to shift out of
+// sync with any other caller's.
 func TestNetworkDeterminism(t *testing.T) {
 	run := func(seed int64) []bool {
 		c := newCluster(t, 2, seed)
@@ -76,7 +81,7 @@ func TestNetworkDeterminism(t *testing.T) {
 
 		var results []bool
 		for i := 0; i < 50; i++ {
-			_, _, _, ok := c.net.route(0, 1)
+			_, _, _, ok := c.net.route(kindAppendEntries, 0, 1)
 			results = append(results, ok)
 		}
 		return results
@@ -112,16 +117,24 @@ func TestNetworkDeterminism(t *testing.T) {
 // not know. If setReplyDropRate leaked into route, the follower would never
 // have appended and the case that exercises mergeEntries against a duplicate
 // append would be unreachable again.
+//
+// All three checks below reuse the SAME seq from the one route() call: this is
+// one reply's fate tracked across three different network conditions, not
+// three different messages, which is what makes reusing seq the right call
+// here rather than a shortcut -- replyDeliverable's decision depends on
+// fn.replyDropRate too, not on seq alone, so the three checks still diverge
+// exactly as the network conditions around them do.
 func TestReplyDropLosesTheReplyNotTheRequest(t *testing.T) {
 	c := newCluster(t, 2, 7)
 
 	c.net.setReplyDropRate(1.0)
 
-	if _, _, _, ok := c.net.route(0, 1); !ok {
+	_, _, seq, ok := c.net.route(kindAppendEntries, 0, 1)
+	if !ok {
 		t.Fatal("the request was dropped by a reply-drop rate: the two rolls " +
 			"have been wired together, and the follower never gets to act")
 	}
-	if c.net.replyDeliverable(1, 0) {
+	if c.net.replyDeliverable(kindAppendEntries, 0, 1, seq) {
 		t.Error("a reply-drop rate of 1.0 delivered a reply anyway")
 	}
 	if got := c.net.drops(); got != 1 {
@@ -129,14 +142,14 @@ func TestReplyDropLosesTheReplyNotTheRequest(t *testing.T) {
 	}
 
 	c.net.setReplyDropRate(0)
-	if !c.net.replyDeliverable(1, 0) {
+	if !c.net.replyDeliverable(kindAppendEntries, 0, 1, seq) {
 		t.Error("a reply-drop rate of 0 discarded a reply")
 	}
 
 	// Reachability beats the roll, in that order: a cut return path is not a
 	// probabilistic loss and must not consume one.
 	c.net.disconnect(1)
-	if c.net.replyDeliverable(1, 0) {
+	if c.net.replyDeliverable(kindAppendEntries, 0, 1, seq) {
 		t.Error("a disconnected return path delivered a reply")
 	}
 }
@@ -147,11 +160,11 @@ func TestReplyDropLosesTheReplyNotTheRequest(t *testing.T) {
 func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	c := newCluster(t, 2, 1)
 
-	_, _, first, ok := c.net.route(0, 1)
+	_, _, first, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: a fresh cluster dropped a message")
 	}
-	_, _, second, ok := c.net.route(0, 1)
+	_, _, second, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: a fresh cluster dropped a message")
 	}
@@ -167,8 +180,8 @@ func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	}
 
 	// Delivered backwards.
-	_, _, third, _ := c.net.route(0, 1)
-	_, _, fourth, _ := c.net.route(0, 1)
+	_, _, third, _ := c.net.route(kindAppendEntries, 0, 1)
+	_, _, fourth, _ := c.net.route(kindAppendEntries, 0, 1)
 	c.net.arrive(0, 1, fourth)
 	c.net.arrive(0, 1, third)
 	if got := c.net.reorderedCount(); got != 1 {
@@ -178,7 +191,7 @@ func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	// Stamps are per DIRECTED pair. Sharing one counter across the cluster
 	// would make every first message on a new link look like an inversion,
 	// and the count would measure fan-out rather than reordering.
-	_, _, otherWay, _ := c.net.route(1, 0)
+	_, _, otherWay, _ := c.net.route(kindAppendEntries, 1, 0)
 	c.net.arrive(1, 0, otherWay)
 	if got := c.net.reorderedCount(); got != 1 {
 		t.Errorf("reordered = %d after a first delivery on a different pair, "+
@@ -186,25 +199,26 @@ func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	}
 }
 
-// A dropped message consumes a stamp it never delivers, leaving a permanent
-// hole in the sequence. The hole must be inert -- it can neither invent an
-// inversion nor hide one, because it simply never arrives.
+// A dropped message consumes a stamp it never delivers (route assigns seq
+// before the drop roll -- Phase G-2, see route's own doc comment), leaving a
+// permanent hole in the sequence. The hole must be inert -- it can neither
+// invent an inversion nor hide one, because it simply never arrives.
 func TestADroppedStampNeverCounts(t *testing.T) {
 	c := newCluster(t, 2, 11)
 
-	_, _, kept, ok := c.net.route(0, 1)
+	_, _, kept, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: message dropped before the drop rate was set")
 	}
 
 	// This one is discarded on the way out and its stamp is never delivered.
 	c.net.setDropRate(1.0)
-	if _, _, _, ok := c.net.route(0, 1); ok {
+	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); ok {
 		t.Fatal("setup: a drop rate of 1.0 delivered a message")
 	}
 	c.net.setDropRate(0)
 
-	_, _, after, ok := c.net.route(0, 1)
+	_, _, after, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: message dropped after the drop rate was cleared")
 	}

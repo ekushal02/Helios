@@ -488,6 +488,27 @@ func (m *Machine) recordApplied(index, term int) {
 // mirroring Background's own shape, is real future work, recorded as an
 // open question rather than attempted in the same task that closes the
 // swap-the-memtable question itself. Caller must hold m.mu.
+//
+// m.bg.Lock()/Unlock() BRACKET THE MANIFEST LOAD-MODIFY-SAVE SEQUENCE
+// BELOW -- A REAL FIX FOR A REAL RACE, NOT DEFENSIVE CODING. m.mu alone
+// only serializes THIS Machine's own flushes against each other; it says
+// nothing to compaction.Background, a separate goroutine running its own
+// load-modify-save cycle against the identical manifest file on its own
+// timer, entirely unaware this function exists. Two such cycles racing
+// is a lost-update bug by construction: whichever Save call lands second
+// silently wins, either reverting a just-completed compaction back to a
+// stale manifest that still names files Run has already deleted from
+// disk, or erasing this flush's own brand-new file the instant
+// CompactLevel clears the whole level it just wrote into. Both shapes
+// were caught, not theorized -- see
+// TestFlushTriggersOnceTheActiveMemtableExceedsThreshold's two distinct
+// failure messages, "L0 holds 10 file(s)" with a run of keys
+// permanently unreadable, and "L0 has no files ... the flush trigger
+// never fired," when it had -- and see Background's own updated doc
+// comment (internal/storage/compaction/background.go) for why the type
+// that already owns the manifest for its own compaction cycles is the
+// right place to hang the shared lock, rather than inventing a third
+// coordination mechanism.
 func (m *Machine) freezeAndFlushLocked() error {
 	frozen := m.active
 	frozenWALPath := filepath.Join(m.dir, activeWALName)
@@ -497,8 +518,11 @@ func (m *Machine) freezeAndFlushLocked() error {
 	}
 
 	manifestPath := filepath.Join(m.dir, manifestName)
+
+	m.bg.Lock()
 	mf, err := manifest.Load(manifestPath)
 	if err != nil {
+		m.bg.Unlock()
 		return fmt.Errorf("load manifest: %w", err)
 	}
 	seq := nextSequence(mf)
@@ -506,13 +530,16 @@ func (m *Machine) freezeAndFlushLocked() error {
 	sstPath := filepath.Join(m.dir, sstName)
 
 	if _, err := sstable.FlushCompressed(frozen, sstPath, m.opts.Compression); err != nil {
+		m.bg.Unlock()
 		return fmt.Errorf("flush: %w", err)
 	}
 
 	mf.EnsureLevel(0)
 	mf.Levels[0] = append([]string{sstName}, mf.Levels[0]...)
-	if err := manifest.Save(manifestPath, mf); err != nil {
-		return fmt.Errorf("save manifest: %w", err)
+	saveErr := manifest.Save(manifestPath, mf)
+	m.bg.Unlock()
+	if saveErr != nil {
+		return fmt.Errorf("save manifest: %w", saveErr)
 	}
 
 	if err := os.Remove(frozenWALPath); err != nil {

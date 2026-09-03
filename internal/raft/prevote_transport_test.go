@@ -65,7 +65,7 @@ func (lf *liveFollower) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteRep
 // receiver rather than any approximation of it. The partition tests depend on
 // that: what they are measuring is a poll going unanswered.
 func (e *endpoint) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteReply) bool {
-	target, delay, seq, ok := e.net.route(e.from, to)
+	target, delay, seq, ok := e.net.route(kindPreVote, e.from, to)
 	if !ok {
 		return false
 	}
@@ -82,7 +82,7 @@ func (e *endpoint) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteReply) b
 	var replyCopy PreVoteReply
 	target.PreVote(&argsCopy, &replyCopy)
 
-	if !e.net.replyDeliverable(to, e.from) {
+	if !e.net.replyDeliverable(kindPreVote, e.from, to, seq) {
 		return false
 	}
 	mustRoundTrip(&replyCopy, reply)

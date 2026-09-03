@@ -51,7 +51,7 @@ func (lf *liveFollower) SendInstallSnapshot(to int, args *InstallSnapshotArgs, r
 // machine on every send, rather than passing a pointer and calling it a
 // transfer.
 func (e *endpoint) SendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	target, delay, seq, ok := e.net.route(e.from, to)
+	target, delay, seq, ok := e.net.route(kindInstallSnapshot, e.from, to)
 	if !ok {
 		return false
 	}
@@ -68,7 +68,7 @@ func (e *endpoint) SendInstallSnapshot(to int, args *InstallSnapshotArgs, reply 
 	var replyCopy InstallSnapshotReply
 	target.InstallSnapshot(&argsCopy, &replyCopy)
 
-	if !e.net.replyDeliverable(to, e.from) {
+	if !e.net.replyDeliverable(kindInstallSnapshot, e.from, to, seq) {
 		return false
 	}
 	mustRoundTrip(&replyCopy, reply)
