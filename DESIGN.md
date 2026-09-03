@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.35 — leader election, log replication, the apply path, linearizable
+**Status:** v1.36 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -4557,7 +4557,90 @@ lock-safe) instead, the same accessor `replyDeliverable` itself already
 relies on for the identical reason -- this task's own tests needed to follow
 the convention the harness had already established, not invent a second one.
 
-## 25. Revision log
+## 25. Message drop, duplication, reordering, and delay -- each with its own configurable rate (Phase G-4)
+
+### 25.1 What existed, and what didn't
+
+Drop (`dropRate`, `replyDropRate`) and delay (`minDelay`, `maxDelay`) were
+already real, independently-dialable fault types by the time this task
+started -- checked directly by `network_test.go` since well before Phase G.
+Reordering was already *measured* (`arrive`'s own `reordered` counter,
+exercised by `TestReorderCountIsSendOrderVersusArrivalOrder`), but only ever
+produced as delay's own incidental side effect: widen `minDelay`/`maxDelay`
+enough and some reordering falls out for free, but there was no way to ask
+for "10% of messages reordered" without first reverse-engineering what delay
+range happened to produce that rate. Duplication did not exist in any form
+at all -- a message was never delivered more than once.
+
+### 25.2 Two new, genuinely independent knobs
+
+`setDuplicateRate` makes a deliverable request also reach its target a
+SECOND time -- drop's own opposite failure mode, and mechanically distinct
+from it: `endpoint.SendRequestVote`/`SendAppendEntries`/`SendPreVote`/
+`SendInstallSnapshot` (all four RPCs) now check `route`'s new `dup` return
+value and, when true, decode and deliver a second, independent copy of the
+same request before the primary one, discarding its own reply -- `Transport`'s
+synchronous, one-reply-per-call shape has no second return path for it,
+which is itself a faithful model of duplicate delivery without a duplicate
+acknowledgment, the shape a real retransmission takes. `setReorderRate`
+biases a message toward arriving late -- `rollReorderBoost` pushes a chosen
+message's own delay strictly past `maxDelay`, the highest an ordinary,
+non-boosted draw can ever reach, raising the odds it loses a race against
+whatever the same pair sends next without touching what delay means for
+every other message. Both roll from `messageHash` with their own salts
+(`saltDuplicate`, `saltReorder`), so they inherit G-2's own determinism for
+free: the same seed reproduces the same duplicates and the same reorder
+biases on replay, exactly as it already does for drops and delays.
+
+**"Biases toward," not "guarantees" -- stated plainly rather than
+oversold.** A reorder rate is a probability across many messages, the same
+honest framing `dropRate` and `duplicateRate` already carry; it is not a
+per-call guarantee that THIS specific message arrives late, since a boosted
+message with nothing sent after it on the same pair for a while still
+eventually arrives with nothing to have been overtaken by.
+
+### 25.3 What's proved, not just built
+
+`TestNetworkDecisionIsPureFunctionOfIdentity` (simreplay_test.go) is
+extended to also check `rollDuplicate`/`rollReorderBoost` -- the same
+no-concurrency purity check every existing decision method already had,
+now covering the two new ones rather than leaving them untested by that
+particular guarantee. `TestDuplicateRateActuallyDeliversTwice` is the
+direct, real-cluster proof that duplication isn't merely decided but
+actually happens: `appendStats`'s own message count, reset immediately
+before `setDuplicateRate(1.0)`, is confirmed to be at least double the
+number of successful routes recorded afterward -- a real, observable
+delivery count, not an inference from the decision trace alone.
+`TestDuplicateVoteDoesNotGrantTwice` is the correctness property
+duplication exists to exercise, checked end to end through the real
+transport rather than only unit-tested against `RequestVote`'s own granting
+rules directly: a real election, with every `RequestVote` duplicated,
+still converges on exactly one leader -- `Majority()` counting a duplicated
+grant as two votes would show up as a split-brain or an under-counted term,
+either of which `checkSingleLeader`'s own majority check would catch.
+`TestReorderRateIncreasesObservedReordering` is the distributional check
+`rollReorderBoost`'s own doc promises, held to the identical standard
+`TestElectionTimeoutsAreRandomised` already set for randomization claims in
+this suite: many draws, not one, comparing a boosted network's own
+`reorderedCount()` against an unboosted control built from the identical
+seed and delay range, so the only variable that differs is `reorderRate`
+itself. `TestDuplicateRateZeroNeverDuplicates` and
+`TestReorderRateZeroMatchesPreExistingBehaviour` are both rates' own
+zero-value contracts: a field that defaults to "off," matching the
+`if fn.xRate <= 0 { return false }` guard every rate in this file already
+uses, checked directly rather than assumed from reading the code.
+
+A real bug was caught while writing `TestDuplicateRateActuallyDeliversTwice`,
+not theorized: `decisionTrace()` accumulates for the whole life of the
+cluster and is never reset by `resetCounters()` (a deliberate, pre-existing
+distinction -- see `decisionTrace`'s own doc), so the first version of this
+test also examined AppendEntries sends from the cluster's own initial
+election, made before `setDuplicateRate` was ever called, and correctly
+found them un-duplicated -- a real inconsistency in the test, not the
+mechanism. Fixed by snapshotting the trace immediately before enabling the
+rate and only examining entries that are new since.
+
+## 26. Revision log
 
 
 | Version | Change |
@@ -4603,3 +4686,4 @@ the convention the harness had already established, not invent a second one.
 | v1.33 | Phase G-2, the chaos-testing phase's second task: the fake network made genuinely seed-deterministic (new §23). The bug: `fakeNetwork` drew every drop/delay/reorder decision from one shared `*rand.Rand`, consumed under `fn.mu` in whatever order concurrent goroutines (one per peer, for both election's vote fan-out and a leader's replication rounds) happened to reach the lock in -- a property of the Go scheduler, not the seed, so a hardcoded seed's failure did not reproduce on replay despite riding on every log line. Fixed by replacing the stream with `messageHash`: a splitmix64-based (the same finalizer `internal/storage/bloom`'s `mix64` uses, §13.5) pure function of `(seed, RPC kind, from, to, seq)`, argued safe to key on a lock-assigned `seq` specifically because this codebase's own replication logic never has two goroutines sending to the same peer at once (one vote per peer per term; at most one AppendEntries/InstallSnapshot round in flight per peer, replication.go's own coalescing rule) -- `noCoalesce` mode is the one path that breaks this and is explicitly excluded, recorded as an open question rather than silently covered. An incidental fix fell out of it: `arrive`'s own long-standing doc comment about a dropped message leaving a permanent hole in the sequence was not actually true of the old code (`seq` was assigned only on the surviving path); moving `seq` assignment before the drop roll made the implementation match the comment that had described it all along. Every decision now also feeds a new `decisionTrace()`, letting a replay be checked for byte-identical fault injection rather than trusted by inspection. Proved at two levels in new `internal/raft/simreplay_test.go`: `TestNetworkDecisionIsPureFunctionOfIdentity`, a direct no-concurrency check of the hash itself; and `TestChaosScenarioReplaysExactly`, a full scripted 5-node partition/kill/heal scenario run twice at the same seed inside its own `testing/synctest` bubble (stable as of this project's own Go 1.26.5), asserting the two runs' `decisionTrace()`s are deep-equal -- bubbles virtualize `Node`'s existing real-time-based election/heartbeat timers for free, with zero production code changes. A real bug surfaced from actually running this on the real toolchain (Go 1.27), not from review: the scripted scenario let its synctest bubble's root goroutine return with a straggling AppendEntries round still asleep in `endpoint.SendAppendEntries`'s own `time.Sleep`, which `Node.Stop()` does not cancel -- harmless outside a bubble, a hard `deadlock: main bubble goroutine has exited but blocked goroutines remain` panic inside one. Fixed by having the scenario stop and drain the cluster itself before returning. Two new open questions recorded in §23.4: `noCoalesce`'s excluded seq race, and whether simultaneous-virtual-instant goroutine scheduling (which synctest does not claim to make deterministic) should eventually be closed by migrating `Node`'s own timers off real time. |
 | v1.34 | A real cross-package race, found and fixed: `kvstore.Machine.freezeAndFlushLocked` (§14.2) and `compaction.Background`'s own cycle (§13.9) were both performing an unsynchronized load-modify-save against the identical on-disk MANIFEST, with no lock shared between them -- §13.9's own v1.14 doc had argued none was needed, correctly for the one caller (`engine.Writer`) that existed then, an argument that quietly stopped being true the moment the flush trigger became a second manifest writer and was never revisited. Two failure shapes, both reproduced: flush's save landing after compaction's reverts the manifest to a stale view still naming files `Run` has already deleted ("L0 holds 10 file(s)" with a run of keys permanently unreadable), or compaction's save landing after flush's erases flush's brand-new file the instant `CompactLevel` clears the whole level it just wrote into ("L0 has no files ... the flush trigger never fired," when it had). Fixed with a lock `compaction.Background` is positioned to own -- exported `Lock`/`Unlock` backing a new `manifestMu`, held across `drainOneCycle`'s own `Run` call and across `freezeAndFlushLocked`'s entire load-derive-flush-append-save sequence, not just the save, since `nextSequence` itself reads a manifest state `Run` could equally be deriving a colliding filename from at the same moment. `TestFlushTriggersOnceTheActiveMemtableExceedsThreshold` at `-race -shuffle=on -count=30`, the user's own real repro, went from 5 failures in 30 to 0 across 90 (30 alone, then 60 more alongside `TestBackgroundCompactionDrainsL0AfterEnoughFlushes`) after the fix; `TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption` (§13.9) still passes throughout, unchanged, because it never exercised a second manifest writer -- exactly why it never caught this. §13.9 and §14.2 both updated with forward/backward pointers to this entry rather than silently editing what v1.14 originally, correctly for its own moment, claimed. **Documentation catch-up note:** v1.32-v1.34 were written up together, after the fact, because the code for all three (Phase G-1's `jepsen-notes.md`, Phase G-2's deterministic network, and this manifest-lock fix) had already been committed to GitHub in a single commit ("deterministic, seed-replayable network layer") without the matching DESIGN.md updates or the `jepsen-notes.md` file itself ever landing alongside it -- caught by checking the repository directly before starting Phase G-3, not assumed current. |
 | v1.35 | Phase G-3, the chaos-testing phase's third task: a fault injector for arbitrary node subsets, on and off, at controlled times (new §24). `partition`/`heal` (§11) replace the whole topology at once and cannot express two independently-timed faults on overlapping subsets, since whichever `heal` call runs first reopens a link the other still needs cut. Fixed underneath first: `fakeNetwork` gained `isolateSubset`/`restoreSubset`, backed by a new reference-counted `cutRefs map[[2]int]int` so overlapping isolations of different subsets compose -- a link stays cut until every isolation cutting it has been restored, not just the most recent one. `faultInjector` (new `internal/raft/faultinjector_test.go`) is the declarative layer on top: a `[]faultSchedule` of `{Subset, At, Duration}` entries, each run on its own goroutine via ordinary `time.Sleep`, automatically `synctest`-compatible (§23) with zero changes needed to get virtual-time scheduling. `Stop()` matches `cluster.stop`/`compaction.Background.Stop`'s own "nothing outlives the caller" discipline: any pending entry never applies, any active one restores immediately, and the call blocks until every goroutine has actually returned. Proved, not just built: `TestIsolateAndRestoreSubsetComposeAcrossOverlappingCalls` checks the composability directly (two overlapping isolations sharing one crossing link; restoring the first must not reopen it while the second is still active), and `TestFaultInjectorHandlesOverlappingArbitrarySubsets` proves the literal task claim end to end, inside a synctest bubble. A real bug was caught while writing the cluster-backed tests, not theorized: the first draft read `c.net.reachable[from][to]` directly from the test goroutine while the injector's own goroutines wrote the same map concurrently under `fn.mu` -- `-race` caught it on the first run; fixed by switching every test to the harness's own existing, lock-safe `deliverable()` accessor. |
+| v1.36 | Phase G-4, the chaos-testing phase's fourth task: message drop, duplication, reordering, and delay, each with its own configurable rate (new §25). Drop and delay already existed; reordering was already measured but only ever produced as delay's own incidental side effect, with no rate of its own; duplication did not exist in any form. `setDuplicateRate` makes a deliverable request also reach its target a second time -- all four `SendXxx` methods now check `route`'s new `dup` return value and deliver a second, independently-decoded copy, discarding its own reply, the faithful shape a real retransmission without a duplicate acknowledgment takes. `setReorderRate` biases a message toward arriving late by pushing its own delay strictly past `maxDelay`, raising the odds it loses a race against whatever the same pair sends next without touching what delay means for anything else -- "biases toward," stated plainly, not "guarantees," the same honest framing `dropRate`/`duplicateRate` already carry. Both roll from `messageHash` with their own salts, inheriting G-2's own determinism for free. `TestNetworkDecisionIsPureFunctionOfIdentity` extended to cover both new roll functions. `TestDuplicateRateActuallyDeliversTwice` confirms real delivery, not just a decided intent, via `appendStats`'s own message count; `TestDuplicateVoteDoesNotGrantTwice` confirms the actual correctness property end to end -- a real election with every RequestVote duplicated still converges on exactly one leader; `TestReorderRateIncreasesObservedReordering` is the distributional check `TestElectionTimeoutsAreRandomised` already set the standard for -- a boosted network's own `reorderedCount()` compared against an unboosted control from the identical seed. A real bug was caught while writing the duplicate-delivery test, not theorized: `decisionTrace()` accumulates for the cluster's whole life and is never reset by `resetCounters()`, so the first version also examined pre-`setDuplicateRate` sends from the initial election and correctly found them un-duplicated -- fixed by snapshotting the trace before enabling the rate and only examining what's new since. |

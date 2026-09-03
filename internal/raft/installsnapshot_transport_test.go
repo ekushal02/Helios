@@ -51,7 +51,7 @@ func (lf *liveFollower) SendInstallSnapshot(to int, args *InstallSnapshotArgs, r
 // machine on every send, rather than passing a pointer and calling it a
 // transfer.
 func (e *endpoint) SendInstallSnapshot(to int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	target, delay, seq, ok := e.net.route(kindInstallSnapshot, e.from, to)
+	target, delay, seq, dup, ok := e.net.route(kindInstallSnapshot, e.from, to)
 	if !ok {
 		return false
 	}
@@ -62,6 +62,21 @@ func (e *endpoint) SendInstallSnapshot(to int, args *InstallSnapshotArgs, reply 
 
 	var argsCopy InstallSnapshotArgs
 	mustRoundTrip(args, &argsCopy)
+
+	if dup {
+		// A duplicated InstallSnapshot exercises real, already-tested
+		// receiver logic rather than a new failure mode of its own --
+		// TestInstallSnapshotIgnoresAnImageAlreadyPassed already covers
+		// a follower asked to install an image it has already passed.
+		// See harness_test.go's SendRequestVote for exactly what "a
+		// second time" means here and why the duplicate's own reply is
+		// discarded.
+		var dupArgs InstallSnapshotArgs
+		mustRoundTrip(args, &dupArgs)
+		e.net.countInstallSnapshot(len(dupArgs.Data))
+		var discard InstallSnapshotReply
+		target.InstallSnapshot(&dupArgs, &discard)
+	}
 
 	e.net.countInstallSnapshot(len(argsCopy.Data))
 

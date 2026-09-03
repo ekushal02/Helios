@@ -34,6 +34,8 @@ func TestNetworkDecisionIsPureFunctionOfIdentity(t *testing.T) {
 	for _, fn := range []*fakeNetwork{a, b} {
 		fn.setDropRate(0.4)
 		fn.setReplyDropRate(0.3)
+		fn.setDuplicateRate(0.2)
+		fn.setReorderRate(0.25)
 		fn.setDelayRange(1*time.Millisecond, 50*time.Millisecond)
 	}
 
@@ -49,6 +51,12 @@ func TestNetworkDecisionIsPureFunctionOfIdentity(t *testing.T) {
 			}
 			if a.rollDelay(kind, 1, 4, seq) != b.rollDelay(kind, 1, 4, seq) {
 				t.Fatalf("kind %d seq %d: delay disagreed between two independently-built networks sharing a seed", kind, seq)
+			}
+			if a.rollDuplicate(kind, 1, 4, seq) != b.rollDuplicate(kind, 1, 4, seq) {
+				t.Fatalf("kind %d seq %d: duplicate decision disagreed between two independently-built networks sharing a seed", kind, seq)
+			}
+			if a.rollReorderBoost(kind, 1, 4, seq) != b.rollReorderBoost(kind, 1, 4, seq) {
+				t.Fatalf("kind %d seq %d: reorder-boost decision disagreed between two independently-built networks sharing a seed", kind, seq)
 			}
 		}
 	}

@@ -13,10 +13,11 @@ import (
 
 // fakeNetwork, an in-memory switchboard between nodes.
 //
-// EVERY FAULT DECISION IT MAKES -- drop this request, delay it by how much,
-// drop this reply -- is a pure function of (seed, kind, from, to, seq), computed
-// by messageHash below. There used to be a single shared *rand.Rand, drawn from
-// under fn.mu in whatever order goroutines happened to reach the lock in. That
+// EVERY FAULT DECISION IT MAKES -- drop this request, duplicate it, delay it
+// by how much, bias it toward arriving out of order, drop this reply -- is a
+// pure function of (seed, kind, from, to, seq), computed by messageHash
+// below. There used to be a single shared *rand.Rand, drawn from under fn.mu
+// in whatever order goroutines happened to reach the lock in. That
 // order is a property of the Go scheduler, not of the seed: election's own
 // runElection fans SendRequestVote out to every peer AT ONCE (one goroutine
 // each), so two runs of the identical seed could -- and, under -shuffle=on
@@ -25,11 +26,31 @@ import (
 // (testlog_test.go), but pinning it and rerunning did not reproduce the
 // failure it named. Hashing each decision from the message's own identity
 // instead of a stream position removes the scheduler from the answer entirely:
-// replaying seed S reproduces the exact same drops, delays, and reorders,
-// regardless of which goroutine got to fn.mu first. See simreplay_test.go for
-// the test that checks exactly this property, and DESIGN.md §24 for why a
-// per-pair seq is safe to use here despite being assigned under a lock shared
-// across every pair.
+// replaying seed S reproduces the exact same drops, duplicates, delays, and
+// reorders, regardless of which goroutine got to fn.mu first. See
+// simreplay_test.go for the test that checks exactly this property, and
+// DESIGN.md §24 for why a per-pair seq is safe to use here despite being
+// assigned under a lock shared across every pair.
+//
+// FOUR INDEPENDENTLY CONFIGURABLE FAULT TYPES, EACH WITH ITS OWN RATE (Phase
+// G-4), NOT ONE KNOB TRYING TO STAND IN FOR ALL OF THEM. drop (dropRate,
+// replyDropRate) discards a message outright -- the receiver never sees it.
+// duplicate (duplicateRate) is drop's own opposite failure mode: the SAME
+// request reaches the receiver TWICE, modeling a network that redelivers a
+// packet rather than losing one, which is a materially different thing for a
+// receiver's own idempotency to get right (RequestVote's one-vote-per-term
+// rule, AppendEntries' index-and-term log matching) than either dropping or
+// delaying ever exercises. delay (minDelay, maxDelay) is ordinary jitter.
+// reorder (reorderRate) is a DELIBERATE bias, not delay's own incidental
+// side effect: delay already produces some reordering for free whenever its
+// own range is wide enough for two messages' draws to cross, but that rate
+// is a derived property of whatever minDelay/maxDelay happen to be, not a
+// dial of its own. reorderRate is a genuinely independent knob -- see
+// rollReorderBoost's own doc for the mechanism -- that raises the ODDS a
+// given message arrives out of order without changing what delay means for
+// everything else, so a test can ask for "10% of messages reordered" without
+// having to first reverse-engineer what delay range would incidentally
+// produce that rate.
 type fakeNetwork struct {
 	mu sync.Mutex
 
@@ -41,11 +62,14 @@ type fakeNetwork struct {
 
 	dropRate      float64       //chance a deliverable REQUEST is dropped anyway
 	replyDropRate float64       //chance a REPLY is dropped after the handler ran
+	duplicateRate float64       //chance a deliverable REQUEST also reaches the target a second time
+	reorderRate   float64       //chance a message's own delay is deliberately biased late
 	minDelay      time.Duration //lower bound on random per-message delay
 	maxDelay      time.Duration //upper bound on random per-message delay
 
-	rpcCount  int //for asserting things like "the minority got no votes"
-	dropCount int //requests plus replies actually discarded
+	rpcCount       int //for asserting things like "the minority got no votes"
+	dropCount      int //requests plus replies actually discarded
+	duplicateCount int //requests actually delivered a second time
 
 	installSnapshotRPCs int
 	preVoteRPCs         int
@@ -117,6 +141,8 @@ type decisionRecord struct {
 	requestDropped bool
 	replyDropped   bool
 	delay          time.Duration
+	duplicated     bool // this request was also delivered a second time
+	reorderBoosted bool // this message's own delay was deliberately biased late
 }
 
 // splitmix64 is the same finalizer internal/storage/bloom's mix64 uses to
@@ -139,13 +165,16 @@ func combineHash(h uint64, v int64) uint64 {
 }
 
 // Salts distinguish the different QUESTIONS asked about the same message --
-// "was the request dropped", "what was its delay", "was the reply dropped" --
-// so the three answers vary independently even though every other input is
-// shared between them.
+// "was the request dropped", "what was its delay", "was the reply dropped",
+// "was it also duplicated", "was it biased toward reordering" -- so the
+// answers vary independently even though every other input is shared
+// between them.
 const (
 	saltRequestDrop uint64 = 1
 	saltDelay       uint64 = 2
 	saltReplyDrop   uint64 = 3
+	saltDuplicate   uint64 = 4
+	saltReorder     uint64 = 5
 )
 
 // messageHash is the entire source of randomness for one network decision.
@@ -193,13 +222,54 @@ func (fn *fakeNetwork) rollDelay(kind messageKind, from, to, seq int) time.Durat
 	return fn.minDelay + time.Duration(h%span)
 }
 
+// rollDuplicate decides whether this request also reaches the target a
+// second time -- independent of drop (a message can be BOTH dropped and,
+// separately, never get the chance to duplicate, since route returns before
+// either matters once dropped) and independent of delay (the duplicate rides
+// along with the primary delivery's own timing rather than drawing a second
+// one of its own; see the endpoint SendXxx methods for exactly where the
+// second target.Xxx call happens).
+func (fn *fakeNetwork) rollDuplicate(kind messageKind, from, to, seq int) bool {
+	if fn.duplicateRate <= 0 {
+		return false
+	}
+	return hashUnitFloat(fn.messageHash(kind, from, to, seq, saltDuplicate)) < fn.duplicateRate
+}
+
+// rollReorderBoost decides whether this message's own delay is deliberately
+// pushed past maxDelay -- a genuine, independent fault, not delay's own
+// incidental side effect. minDelay/maxDelay already produce SOME reordering
+// for free whenever their own range is wide enough for two draws to cross,
+// but that rate is a derived property of whatever the range happens to be,
+// not something a caller can dial directly. Boosting a message's delay to
+// strictly exceed maxDelay -- the highest an ordinary, non-boosted delay can
+// ever be -- biases it toward losing a race against whatever this pair sends
+// next, without touching what delay means for every other message. "Biases
+// toward," not "guarantees": if nothing else is sent to this pair for a
+// while, a boosted message still eventually arrives with nothing to have
+// been overtaken by. See arrive's own reordered counter for how a caller
+// confirms the bias actually produced measurable reordering, the same
+// "measured, not just asserted" standard TestElectionTimeoutsAreRandomised
+// already holds randomization claims to.
+func (fn *fakeNetwork) rollReorderBoost(kind messageKind, from, to, seq int) bool {
+	if fn.reorderRate <= 0 {
+		return false
+	}
+	return hashUnitFloat(fn.messageHash(kind, from, to, seq, saltReorder)) < fn.reorderRate
+}
+
 // recordRequestLocked and recordReplyLocked build up fn.trace as decisions are
 // made. Callers must hold fn.mu.
-func (fn *fakeNetwork) recordRequestLocked(kind messageKind, from, to, seq int, dropped bool, delay time.Duration) {
+func (fn *fakeNetwork) recordRequestLocked(kind messageKind, from, to, seq int, dropped bool, delay time.Duration, duplicated, reorderBoosted bool) {
 	if fn.trace == nil {
 		fn.trace = make(map[traceKey]decisionRecord)
 	}
-	fn.trace[traceKey{kind, from, to, seq}] = decisionRecord{requestDropped: dropped, delay: delay}
+	fn.trace[traceKey{kind, from, to, seq}] = decisionRecord{
+		requestDropped: dropped,
+		delay:          delay,
+		duplicated:     duplicated,
+		reorderBoosted: reorderBoosted,
+	}
 }
 
 func (fn *fakeNetwork) recordReplyLocked(kind messageKind, from, to, seq int, dropped bool) {
@@ -379,6 +449,31 @@ func (fn *fakeNetwork) setReplyDropRate(p float64) {
 	fn.replyDropRate = p
 }
 
+// setDuplicateRate makes a deliverable REQUEST also reach its target a
+// second time -- drop's own opposite failure mode (a message that shows up
+// too often rather than not at all), and a materially different thing for a
+// receiver to get right than dropping or delaying ever exercises: RequestVote
+// must not grant a second vote in the same term just because it was asked
+// twice, and AppendEntries' own index-and-term log matching must treat a
+// repeated append as a no-op rather than corrupting the log by reapplying
+// it. See rollDuplicate's own doc for exactly what "a second time" means
+// mechanically.
+func (fn *fakeNetwork) setDuplicateRate(p float64) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	fn.duplicateRate = p
+}
+
+// setReorderRate biases a message toward arriving out of order -- a
+// deliberate, independently-dialable fault, not delay's own incidental side
+// effect. See rollReorderBoost's own doc for the mechanism and for why
+// "biases toward" rather than "guarantees" is the honest claim to make.
+func (fn *fakeNetwork) setReorderRate(p float64) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	fn.reorderRate = p
+}
+
 func (fn *fakeNetwork) setMaxDelay(d time.Duration) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
@@ -404,6 +499,16 @@ func (fn *fakeNetwork) drops() int {
 	return fn.dropCount
 }
 
+// duplicates reports how many requests were actually delivered a second
+// time so far -- the direct, observable count setDuplicateRate's own
+// probability produces, the same relationship drops() already has to
+// dropRate.
+func (fn *fakeNetwork) duplicates() int {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+	return fn.duplicateCount
+}
+
 func (fn *fakeNetwork) countAppend(entries int) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
@@ -424,6 +529,7 @@ func (fn *fakeNetwork) resetCounters() {
 	fn.appendRPCs, fn.entriesShipped = 0, 0
 	fn.installSnapshotRPCs, fn.snapshotBytes = 0, 0
 	fn.preVoteRPCs = 0
+	fn.duplicateCount = 0
 }
 
 func (fn *fakeNetwork) reorderedCount() int {
@@ -443,7 +549,7 @@ func (fn *fakeNetwork) endpoint(from int) Transport {
 }
 
 func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	target, delay, seq, ok := e.net.route(kindRequestVote, e.from, to)
+	target, delay, seq, dup, ok := e.net.route(kindRequestVote, e.from, to)
 	if !ok {
 		return false
 	}
@@ -456,6 +562,21 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 	var argsCopy RequestVoteArgs
 	mustRoundTrip(args, &argsCopy)
 
+	if dup {
+		// The network redelivers this exact request a second time -- a
+		// fresh, independent decode, not the same argsCopy reused,
+		// exactly as two genuinely separate packets carrying identical
+		// bytes would each decode on their own. Its own reply is
+		// discarded: Transport's synchronous, one-reply-per-call shape
+		// has no second return path for it, which is itself a faithful
+		// model of duplicate delivery without a duplicate
+		// acknowledgment -- the shape a real retransmission takes.
+		var dupArgs RequestVoteArgs
+		mustRoundTrip(args, &dupArgs)
+		var discard RequestVoteReply
+		target.RequestVote(&dupArgs, &discard)
+	}
+
 	var replyCopy RequestVoteReply
 	target.RequestVote(&argsCopy, &replyCopy)
 
@@ -467,7 +588,7 @@ func (e *endpoint) SendRequestVote(to int, args *RequestVoteArgs, reply *Request
 }
 
 func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	target, delay, seq, ok := e.net.route(kindAppendEntries, e.from, to)
+	target, delay, seq, dup, ok := e.net.route(kindAppendEntries, e.from, to)
 	if !ok {
 		return false
 	}
@@ -478,6 +599,18 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 
 	var argsCopy AppendEntriesArgs
 	mustRoundTrip(args, &argsCopy)
+
+	if dup {
+		// See SendRequestVote's own doc on exactly what "a second time"
+		// means here. countAppend runs for the duplicate too -- it is a
+		// second, real delivery to the target, not a bookkeeping
+		// no-op, and appendStats' own count should reflect that.
+		var dupArgs AppendEntriesArgs
+		mustRoundTrip(args, &dupArgs)
+		e.net.countAppend(len(dupArgs.Entries))
+		var discard AppendEntriesReply
+		target.AppendEntries(&dupArgs, &discard)
+	}
 
 	e.net.countAppend(len(argsCopy.Entries))
 
@@ -492,7 +625,10 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 }
 
 // route decides whether a message is delivered and returns the target, any
-// delay to apply, and a send-order stamp for the reorder accounting.
+// delay to apply, a send-order stamp for the reorder accounting, and whether
+// this request should ALSO be delivered a second time (see rollDuplicate's
+// own doc, and the endpoint SendXxx methods for where the second delivery
+// actually happens).
 //
 // seq is assigned HERE, unconditionally, before the drop roll -- so it names
 // which attempted send this is between this pair (the seq-th send from `from`
@@ -512,30 +648,43 @@ func (e *endpoint) SendAppendEntries(to int, args *AppendEntriesArgs, reply *App
 // messageHash as if it were deterministic, because for a fixed pair it is.
 // noCoalesce mode is the one path that doesn't hold this invariant: see
 // DESIGN.md §24's open question on it.
-func (fn *fakeNetwork) route(kind messageKind, from, to int) (*Node, time.Duration, int, bool) {
+//
+// A message that is both dropped AND would otherwise have duplicated never
+// gets the chance to: dropped means the target never sees it at all, so
+// there is nothing left to duplicate -- dup is only ever meaningful, and
+// only ever rolled, on the surviving path.
+func (fn *fakeNetwork) route(kind messageKind, from, to int) (target *Node, delay time.Duration, seq int, dup bool, ok bool) {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 
 	fn.rpcCount++
 
 	if !fn.reachable[from][to] {
-		return nil, 0, 0, false
+		return nil, 0, 0, false, false
 	}
 
 	pair := [2]int{from, to}
-	seq := fn.nextSeq[pair]
+	seq = fn.nextSeq[pair]
 	fn.nextSeq[pair] = seq + 1
 
 	if fn.rollDrop(kind, from, to, seq) {
 		fn.dropCount++
-		fn.recordRequestLocked(kind, from, to, seq, true, 0)
-		return nil, 0, 0, false
+		fn.recordRequestLocked(kind, from, to, seq, true, 0, false, false)
+		return nil, 0, 0, false, false
 	}
 
-	delay := fn.rollDelay(kind, from, to, seq)
-	fn.recordRequestLocked(kind, from, to, seq, false, delay)
+	delay = fn.rollDelay(kind, from, to, seq)
+	boosted := fn.rollReorderBoost(kind, from, to, seq)
+	if boosted {
+		delay += fn.maxDelay + 1 // strictly past the highest an ordinary draw can ever be
+	}
+	dup = fn.rollDuplicate(kind, from, to, seq)
+	if dup {
+		fn.duplicateCount++
+	}
+	fn.recordRequestLocked(kind, from, to, seq, false, delay, dup, boosted)
 
-	return fn.nodes[to], delay, seq, true
+	return fn.nodes[to], delay, seq, dup, true
 }
 
 // arrive records a delivery and counts it if an earlier-sent message to the

@@ -23,23 +23,23 @@ import "testing"
 func TestNetworkConnectivity(t *testing.T) {
 	c := newCluster(t, 3, 1)
 
-	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); !ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); !ok {
 		t.Fatal("fresh cluster should be fully connected")
 	}
 
 	c.net.disconnect(0)
-	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); ok {
 		t.Error("0 -> 1 should fail after disconnecting 0")
 	}
-	if _, _, _, ok := c.net.route(kindAppendEntries, 1, 0); ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 1, 0); ok {
 		t.Error("1 -> 0 should fail after disconnecting 0 (both directions)")
 	}
-	if _, _, _, ok := c.net.route(kindAppendEntries, 1, 2); !ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 1, 2); !ok {
 		t.Error("1 -> 2 should be unaffected by disconnecting 0")
 	}
 
 	c.net.reconnect(0)
-	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); !ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); !ok {
 		t.Error("0 -> 1 should work again after reconnect")
 	}
 }
@@ -50,18 +50,18 @@ func TestNetworkPartition(t *testing.T) {
 	// Majority {0,1,2} split from minority {3,4}.
 	c.net.partition([]int{0, 1, 2}, []int{3, 4})
 
-	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 2); !ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 0, 2); !ok {
 		t.Error("within-majority link should survive")
 	}
-	if _, _, _, ok := c.net.route(kindAppendEntries, 3, 4); !ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 3, 4); !ok {
 		t.Error("within-minority link should survive")
 	}
-	if _, _, _, ok := c.net.route(kindAppendEntries, 2, 3); ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 2, 3); ok {
 		t.Error("across-partition link should be cut")
 	}
 
 	c.net.heal()
-	if _, _, _, ok := c.net.route(kindAppendEntries, 2, 3); !ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 2, 3); !ok {
 		t.Error("heal should restore all links")
 	}
 }
@@ -81,7 +81,7 @@ func TestNetworkDeterminism(t *testing.T) {
 
 		var results []bool
 		for i := 0; i < 50; i++ {
-			_, _, _, ok := c.net.route(kindAppendEntries, 0, 1)
+			_, _, _, _, ok := c.net.route(kindAppendEntries, 0, 1)
 			results = append(results, ok)
 		}
 		return results
@@ -129,7 +129,7 @@ func TestReplyDropLosesTheReplyNotTheRequest(t *testing.T) {
 
 	c.net.setReplyDropRate(1.0)
 
-	_, _, seq, ok := c.net.route(kindAppendEntries, 0, 1)
+	_, _, seq, _, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("the request was dropped by a reply-drop rate: the two rolls " +
 			"have been wired together, and the follower never gets to act")
@@ -160,11 +160,11 @@ func TestReplyDropLosesTheReplyNotTheRequest(t *testing.T) {
 func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	c := newCluster(t, 2, 1)
 
-	_, _, first, ok := c.net.route(kindAppendEntries, 0, 1)
+	_, _, first, _, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: a fresh cluster dropped a message")
 	}
-	_, _, second, ok := c.net.route(kindAppendEntries, 0, 1)
+	_, _, second, _, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: a fresh cluster dropped a message")
 	}
@@ -180,8 +180,8 @@ func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	}
 
 	// Delivered backwards.
-	_, _, third, _ := c.net.route(kindAppendEntries, 0, 1)
-	_, _, fourth, _ := c.net.route(kindAppendEntries, 0, 1)
+	_, _, third, _, _ := c.net.route(kindAppendEntries, 0, 1)
+	_, _, fourth, _, _ := c.net.route(kindAppendEntries, 0, 1)
 	c.net.arrive(0, 1, fourth)
 	c.net.arrive(0, 1, third)
 	if got := c.net.reorderedCount(); got != 1 {
@@ -191,7 +191,7 @@ func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 	// Stamps are per DIRECTED pair. Sharing one counter across the cluster
 	// would make every first message on a new link look like an inversion,
 	// and the count would measure fan-out rather than reordering.
-	_, _, otherWay, _ := c.net.route(kindAppendEntries, 1, 0)
+	_, _, otherWay, _, _ := c.net.route(kindAppendEntries, 1, 0)
 	c.net.arrive(1, 0, otherWay)
 	if got := c.net.reorderedCount(); got != 1 {
 		t.Errorf("reordered = %d after a first delivery on a different pair, "+
@@ -206,19 +206,19 @@ func TestReorderCountIsSendOrderVersusArrivalOrder(t *testing.T) {
 func TestADroppedStampNeverCounts(t *testing.T) {
 	c := newCluster(t, 2, 11)
 
-	_, _, kept, ok := c.net.route(kindAppendEntries, 0, 1)
+	_, _, kept, _, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: message dropped before the drop rate was set")
 	}
 
 	// This one is discarded on the way out and its stamp is never delivered.
 	c.net.setDropRate(1.0)
-	if _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); ok {
+	if _, _, _, _, ok := c.net.route(kindAppendEntries, 0, 1); ok {
 		t.Fatal("setup: a drop rate of 1.0 delivered a message")
 	}
 	c.net.setDropRate(0)
 
-	_, _, after, ok := c.net.route(kindAppendEntries, 0, 1)
+	_, _, after, _, ok := c.net.route(kindAppendEntries, 0, 1)
 	if !ok {
 		t.Fatal("setup: message dropped after the drop rate was cleared")
 	}

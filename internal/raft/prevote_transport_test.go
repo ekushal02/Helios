@@ -65,7 +65,7 @@ func (lf *liveFollower) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteRep
 // receiver rather than any approximation of it. The partition tests depend on
 // that: what they are measuring is a poll going unanswered.
 func (e *endpoint) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteReply) bool {
-	target, delay, seq, ok := e.net.route(kindPreVote, e.from, to)
+	target, delay, seq, dup, ok := e.net.route(kindPreVote, e.from, to)
 	if !ok {
 		return false
 	}
@@ -76,6 +76,17 @@ func (e *endpoint) SendPreVote(to int, args *PreVoteArgs, reply *PreVoteReply) b
 
 	var argsCopy PreVoteArgs
 	mustRoundTrip(args, &argsCopy)
+
+	if dup {
+		// See harness_test.go's SendRequestVote for exactly what "a
+		// second time" means here and why the duplicate's own reply is
+		// discarded.
+		var dupArgs PreVoteArgs
+		mustRoundTrip(args, &dupArgs)
+		e.net.countPreVote()
+		var discard PreVoteReply
+		target.PreVote(&dupArgs, &discard)
+	}
 
 	e.net.countPreVote()
 
