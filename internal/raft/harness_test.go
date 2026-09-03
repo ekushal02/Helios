@@ -57,6 +57,18 @@ type fakeNetwork struct {
 	lastArrived map[[2]int]int //highest stamp delivered per directed pair
 	reordered   int            //messages that arrived behind a later-sent one
 
+	// cutRefs counts, per directed pair, how many currently-active
+	// isolateSubset calls are cutting it -- the reference-counted overlay
+	// isolateSubset/restoreSubset (below) need to compose correctly, unlike
+	// partition/heal's own wholesale-replace semantics: two independently
+	// scheduled isolations of different, overlapping node subsets can
+	// stay active across the same time window without one's own restore
+	// call reopening a link the other still needs cut. partition, heal,
+	// disconnect, and reconnect never touch this map -- they are, and stay,
+	// direct, unconditional replacements of the whole reachable matrix,
+	// exactly as every existing caller of them already assumes.
+	cutRefs map[[2]int]int
+
 	trace map[traceKey]decisionRecord //every decision made so far; see decisionTrace
 }
 
@@ -67,6 +79,7 @@ func newFakeNetwork(seed int64) *fakeNetwork {
 		reachable:   make(map[int]map[int]bool),
 		nextSeq:     make(map[[2]int]int),
 		lastArrived: make(map[[2]int]int),
+		cutRefs:     make(map[[2]int]int),
 	}
 }
 
@@ -276,6 +289,70 @@ func (fn *fakeNetwork) heal() {
 	for from := range fn.nodes {
 		for to := range fn.nodes {
 			fn.reachable[from][to] = true
+		}
+	}
+}
+
+// isolateSubset cuts every link between subset and the rest of the
+// cluster, in both directions -- links WITHIN subset, and links within
+// everyone else, are untouched. Unlike partition (which replaces the
+// whole topology at once, given every group up front) or disconnect
+// (which isolates exactly one node and has no notion of "while something
+// else is also isolated"), isolateSubset is composable: it can be called
+// for an arbitrary subset at an arbitrary moment, independently of
+// whatever else is currently isolated, and its own restoreSubset call
+// later reopens only what THIS call itself cut -- see cutRefs' own doc
+// for why a plain "set reachable back to true" would be wrong the moment
+// two isolations overlap on the same link. This is the primitive Phase
+// G-3's faultInjector (faultinjector_test.go) is built on; it is also
+// directly usable on its own, without a schedule, exactly as
+// partition/heal already are.
+func (fn *fakeNetwork) isolateSubset(subset []int) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+
+	in := make(map[int]bool, len(subset))
+	for _, id := range subset {
+		in[id] = true
+	}
+	for from := range fn.nodes {
+		for to := range fn.nodes {
+			if from == to || in[from] == in[to] {
+				continue // both inside subset, both outside it, or the same node: not a crossing link
+			}
+			pair := [2]int{from, to}
+			fn.cutRefs[pair]++
+			fn.reachable[from][to] = false
+		}
+	}
+}
+
+// restoreSubset is isolateSubset's own inverse, for the identical subset
+// argument: it decrements cutRefs for every link that call's own
+// isolateSubset cut, reopening a link only once nothing else currently
+// isolating it remains. Calling restoreSubset with a subset that was
+// never isolated, or isolated by a call that has already been restored,
+// is a safe no-op on any link whose count is already zero.
+func (fn *fakeNetwork) restoreSubset(subset []int) {
+	fn.mu.Lock()
+	defer fn.mu.Unlock()
+
+	in := make(map[int]bool, len(subset))
+	for _, id := range subset {
+		in[id] = true
+	}
+	for from := range fn.nodes {
+		for to := range fn.nodes {
+			if from == to || in[from] == in[to] {
+				continue
+			}
+			pair := [2]int{from, to}
+			if fn.cutRefs[pair] > 0 {
+				fn.cutRefs[pair]--
+			}
+			if fn.cutRefs[pair] == 0 {
+				fn.reachable[from][to] = true
+			}
 		}
 	}
 }

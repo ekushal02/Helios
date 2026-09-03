@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.31 — leader election, log replication, the apply path, linearizable
+**Status:** v1.35 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -2533,7 +2533,9 @@ test. This closes that: `Background` runs cycles on a ticker in their own gorout
 so nothing calling `engine.Writer.Put` or `.Delete` (§13.7) ever has to trigger or
 wait on a compaction.
 
-**Why this needed no new locking, and why that claim is checked rather than trusted.**
+**Why this needed no new locking, and why that claim is checked rather than trusted
+— true of `engine.Writer` specifically, not of every caller this package would ever
+have. §14.2 records what happened once one did.**
 `engine.Writer`'s only durable state is its own `*wal.WAL` and `*memtable.Memtable`
 (§13.7); `Run` only ever touches SSTable files already on disk plus the manifest
 (§13.8). The two share no lock, no field, nothing — a live write path was never going
@@ -3059,6 +3061,43 @@ is the test that proves these two independently-built pieces actually interopera
 not just coexist: enough flushes to cross `MaxFilesPerLevel` leaves L1 holding a
 real compacted file, with every current value still correct once the read path is
 serving data that has been rewritten underneath it.
+
+**A real hazard was found here, not merely in principle — the previous paragraph's
+own "runs alongside... independently" undersold it.** `compaction.Background`'s
+own v1.14 doc (§13.9) argued no lock was needed because `engine.Writer` — the only
+manifest-adjacent caller that existed at the time — never touches the manifest at
+all. `freezeAndFlushLocked` is not `engine.Writer`: it loads the manifest, appends
+its own newly-flushed file to L0, and saves, on its own schedule, entirely
+unsynchronized with whatever cycle `compaction.Background`'s own loop is running at
+the same moment. Two unguarded load-modify-save cycles against the same file is a
+lost-update race by construction, and it produced two distinct, both-observed
+failure shapes in `TestFlushTriggersOnceTheActiveMemtableExceedsThreshold`, caught
+only because a user's own `-shuffle=on -count=30` run against real disk timing hit
+it repeatedly where a handful of `-count=3` runs in CI had not: flush's own save
+landing after compaction's reverts the manifest to a stale, pre-compaction view that
+still names files `Run` has already deleted from disk (**"L0 holds 10 file(s)"**
+with the ten keys `Run`'s own merge had just relocated permanently unreadable —
+`reconcileSSTReadersLocked`'s own error path silently `continue`s past a manifest
+entry it cannot open), or compaction's save landing after flush's erases flush's
+brand-new file the instant `CompactLevel` clears the whole level it just wrote into
+(**"L0 has no files… the flush trigger never fired," when it had**).
+
+Fixed with the lock `compaction.Background` is positioned to own, since it already
+holds the manifest for its own cycles: `Background.Lock`/`Unlock`, backing a new
+`manifestMu` held across `drainOneCycle`'s own `Run` call, and taken by
+`freezeAndFlushLocked` across its own load-derive-flush-append-save sequence — the
+whole sequence, not just the save, since `nextSequence` itself reads the manifest
+`Run`'s own `nextSequence` could equally be deriving a colliding filename from at
+the same moment. `TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption`
+(§13.9) still passes — it never exercised a second manifest writer, which is exactly
+why it never caught this — and the actual repro,
+`TestFlushTriggersOnceTheActiveMemtableExceedsThreshold` at `-race -shuffle=on
+-count=30`, went from 5 real failures in 30 to 0 in 90 (30, then a further 60
+alongside `TestBackgroundCompactionDrainsL0AfterEnoughFlushes`) after the fix.
+`manifest.go`'s own doc has named this exact coordination as belonging to "a
+different, unbuilt layer above this package" since before `compaction` shipped —
+this is that layer, built at the one place (`kvstore.Machine`, via the `*Background`
+it already owns) that has both writers in view.
 
 ### 14.3 Reads: both linearizable paths, against the real read path
 
@@ -4238,7 +4277,287 @@ network-free) and `integration_test.go` (every subcommand exercised against a re
 single-node server built the identical way `client_test.go`'s own `startRealServer`
 is, plus a genuinely unreachable peer for `status`).
 
-## 22. Revision log
+## 22. Chaos testing: literature review (Phase G-1)
+
+Phase G is chaos testing: injecting real faults (partitions, pauses, clock
+skew, kills) against a running multi-node Helios cluster and checking the
+resulting histories for linearizability violations, the same discipline
+this project has applied to individual components (§11) but not yet to the
+whole system under concurrent fault injection. Before writing any nemesis
+or workload code, the first task was to read, not code: two full Jepsen
+analyses, chosen as a deliberate contrast rather than two similar systems.
+
+**etcd 3.4.3** (Kingsbury, 2020) is a from-scratch Raft implementation
+tested for the same shape of guarantee Helios claims — strict-serializable
+KV operations under partitions, pauses, clock skew, and membership changes
+— and it holds up; its one real finding (locks) is a coordination-primitive
+issue layered on top of a correct Raft core, not a Raft bug. **MongoDB
+3.4.0-rc3** (Kingsbury, 2017) is the useful negative case: a
+replication protocol that borrows Raft's vocabulary (terms, elections, a
+replicated log) without fully replacing wall-clock-timestamp comparisons
+with term comparisons, and loses majority-acknowledged writes as a direct,
+reproducible consequence. Full notes, including the specific test workloads
+each report used and why, are kept out of this document at
+[`jepsen-notes.md`](jepsen-notes.md) rather than duplicated here.
+
+The relevant takeaway for Phase G's own design, not just background
+reading: the nemesis most likely to surface a real ordering bug (as opposed
+to a documentation gap) is isolate-the-leader / advance-or-skew-its-clock /
+force-an-election, layered before broader partition sweeps — because that
+is the exact shape of fault that caught MongoDB's v0 and v1 bugs, and the
+same category as the `mergeEntries`/`advanceCommitIndex` correctness bugs
+this project's own Phase B–D caught by hand (§10). This also sharpens one
+existing §12 open question rather than adding a new one: if `RetryConfig`
+or the lease read path is ever relied on as a coordination primitive the
+way etcd's locks are, the same "unsafe without a fencing token" caveat
+etcd's own report ends on applies here too, and should be stated in this
+document rather than left implicit.
+
+No production or test code changes in this task; no measured values to
+record.
+
+## 23. Deterministic simulation: a seeded, replayable network layer (Phase G-2)
+
+### 23.1 The bug this closes
+
+Every test in this package already builds its cluster from an explicit,
+hardcoded seed (`newCluster(t, 5, 4242)` and its like, throughout the suite) —
+so "replay a failing seed" should have already worked, and `-shuffle=on
+-count=3` in the standard gate exists specifically to catch cases where it
+doesn't. It didn't, for one specific reason: `fakeNetwork` (harness_test.go)
+drew every drop/delay/reorder decision from a single shared `*rand.Rand`,
+consumed under `fn.mu` in whatever order competing goroutines happened to
+reach the lock in. `runElection` fans `SendRequestVote` out to every peer AT
+ONCE, one goroutine per peer (election.go); a leader keeps up to N-1
+`replicateRound` goroutines live at once, one per peer (replication.go). Which
+of those goroutines' calls to `route()` drew the *n*-th value from `fn.rng`
+was a property of the Go scheduler on that run, not of the seed. The seed
+still rode on every log line (`testlog_test.go`'s own `.With("seed", seed)`),
+but pinning it and rerunning did not reproduce the failure it named — the
+same seed could hand message A's drop roll to message B on a different run.
+
+### 23.2 The fix: hash identity, not stream position
+
+`route` and `replyDeliverable` no longer read from a shared stream at all.
+Every decision — drop the request, what delay to apply, drop the reply — is
+now `messageHash(seed, kind, from, to, seq)`, a `splitmix64`-based hash (the
+same finalizer `internal/storage/bloom`'s `mix64` uses to decorrelate its own
+two probe hashes, §13.5) run through the standard 53-bit-to-`[0,1)` technique
+`math/rand`'s own `Float64` uses internally, so `dropRate`/`replyDropRate`
+keep meaning exactly what they meant before. `kind` (`kindRequestVote` /
+`kindPreVote` / `kindAppendEntries` / `kindInstallSnapshot`) keeps the four
+RPCs from sharing a hash space; `seq` is the message's own position in its
+directed pair's history, assigned — unconditionally, even for a message about
+to be dropped — the moment `route` is called.
+
+That `seq` assignment is itself made under `fn.mu`, a lock shared across
+*every* pair in the cluster, which looks like exactly the race this section
+just described. It isn't, for a reason specific to how this codebase's own
+replication logic behaves rather than a general property of locks: Raft here
+never has two goroutines sending to the *same* peer at once. A candidate asks
+each peer for exactly one vote per term; a leader's own coalescing rule keeps
+at most one AppendEntries (or InstallSnapshot, mutually exclusive per round)
+round in flight per peer, by construction (replication.go's own doc comment,
+"AT MOST ONE ROUND IN FLIGHT PER PEER"). So although many *different* pairs'
+goroutines really do race for `fn.mu`, any *given* pair's own sequence of seq
+values is assigned in the same causal order on every replay, regardless of
+who else was racing for the lock at the time — which is what makes it safe to
+fold into a hash as if it were deterministic, because for a fixed pair it is.
+`noCoalesce` mode, used by a handful of tests to deliberately allow
+overlapping rounds to the same peer, is the one path that doesn't hold this
+invariant and is explicitly excluded — see the open question below.
+
+Every decision is also recorded into a new `decisionTrace()`: a
+`map[traceKey]decisionRecord` keyed by `(kind, from, to, seq)`, letting a test
+compare two runs' entire fault-injection histories for exact equality rather
+than trusting that "looks similar" means "is identical."
+
+An incidental correctness fix fell out of moving `seq` assignment earlier:
+`arrive`'s own long-standing doc comment claimed "a dropped message consumes
+a stamp it never delivers, leaving a permanent hole in the sequence," which
+was not actually true of the *old* code — a dropped message's `seq` was
+assigned only on the surviving path, so no hole was ever left. It's true of
+the new code, now that `seq` is assigned before the drop roll rather than
+after. The comment was correct all along; the implementation has caught up to
+it.
+
+### 23.3 Proving it: `internal/raft/simreplay_test.go`
+
+Two tests, at two different levels, rather than one claim taken on faith.
+`TestNetworkDecisionIsPureFunctionOfIdentity` is the direct, no-concurrency
+check: two independently-built `fakeNetwork`s sharing a seed are asked the
+same 2,000 questions (500 seq values × 4 kinds) and must agree on every one —
+cheap, fast, exact, and the property `route`/`replyDeliverable` actually
+depend on.
+
+`TestChaosScenarioReplaysExactly` is the claim this task exists to prove,
+under real concurrent load: a full scripted scenario against a real 5-node
+cluster — elect a leader, partition it 3/2 with the leader in the majority,
+kill a minority node, hold, heal — run twice at the identical seed, each
+inside its own `testing/synctest` bubble (stable in this project's own Go
+1.26.5; `synctest.Test`, not the deprecated 1.24 `synctest.Run`). Inside a
+bubble, every timer Node's own ticker and heartbeat loops already use
+(election.go, heartbeat.go — **unmodified by this task**, not even touched)
+runs on a virtual clock that only advances once every goroutine in the bubble
+is durably blocked, so real machine jitter — GC pauses, a loaded CI box —
+cannot be the thing that makes two runs disagree about which of two
+close-together events happens first. `maps.Equal` on the two runs'
+`decisionTrace()` results is the assertion: deep-equal, not merely
+similarly-shaped.
+
+**A real bug was caught by actually running this on the real toolchain, not
+by review.** The first version of the scripted scenario let its
+`synctest.Test` callback return immediately after its last scripted
+`time.Sleep`, and Go 1.27 panicked with `deadlock: main bubble goroutine has
+exited but blocked goroutines remain`. The cause was a gap this project's own
+`kill()` doc comment had already named for a different reason: `Node.Stop()`
+ends the election/heartbeat *tickers* immediately but does not cancel a
+round already past its own ticker dispatch, sitting inside
+`endpoint.SendAppendEntries`'s `time.Sleep(delay)` — "there is no process to
+exit and no socket to close." Outside a bubble this is invisible: such a
+goroutine just finishes a few real milliseconds after the test returns,
+orphaned and harmless, the exact pattern `testlog_test.go`'s own `testWriter`
+doc comment names. Inside a bubble it isn't harmless — synctest requires
+every goroutine to be finished or durably blocked on something that will
+still eventually unblock once the root returns, and `t.Cleanup(c.stop)`
+(already registered by `newCluster`) runs too late to help: the panic fires
+the instant the root goroutine returns, before any cleanup gets a chance to
+run. Fixed by calling `c.stop()` explicitly inside the scenario itself,
+before returning — so no further rounds start — followed by one more
+`time.Sleep`, comfortably longer than the scenario's own delay ceiling and
+the one extra round `replicateRound`'s own pending-flag can still trigger
+after stop, to let any stragglers actually finish first.
+
+Verification for this task is unusual for this project in one respect, worth
+recording rather than glossing over: the harness-level work (`route`,
+`replyDeliverable`, the hash functions, `TestNetworkDecisionIsPureFunctionOfIdentity`,
+and the full existing suite) was verified directly by Claude on Go 1.22 before
+delivery, since the sandbox it ran in had no network path to this project's
+own Go 1.26.5+ toolchain and `testing/synctest` doesn't exist on 1.22.
+`TestChaosScenarioReplaysExactly` itself shipped with the deadlock above
+still in it, and Kushal's own real run on the real toolchain — pasting back
+the exact panic, not just "it failed" — is what actually found and fixed it:
+the identical "diagnose from real output only, never simulate a test result"
+discipline this project has applied to every other task, now exercised on
+Claude's own delivered code rather than Kushal's.
+
+### 23.4 Open questions this raises
+
+Two, both new, both narrower than "is the whole system deterministic":
+
+- **`noCoalesce` mode is explicitly excluded.** The handful of tests that set
+  it to deliberately allow overlapping AppendEntries rounds to the same peer
+  break the "at most one sender per pair" invariant §23.2's safety argument
+  depends on; their own `seq` assignment can still race. Not fixed here — a
+  fix would need a *content*-derived seq (e.g., hashing the message's own
+  `PrevLogIndex`/`Term` rather than a counter) rather than a positional one,
+  a larger change than this task's scope.
+- **Simultaneous-virtual-instant scheduling remains unproven.** `synctest`
+  makes *time* deterministic; it does not guarantee a fixed order between two
+  goroutines that become runnable at the exact same virtual nanosecond — the
+  Go team's own documentation is explicit that synctest does not make
+  concurrent execution deterministic in that sense. `TestChaosScenarioReplaysExactly`
+  deliberately claims only that the *network's own decisions* replay
+  exactly, not that every possible Raft interleaving does. A full
+  virtual-clock rewrite of `Node`'s own timers (`election.go`,
+  `heartbeat.go`) was flagged as a candidate to pull forward into this phase
+  and was deliberately NOT attempted here — this task's whole point was that
+  it doesn't need to be: `synctest` already virtualizes `Node`'s existing
+  real-`time`-based timers for free, with zero production code changes, for
+  any test that runs inside a bubble. Whether to migrate the *existing*
+  chaos/partition/election suite to run inside bubbles as standard practice
+  (rather than just this task's one new proof test) is left open.
+
+## 24. Fault injector: arbitrary node subsets, on and off, at controlled times (Phase G-3)
+
+### 24.1 What the existing primitives couldn't express
+
+Every partition test in this package before this task -- `partition_test.go`,
+`prevote_test.go` -- hand-writes its own one-shot schedule directly in the
+test body: call `fn.partition(...)`, `time.Sleep` some duration, call
+`fn.heal()`. That is exactly the right amount of machinery for a scenario
+that partitions the cluster once. It stops being enough the moment a scenario
+wants several *independent* fault windows on *different* arbitrary subsets
+whose time windows may overlap: `fn.partition`/`fn.heal` both replace the
+*whole* topology at once, given every group up front, so "isolate `{0}` for
+200ms, and *also* isolate `{2,3}` for a window that overlaps it" cannot be
+expressed with them at all -- whichever `heal` call ran first would reopen a
+link the other fault still needed cut.
+
+### 24.2 A composable primitive underneath, before a scheduler on top
+
+Fixing the scheduling problem needed fixing the reachability model first.
+`fakeNetwork` gained `isolateSubset`/`restoreSubset` (harness_test.go):
+`isolateSubset(subset)` cuts every link between `subset` and everyone else,
+in both directions, leaving links entirely within `subset` and links
+entirely within the rest of the cluster untouched; `restoreSubset(subset)`
+is its exact inverse. Both are backed by a new `cutRefs map[[2]int]int`,
+reference-counting how many currently-active `isolateSubset` calls are
+cutting a given directed pair -- the mechanism that makes two overlapping
+isolations of different subsets compose correctly: restoring one never
+reopens a link a still-active second isolation also needs cut, since that
+link's own count only reaches zero once *every* isolation cutting it has
+been restored. `partition`, `heal`, `disconnect`, and `reconnect` are
+untouched, and stay the direct, unconditional replacements of the whole
+matrix every existing caller of them already assumes -- `cutRefs` is a
+strictly additive overlay, not a rewrite of the existing primitives.
+
+### 24.3 `faultInjector`: the declarative schedule
+
+`internal/raft/faultinjector_test.go` adds `faultInjector`, built entirely
+from ordinary goroutines and `time.Sleep` -- deliberately no bespoke timer,
+no polling loop -- which is what makes it automatically compatible with
+`testing/synctest` (§23) with zero changes needed to this file: a schedule
+run inside a synctest bubble gets virtual-time, real-machine-jitter-free
+scheduling for free, exactly the way `Node`'s own election/heartbeat timers
+already do. `Run(schedule []faultSchedule)` starts one goroutine per
+`{Subset, At, Duration}` entry, each sleeping until its own `At`, calling
+`isolateSubset`, sleeping its own `Duration`, then calling `restoreSubset` --
+independently of every other entry, which is what lets two entries' own
+windows overlap in time without either one's restore disturbing the other.
+`Stop()` cuts the whole schedule short: any entry still waiting for its own
+`At` never isolates its subset at all, and any entry currently mid-isolation
+restores it immediately rather than waiting out its remaining `Duration` --
+the same "nothing outlives the caller" discipline `cluster.stop` and
+`compaction.Background.Stop` already hold themselves to (§13.9), and blocks
+until every entry's own goroutine has actually returned, so a caller that
+calls `Stop` and immediately inspects the network is guaranteed to see every
+isolation this injector made already reverted, not merely requested to be.
+
+### 24.4 What's proved, not just built
+
+`TestIsolateSubsetCutsOnlyCrossingLinks` checks the primitive directly: only
+crossing links move. `TestIsolateAndRestoreSubsetComposeAcrossOverlappingCalls`
+is the actual new capability, checked directly rather than inferred: two
+`isolateSubset` calls on different, overlapping subsets share one crossing
+link, and restoring the first call's own subset is confirmed to leave that
+shared link cut for as long as the second call's own isolation is still
+active -- the exact composability `partition`/`heal` cannot offer.
+`TestFaultInjectorAppliesAndRestoresOnSchedule` and
+`TestFaultInjectorStopRestoresEverythingImmediately` are the end-to-end
+proofs against a real cluster, the first checking a schedule entry's own
+timing (isolated partway through its window, reconnected once it ends) and
+the second checking `Stop`'s own immediate-restoration guarantee.
+`TestFaultInjectorHandlesOverlappingArbitrarySubsets` is the literal claim
+this task asks for, proved at once rather than piecemeal: two
+independently-scheduled faults on two different, non-adjacent node subsets,
+with overlapping time windows, applied and restored correctly by one
+injector's own schedule -- run inside a synctest bubble to demonstrate the
+free composition with §23's own infrastructure directly, rather than only
+asserting it in prose.
+
+A real, caught-not-theorized bug from writing these tests, worth recording
+alongside the fix rather than silently corrected: the first versions of the
+cluster-backed tests read `c.net.reachable[from][to]` directly from the test
+goroutine while the injector's own goroutines were concurrently writing the
+same map under `fn.mu` -- a genuine data race, caught immediately by `-race`
+on the very first run, not a hypothetical one. Every test in this file now
+goes through `fn.deliverable(from, to)` (already existing, already
+lock-safe) instead, the same accessor `replyDeliverable` itself already
+relies on for the identical reason -- this task's own tests needed to follow
+the convention the harness had already established, not invent a second one.
+
+## 25. Revision log
 
 
 | Version | Change |
@@ -4279,3 +4598,8 @@ is, plus a genuinely unreachable peer for `status`).
 | v1.30 | Watch: stream changes for a key prefix to a client (new §20), Phase F-7 -- the last unimplemented RPC in helios.proto. Deliberately NOT leader-gated, the one RPC in this project that isn't: Watch needs only the in-order, exactly-once delivery Raft's own state machine safety already guarantees on any node that applies a given entry, not the linearizability every other read needs a leader's own barrier for. `watchState.notify` (internal/kvstore/watch.go) is called from applyCommand's own single-consumer apply path, non-blocking by design (select/default) -- a slow watcher whose buffered channel fills is disconnected rather than allowed to stall the apply path or any other watcher. WatchEvent.Revision is exact, not the AppliedIndex()-after-the-call approximation Get/Put/Delete/Scan carry, since applyCommand already knows the precise commit index. A real bug found and fixed before shipping, recorded in full in §20.3: an early version assumed restart replay alone would rebuild the retained-history ring buffer for free (true above the snapshot floor, the identical property §18.5 already describes for the dedup table), but missed that nothing redelivers entries AT OR BELOW the floor -- a freshly-restarted node with a short replay could silently answer a start_revision at or below the floor with an INCOMPLETE replay and ok=true, no error. Fixed by watchState.markFloor, called from NewMachine, Machine.take, and installSnapshot whenever the floor can move, backed by a new raft.Node.SnapshotFloor accessor (mirroring LeaderHint's own shape) Machine had no prior way to ask for. TestWatchReportsGapBelowTheSnapshotFloorEvenWithoutRingBufferEviction is written to fail without this wiring and pass with it. Server.Watch batches replay and live events (watchBatchSize), filters by key_prefix (the identical layering Scan already uses), and maps an evicted start_revision to codes.OutOfRange. client.Client.Watch deliberately is NOT wrapped in do's retry loop -- a long-lived stream reconnecting silently would need its own gap-detection story this task does not attempt -- but does follow a single NotLeader hint before the stream opens. New open question in §12: WatchHistoryCapacity is a blunt event-count bound, not byte- or time-sized. Tested at internal/kvstore/watch_test.go (live delivery, the start_revision=0 contract, replay-then-live continuity, the evicted-revision gap, Put vs Delete, slow-watcher disconnection, clean Close shutdown, and the snapshot-floor regression test), internal/raft/snapshotfloor_test.go, internal/server/server_test.go (prefix filtering and OutOfRange via a hand-written fake stream), and client/client_test.go (the redirect branch against a scripted fake server, plus a real end-to-end watch). |
 
 | v1.31 | A CLI, cmd/heliosctl (new §21): heliosctl get/put/del/scan/status, a separate binary from cmd/helios, matching etcd/etcdctl's own established server/CLI split rather than reshaping cmd/helios's already-established invocation. --peers defaults to 1=localhost:50051 (matching cmd/helios's own default gRPC address) so a first-time command works with no flags at all. Every command's help includes worked examples, checked directly (TestRunHelpForEachKnownCommand asserts an Examples: section on every one), and every subcommand validates its own arguments before any network call (TestSubcommandsRejectWrongArgCount). Exit codes are deliberately two-state (0 success, 1 anything else) rather than a finer taxonomy, reasoned as the better fit for a tool whose primary interface is a human reading stderr, not a script branching on codes; get on a missing key prints "(key not found)" to stdout, matching redis-cli's own convention for a KV store CLI specifically. status is the one command that does NOT use the resilient multi-peer client -- it probes each configured peer individually with a single-peer, MaxAttempts=1 client.Client, and distinguishes "reachable but not the leader" from "genuinely unreachable" by checking for a NotLeaderDetail among the status's own details (both cases otherwise share codes.Unavailable), reporting the hinted leader ID when one is present. scan --all silently ignoring --stale (ScanAll has no consistency parameter of its own) is documented directly in scan's own help text rather than left for the user to discover. cmd/helios/main.go gets a one-line pointer to heliosctl now that it exists. Tested at cmd/heliosctl/flags_test.go (peer parsing, argument validation, help routing, all network-free) and integration_test.go (every subcommand against a real single-node server, plus status against a genuinely unreachable peer). |
+
+| v1.32 | Phase G-1, the chaos-testing phase's first task: a literature review, not code. Two full Jepsen analyses read and written up at `jepsen-notes.md` (new §22) -- etcd 3.4.3, a from-scratch Raft implementation holding up under the same strict-serializability claim this project makes, with its one real finding (locks) confined to a coordination primitive rather than the Raft core; and MongoDB 3.4.0-rc3, chosen as the contrasting negative case, whose replication protocol borrows Raft's vocabulary without fully replacing wall-clock-timestamp comparisons with term comparisons, and loses majority-acknowledged writes as a direct, reproducible consequence of exactly that gap. The nemesis shape both reports point toward for Phase G's own first workload -- isolate the leader, skew or advance its clock, force an election, then heal -- is recorded as the argued starting point rather than a broader partition sweep. Sharpens, rather than adds to, §12's existing open question on `RetryConfig`/lease-read safety: if either is ever relied on as a coordination primitive, etcd's own "unsafe without a fencing token" caveat applies here too. No production or test code touched; no measured values in this task. |
+| v1.33 | Phase G-2, the chaos-testing phase's second task: the fake network made genuinely seed-deterministic (new §23). The bug: `fakeNetwork` drew every drop/delay/reorder decision from one shared `*rand.Rand`, consumed under `fn.mu` in whatever order concurrent goroutines (one per peer, for both election's vote fan-out and a leader's replication rounds) happened to reach the lock in -- a property of the Go scheduler, not the seed, so a hardcoded seed's failure did not reproduce on replay despite riding on every log line. Fixed by replacing the stream with `messageHash`: a splitmix64-based (the same finalizer `internal/storage/bloom`'s `mix64` uses, §13.5) pure function of `(seed, RPC kind, from, to, seq)`, argued safe to key on a lock-assigned `seq` specifically because this codebase's own replication logic never has two goroutines sending to the same peer at once (one vote per peer per term; at most one AppendEntries/InstallSnapshot round in flight per peer, replication.go's own coalescing rule) -- `noCoalesce` mode is the one path that breaks this and is explicitly excluded, recorded as an open question rather than silently covered. An incidental fix fell out of it: `arrive`'s own long-standing doc comment about a dropped message leaving a permanent hole in the sequence was not actually true of the old code (`seq` was assigned only on the surviving path); moving `seq` assignment before the drop roll made the implementation match the comment that had described it all along. Every decision now also feeds a new `decisionTrace()`, letting a replay be checked for byte-identical fault injection rather than trusted by inspection. Proved at two levels in new `internal/raft/simreplay_test.go`: `TestNetworkDecisionIsPureFunctionOfIdentity`, a direct no-concurrency check of the hash itself; and `TestChaosScenarioReplaysExactly`, a full scripted 5-node partition/kill/heal scenario run twice at the same seed inside its own `testing/synctest` bubble (stable as of this project's own Go 1.26.5), asserting the two runs' `decisionTrace()`s are deep-equal -- bubbles virtualize `Node`'s existing real-time-based election/heartbeat timers for free, with zero production code changes. A real bug surfaced from actually running this on the real toolchain (Go 1.27), not from review: the scripted scenario let its synctest bubble's root goroutine return with a straggling AppendEntries round still asleep in `endpoint.SendAppendEntries`'s own `time.Sleep`, which `Node.Stop()` does not cancel -- harmless outside a bubble, a hard `deadlock: main bubble goroutine has exited but blocked goroutines remain` panic inside one. Fixed by having the scenario stop and drain the cluster itself before returning. Two new open questions recorded in §23.4: `noCoalesce`'s excluded seq race, and whether simultaneous-virtual-instant goroutine scheduling (which synctest does not claim to make deterministic) should eventually be closed by migrating `Node`'s own timers off real time. |
+| v1.34 | A real cross-package race, found and fixed: `kvstore.Machine.freezeAndFlushLocked` (§14.2) and `compaction.Background`'s own cycle (§13.9) were both performing an unsynchronized load-modify-save against the identical on-disk MANIFEST, with no lock shared between them -- §13.9's own v1.14 doc had argued none was needed, correctly for the one caller (`engine.Writer`) that existed then, an argument that quietly stopped being true the moment the flush trigger became a second manifest writer and was never revisited. Two failure shapes, both reproduced: flush's save landing after compaction's reverts the manifest to a stale view still naming files `Run` has already deleted ("L0 holds 10 file(s)" with a run of keys permanently unreadable), or compaction's save landing after flush's erases flush's brand-new file the instant `CompactLevel` clears the whole level it just wrote into ("L0 has no files ... the flush trigger never fired," when it had). Fixed with a lock `compaction.Background` is positioned to own -- exported `Lock`/`Unlock` backing a new `manifestMu`, held across `drainOneCycle`'s own `Run` call and across `freezeAndFlushLocked`'s entire load-derive-flush-append-save sequence, not just the save, since `nextSequence` itself reads a manifest state `Run` could equally be deriving a colliding filename from at the same moment. `TestFlushTriggersOnceTheActiveMemtableExceedsThreshold` at `-race -shuffle=on -count=30`, the user's own real repro, went from 5 failures in 30 to 0 across 90 (30 alone, then 60 more alongside `TestBackgroundCompactionDrainsL0AfterEnoughFlushes`) after the fix; `TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption` (§13.9) still passes throughout, unchanged, because it never exercised a second manifest writer -- exactly why it never caught this. §13.9 and §14.2 both updated with forward/backward pointers to this entry rather than silently editing what v1.14 originally, correctly for its own moment, claimed. **Documentation catch-up note:** v1.32-v1.34 were written up together, after the fact, because the code for all three (Phase G-1's `jepsen-notes.md`, Phase G-2's deterministic network, and this manifest-lock fix) had already been committed to GitHub in a single commit ("deterministic, seed-replayable network layer") without the matching DESIGN.md updates or the `jepsen-notes.md` file itself ever landing alongside it -- caught by checking the repository directly before starting Phase G-3, not assumed current. |
+| v1.35 | Phase G-3, the chaos-testing phase's third task: a fault injector for arbitrary node subsets, on and off, at controlled times (new §24). `partition`/`heal` (§11) replace the whole topology at once and cannot express two independently-timed faults on overlapping subsets, since whichever `heal` call runs first reopens a link the other still needs cut. Fixed underneath first: `fakeNetwork` gained `isolateSubset`/`restoreSubset`, backed by a new reference-counted `cutRefs map[[2]int]int` so overlapping isolations of different subsets compose -- a link stays cut until every isolation cutting it has been restored, not just the most recent one. `faultInjector` (new `internal/raft/faultinjector_test.go`) is the declarative layer on top: a `[]faultSchedule` of `{Subset, At, Duration}` entries, each run on its own goroutine via ordinary `time.Sleep`, automatically `synctest`-compatible (§23) with zero changes needed to get virtual-time scheduling. `Stop()` matches `cluster.stop`/`compaction.Background.Stop`'s own "nothing outlives the caller" discipline: any pending entry never applies, any active one restores immediately, and the call blocks until every goroutine has actually returned. Proved, not just built: `TestIsolateAndRestoreSubsetComposeAcrossOverlappingCalls` checks the composability directly (two overlapping isolations sharing one crossing link; restoring the first must not reopen it while the second is still active), and `TestFaultInjectorHandlesOverlappingArbitrarySubsets` proves the literal task claim end to end, inside a synctest bubble. A real bug was caught while writing the cluster-backed tests, not theorized: the first draft read `c.net.reachable[from][to]` directly from the test goroutine while the injector's own goroutines wrote the same map concurrently under `fn.mu` -- `-race` caught it on the first run; fixed by switching every test to the harness's own existing, lock-safe `deliverable()` accessor. |
