@@ -38,6 +38,7 @@ type Node struct {
 	id           int          // Node's ID
 	peers        []int        //ids of all the other nodes in the cluster
 	transport    Transport    //how this node reaches peers
+	clock        clock        //source of "now" for the lease-critical path only; see clock.go
 	logger       *slog.Logger //nil until SetLogger; lg() falls back to discard
 	currentTerm  int          //current election term
 	votedFor     int          //current vote
@@ -66,6 +67,14 @@ type Node struct {
 
 	lastContact map[int]time.Time // lastContact records, per peer, the SEND time of the most recent message that peer answered.
 
+	// maxObservedNow is the highest clock.Now() this node has ever seen on
+	// the lease-critical path (ReadLease, noteContact). See
+	// detectClockRollback for why this exists: without it, a clock that
+	// jumps backward leaves lastContact frozen at its pre-jump values
+	// forever, since noteContact's own monotonicity guard refuses any
+	// smaller, post-jump sentAt from ever updating them again.
+	maxObservedNow time.Time
+
 	electionDeadline  time.Time //election starting timer
 	lastLeaderContact time.Time
 	preVoting         bool          // a poll is in flight
@@ -93,6 +102,7 @@ func NewNode(id int, peers []int, transport Transport, seed int64) *Node {
 		id:                id,
 		peers:             peers,
 		transport:         transport,
+		clock:             realClock{},
 		logger:            discardLogger,
 		currentTerm:       0,
 		votedFor:          None,

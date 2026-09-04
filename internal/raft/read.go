@@ -191,22 +191,110 @@ func (n *Node) ReadLease() (readIndex int, until time.Time, ok bool) {
 		return 0, time.Time{}, false
 	}
 
+	// Checked before anything below reads lastContact: a rollback detected
+	// here clears it, so leaseExpiry (next) sees the cleared map rather than
+	// stale, frozen, pre-rollback entries. See detectClockRollback's own
+	// doc for why this ordering is load-bearing, not incidental.
+	now := n.clock.Now()
+	n.detectClockRollback(now)
+
 	// Gate two: nothing committed, or the newest committed entry is inherited.
 	if n.commitIndex == 0 || n.log[n.commitIndex].Term != n.currentTerm {
 		return 0, time.Time{}, false
 	}
 
-	until = n.leaseExpiry()
-	if !time.Now().Before(until) {
+	until = n.leaseExpiry(now)
+	if !now.Before(until) {
 		return 0, time.Time{}, false
 	}
 
 	return n.commitIndex, until, true
 }
 
+// detectClockRollback compares observed against the highest value this node
+// has ever seen on the lease-critical path and, if observed is EARLIER,
+// clears every recorded lastContact entry.
+//
+// =============================================================================
+// WHY THIS EXISTS: "A LEADER WHOSE CLOCK JUMPS BACKWARDS" (Phase G-6)
+// =============================================================================
+//
+// noteContact's own monotonicity guard -- "if sentAt.After(n.lastContact[peer])"
+// -- exists to stop a late reply to an old message from dragging the lease
+// backwards (its own doc comment explains why). That SAME guard, under a
+// clock that jumps backwards, becomes the bug: every sentAt recorded AFTER
+// the jump is, numerically, EARLIER than whatever was recorded before it, so
+// the guard refuses every single one of them, forever. lastContact freezes
+// at its pre-jump values. leaseExpiry keeps computing an expiry from those
+// frozen values, and clock.Now() -- ALSO past the jump, so ALSO smaller --
+// keeps satisfying now.Before(until) against that frozen expiry, potentially
+// indefinitely. To this node, everything looks internally consistent: its
+// own clock, its own lastContact, its own comparison. What it cannot see is
+// that real wall-clock time -- and every OTHER node's own, unrolled-back
+// clock -- kept moving the entire time. A new leader can be elected and
+// commit writes on the other side of that gap while this node still
+// believes its lease is live. See
+// TestReadLeaseIsSafeWhenTheLeadersClockJumpsBackward for this traced all
+// the way through, and DESIGN.md §26 for the fuller argument.
+//
+// =============================================================================
+// WHY THIS IS CALLED ONLY FROM ReadLease, NEVER FROM noteContact
+// =============================================================================
+//
+// It was called from noteContact too, briefly, on the theory that catching a
+// rollback as soon as any new contact arrived was strictly more defensive
+// than waiting for the next ReadLease call. That version broke healthy
+// leaders in real, unmodified operation: replicateAll fans AppendEntries out
+// to every peer AT ONCE, one goroutine per peer, each stamping its own sentAt
+// independently before its own RPC round-trips. Two peers' round trips do
+// not complete in the order their sentAt values were captured in -- network
+// and scheduling variance sees to that -- so noteContact for the peer that
+// left LATER but answered FIRST can be followed by noteContact for the peer
+// that left EARLIER but answered SLOWER, presenting this function with an
+// observed time that is smaller than one it already saw, despite the clock
+// never having done anything but advance. Comparing against a single global
+// high-water mark from inside noteContact could not tell that apart from a
+// real rollback, and cleared a perfectly healthy leader's lastContact on
+// essentially any round where two peers' replies happened to arrive out of
+// send order -- which, empirically, was often enough to make
+// TestALeaseIsRefusedUntilSomethingCommitsInThisTerm and three of its
+// siblings fail intermittently the first time this ran against a real
+// scheduler rather than this package's own single-machine test harness.
+//
+// ReadLease does not have this problem: every call holds n.mu for its own
+// entire body, so two calls' own now := n.clock.Now() reads are strictly
+// ordered by the lock itself, in true chronological order, never
+// interleaved with each other. A smaller observation there really is a
+// rollback. noteContact keeps its own, PER-PEER monotonicity guard --
+// correct, and unrelated to this -- and touches nothing global.
+//
+// The fix does not try to reconstruct what the clock "really" did. It
+// forgets: a rollback proves this node's own clock is no longer trustworthy
+// for dating ANY prior evidence, so every prior contact is discarded, and
+// the lease must be re-earned exactly the way a freshly-elected leader
+// already has to -- no lease until a majority answers again, this time
+// timestamped by a clock this node has actual reason to trust. A clock that
+// jumps FORWARD needs no equivalent handling: it only makes the lease expire
+// sooner, which is the one direction this whole mechanism was already
+// designed to be safe to be wrong in (see leaseDuration's own derivation,
+// and noteContact's).
+//
+// Caller must hold n.mu, and must be ReadLease specifically -- see above.
+func (n *Node) detectClockRollback(observed time.Time) {
+	if !n.maxObservedNow.IsZero() && observed.Before(n.maxObservedNow) {
+		for p := range n.lastContact {
+			delete(n.lastContact, p)
+		}
+	}
+	if observed.After(n.maxObservedNow) {
+		n.maxObservedNow = observed
+	}
+}
+
 // leaseExpiry returns the instant this node must stop trusting its own state,
 // or the zero time if it has not heard from enough peers to have a lease at
-// all.
+// all. now is the caller's own already-read clock.Now(), reused here rather
+// than read a second time.
 //
 // THE kTH MOST RECENT CONTACT, not the most recent. One peer answering does not
 // make a majority; the lease runs from the moment the majority was last
@@ -215,14 +303,14 @@ func (n *Node) ReadLease() (readIndex int, until time.Time, ok bool) {
 // quorum.
 //
 // Caller must hold mu.
-func (n *Node) leaseExpiry() time.Time {
+func (n *Node) leaseExpiry(now time.Time) time.Time {
 	// Peers needed besides this node, which always agrees with itself.
 	need := n.quorumSize() - 1
 
 	// A single-node cluster is its own majority and nobody else can be elected,
 	// so there is nothing to wait to hear from. The lease is always live.
 	if need <= 0 {
-		return time.Now().Add(leaseDuration)
+		return now.Add(leaseDuration)
 	}
 
 	heard := make([]time.Time, 0, len(n.peers))

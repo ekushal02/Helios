@@ -110,7 +110,7 @@ func (n *Node) sendInstallSnapshot(peer int, term int, args *InstallSnapshotArgs
 
 	// Stamped before the send, for the same reason as in sendAppendEntries: a
 	// follower resets its election timer on receipt, which is at or after now.
-	sentAt := time.Now()
+	sentAt := n.now()
 
 	ok := n.transport.SendInstallSnapshot(peer, args, &reply)
 

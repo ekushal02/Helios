@@ -1,7 +1,5 @@
 package raft
 
-import "time"
-
 // replicateAll fans one AppendEntries out to every follower.
 //
 // term is the leadership term this fan-out belongs to, passed in rather than
@@ -207,7 +205,7 @@ func (n *Node) sendAppendEntries(peer int, term int, args *AppendEntriesArgs) {
 	// election timer when it receives this, which is at or after now, so dating
 	// the contact from here understates the lease rather than overstating it.
 	// See noteContact.
-	sentAt := time.Now()
+	sentAt := n.now()
 
 	if !n.transport.SendAppendEntries(peer, args, &reply) {
 		return // dropped, partitioned or dead: the next tick tries again

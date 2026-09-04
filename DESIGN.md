@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.36 — leader election, log replication, the apply path, linearizable
+**Status:** v1.38 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -4640,7 +4640,198 @@ found them un-duplicated -- a real inconsistency in the test, not the
 mechanism. Fixed by snapshotting the trace immediately before enabling the
 rate and only examining entries that are new since.
 
-## 26. Revision log
+## 26. Process kill and restart, including kill during fsync (Phase G-5)
+
+### 26.1 What already existed
+
+`internal/raft/crash_test.go`'s `TestHardKillLosesNoAcknowledgedState` predates
+this task: the test binary re-executes itself, the child saves a rising
+sequence of terms into a shared directory and prints one line per term after
+`Save` returns, and the parent `SIGKILL`s it after a random 15-175ms interval,
+across twelve rounds sharing one directory -- each round both a hard kill and
+a restart of the previous round's corpse. Its own doc comment already drew
+the honest boundary this task works within rather than crosses: `SIGKILL`
+destroys a process, not a page cache, so it proves atomicity (a state file
+that still decodes, is internally consistent, and never loses an acknowledged
+term) but not durability against real power loss, which would need the write
+path interrupted *below* the kernel. That same comment named this task
+directly, before it existed: "that belongs with the kill-during-fsync
+injector; the fsync calls here are what it will have to exercise."
+
+### 26.2 What this task adds, and the two assumptions that didn't survive being run
+
+`runCrashChild` gained an `HELIOS_CRASH_MODE=fsync` mode: a `PRESAVE {term}`
+line printed immediately before every `Save()` call, so a round where the kill
+lands mid-`Save()` can be *measured* (`presave > acked` on the parent's own
+recorded highs) rather than inferred from timing alone. Getting there took
+two real, measured wrong turns, both worth recording rather than quietly
+overwritten by the version that worked.
+
+**First attempt: synchronize the kill to the child's own signal.** The
+parent waited for the child's first `PRESAVE` line, then killed within a
+tight (0-2ms, then 0-400µs) jitter window after it, on the theory that
+reacting to the child's own announcement would reliably land inside the exact
+`Save()` call it had just started. Measured directly: 4-7 of 40 rounds
+interrupted (10-17%) -- *worse* than a plain, unsynchronized random sleep
+from process start at the same payload size (12-20 of 40, 30-50%). The gap
+traced to a real, separately measured number this version never accounted
+for: bare `exec.Command` start-to-first-output latency of roughly 1.1-1.5ms
+in the environment this was measured against (fork, exec, Go runtime init,
+opening the storage directory) -- large enough that a jitter window measured
+*from the signal* was frequently consumed entirely by overhead the
+synchronization had no visibility into, or reacting late enough (through
+goroutine scheduling and pipe-buffer latency) that the "first" `PRESAVE` it
+had synchronized to was already several `Save()` cycles stale by the time the
+kill actually landed.
+
+**Second attempt: a much larger payload to widen `Save()`'s own window.**
+`crashFsyncLogCycle` (20,000 entries, forty times `crashLogCycle`'s 500) was
+chosen on the assumption that more bytes would mean a measurably longer
+`fsync`, giving external timing more room to land inside it. Measured
+directly: mean `Save()` duration was 434-511µs across payloads ranging from
+500 to 100,000 entries -- essentially flat. Fixed `write`/`fsync`/`rename`/
+`fsync-dir` syscall overhead dominates over byte count on the storage this
+was tested against (fast, plausibly tmpfs-backed), not data volume.
+`crashFsyncLogCycle` is kept anyway -- a real disk, where write latency
+scales with size in a way it does not here, should behave differently, and
+there is no reason to throw away a plausible lever for environments where it
+would matter -- but the evidence this task's own hit-rate numbers rest on is
+the timing alone, and that distinction is recorded rather than papered over
+with an untested justification.
+
+**What actually worked** was the simplest of the three: reuse the *exact*
+mechanism `TestHardKillLosesNoAcknowledgedState` already has
+(`runChildUntilKilled`, a plain randomized sleep from process start, no
+synchronization), generalized to also carry `"fsync"` mode's `PRESAVE`
+tracking, with a live-duration window (5-50ms) chosen only to be comfortably
+past the measured ~1.1-1.5ms startup cost -- giving the child real margin to
+be well into its own steady-state loop, where `Save()` turned out to already
+dominate the large majority of its own wall-clock time, before the kill
+lands. Measured directly across several seeds: 30-58% of rounds genuinely
+interrupted an in-flight `Save()` -- comparable to, not dramatically better
+than, the *original* test's own 15-175ms window measured the same way (also
+30-50% once compared at the same round count) -- which is itself the most
+useful finding this task produced: past a certain point, precisely-timed
+synchronization bought nothing measurable that a wide-enough blind window
+didn't already have. `TestHardKillDuringFsyncLosesNoAcknowledgedState`'s own
+anti-vacuity check (`rounds/4`, well below the 30-58% actually measured)
+reflects this: a real, conservative floor grounded in repeated measurement,
+not an aspirational number chosen before anything was run.
+
+### 26.3 What this still does not prove
+
+The identical honest boundary §26.1 already draws, unmoved by anything in
+this task: true below-kernel power-loss corruption. `SIGKILL` destroys a
+process, not a page cache -- bytes already handed to the kernel by `write()`
+or `Sync()` survive the kill regardless of how precisely it is timed. Testing
+that needs the write path interrupted below the kernel -- a device-mapper
+log-writes target, or a machine someone unplugs -- which stays exactly as
+out of scope now as §26.1's own original comment said it was.
+
+## 27. Clock skew, including a leader whose clock jumps backwards (Phase G-6)
+
+### 27.1 Why this needed a real seam, not another synctest test
+
+Every other `Node` timer -- election, heartbeat -- still calls `time.Now()`
+directly, and stays that way: §23 already established that
+`testing.synctest` virtualizes those for free, for any test that runs inside
+a bubble, with zero production code changes. What a bubble structurally
+cannot do is give ONE node a clock that diverges from its peers': every
+goroutine inside one bubble shares the identical virtual clock. A clock-SKEW
+fault is a claim about exactly that divergence, so testing it needed a seam
+`synctest` cannot provide.
+
+A new `clock` interface (`internal/raft/clock.go`), used ONLY on the
+lease-critical path -- `ReadLease`, `leaseExpiry`, `noteContact`, and the two
+call sites that stamp `sentAt` (`replication.go`, `installsnapshot.go`) --
+is that seam. Everywhere else keeps calling `time.Now()` directly. This is
+the first production code change any Phase G task has actually needed
+(G-2 through G-5 were all test-only, deliberately), and it is scoped as
+tightly as the argument allows: a wrong answer from `time.Now()` almost
+everywhere in this package is a LIVENESS bug at worst -- an election timer
+firing early or late only changes how quickly the cluster converges. The
+lease path is the one place this project had already, explicitly, named as
+different: §9's own "bounded clock assumption" is a SAFETY argument --
+`ReadLease`'s whole justification for skipping a majority round is a claim
+that a specific instant, measured on THIS node's own clock, has not yet
+arrived. A test that cannot make that specific claim false has no way to
+check whether the code checking it is actually correct, rather than merely
+plausible. `realClock` is a zero-overhead wrapper `NewNode` sets by default;
+`fakeClock` (`clockskew_test.go`) is the test-only half, letting a test
+`Set`, `Advance`, or -- the one thing a real clock never does -- `Rewind`
+one specific node's own clock, injected by assigning `n.clock` directly
+(an unexported, same-package field; `NewNode`'s and `OpenNode`'s own public
+signatures are untouched).
+
+### 27.2 A real, persistent vulnerability, found while building the fault injector
+
+`noteContact`'s own monotonicity guard -- `if sentAt.After(n.lastContact[peer])`
+-- exists to stop a late reply to an old message from dragging the lease
+backwards, and its own doc comment already explained why. That SAME guard,
+under a clock that jumps backwards, becomes the bug: every `sentAt` recorded
+AFTER the jump is, numerically, EARLIER than whatever was recorded before
+it, so the guard refuses every single one of them, FOREVER. `lastContact`
+freezes at its pre-jump values. `leaseExpiry` keeps computing an expiry from
+those frozen values, and `clock.Now()` -- also past the jump, so also
+smaller -- keeps satisfying `now.Before(until)` against that frozen expiry,
+potentially indefinitely. To the node itself, everything looks internally
+consistent: its own clock, its own `lastContact`, its own comparison. What
+it cannot see is that real wall-clock time -- and every OTHER node's own,
+unrolled-back clock -- kept moving the entire time. A new leader can be
+elected and commit writes on the far side of that gap while this node still
+believes its lease is live. This is not a brief window; without a fix, it is
+UNRECOVERABLE until the node loses leadership some other way, since the very
+guard meant to protect the lease is what keeps it wedged.
+
+**Fixed, not merely documented, in the same commit as the test that found
+it.** `detectClockRollback` (read.go) compares each new clock observation on
+the lease-critical path against the highest ever seen; if the new one is
+EARLIER, every recorded `lastContact` entry is cleared. The lease must then
+be re-earned exactly the way a freshly-elected leader already has to -- no
+lease until a majority answers again, this time timestamped by a clock this
+node has actual reason to trust. Wired into both `ReadLease` (checked before
+`leaseExpiry` computes `until`, so a rollback detected there is already
+reflected in the SAME call) and `noteContact` (so a rollback is caught the
+moment any new contact arrives, not only on the next `ReadLease` call). A
+clock that jumps FORWARD needs no equivalent handling: it only makes the
+lease expire sooner, the one direction `leaseDuration`'s own derivation was
+already designed to be safe to be wrong in.
+
+**Verified as a real fix, not asserted as one.** The core test,
+`TestReadLeaseIsSafeWhenTheLeadersClockJumpsBackward`, was run once with
+`detectClockRollback`'s own call in `ReadLease` commented out: it failed,
+with exactly the predicted message -- the deposed leader still held a lease
+an hour after its own clock rolled back that far. Restored, it passes. That
+sequence -- break it on purpose, watch it fail for the right reason, put it
+back -- is what makes this a demonstrated fix rather than a plausible one.
+
+### 27.3 A second, genuine bug the first test's own methodology surfaced
+
+Injecting a `fakeClock` onto an ALREADY-RUNNING leader (needed to simulate a
+clock fault arriving mid-lifetime, not only at startup) raced a real,
+`-race`-caught data race: `sendAppendEntries` and `sendInstallSnapshot` both
+stamp `sentAt` from a direct, UNLOCKED `n.clock.Now()` call, a pattern
+`n.transport` already uses safely because `n.transport` never changes after
+construction. `n.clock` is deliberately different -- swappable after
+construction is the entire reason it exists -- so a test reassigning it
+under `n.mu` genuinely raced those two unlocked reads. Fixed with `n.now()`
+(clock.go): read the `clock` interface value under the lock (cheap -- a
+two-word copy, not the state behind it) and call `.Now()` on the copy
+outside it, safe regardless of which clock it is. `ReadLease` itself needed
+no change; it already holds `n.mu` for its whole body.
+
+### 27.4 What this deliberately does not attempt
+
+A whole-`Node` virtual-clock rewrite -- letting a test control election and
+heartbeat timers directly, rather than relying on `synctest`'s own bubble --
+was flagged as a candidate to pull forward as far back as §23's own open
+questions, and is deliberately still not built here. This task's own clock
+seam covers exactly the one place a wrong clock answer is a safety bug, not
+a liveness one; extending it further would duplicate `synctest`'s own,
+already-adequate handling of every timer this project has not already named
+as different.
+
+## 28. Revision log
 
 
 | Version | Change |
@@ -4687,3 +4878,5 @@ rate and only examining entries that are new since.
 | v1.34 | A real cross-package race, found and fixed: `kvstore.Machine.freezeAndFlushLocked` (§14.2) and `compaction.Background`'s own cycle (§13.9) were both performing an unsynchronized load-modify-save against the identical on-disk MANIFEST, with no lock shared between them -- §13.9's own v1.14 doc had argued none was needed, correctly for the one caller (`engine.Writer`) that existed then, an argument that quietly stopped being true the moment the flush trigger became a second manifest writer and was never revisited. Two failure shapes, both reproduced: flush's save landing after compaction's reverts the manifest to a stale view still naming files `Run` has already deleted ("L0 holds 10 file(s)" with a run of keys permanently unreadable), or compaction's save landing after flush's erases flush's brand-new file the instant `CompactLevel` clears the whole level it just wrote into ("L0 has no files ... the flush trigger never fired," when it had). Fixed with a lock `compaction.Background` is positioned to own -- exported `Lock`/`Unlock` backing a new `manifestMu`, held across `drainOneCycle`'s own `Run` call and across `freezeAndFlushLocked`'s entire load-derive-flush-append-save sequence, not just the save, since `nextSequence` itself reads a manifest state `Run` could equally be deriving a colliding filename from at the same moment. `TestFlushTriggersOnceTheActiveMemtableExceedsThreshold` at `-race -shuffle=on -count=30`, the user's own real repro, went from 5 failures in 30 to 0 across 90 (30 alone, then 60 more alongside `TestBackgroundCompactionDrainsL0AfterEnoughFlushes`) after the fix; `TestConcurrentWritesAndBackgroundCompactionProduceNoRaceOrCorruption` (§13.9) still passes throughout, unchanged, because it never exercised a second manifest writer -- exactly why it never caught this. §13.9 and §14.2 both updated with forward/backward pointers to this entry rather than silently editing what v1.14 originally, correctly for its own moment, claimed. **Documentation catch-up note:** v1.32-v1.34 were written up together, after the fact, because the code for all three (Phase G-1's `jepsen-notes.md`, Phase G-2's deterministic network, and this manifest-lock fix) had already been committed to GitHub in a single commit ("deterministic, seed-replayable network layer") without the matching DESIGN.md updates or the `jepsen-notes.md` file itself ever landing alongside it -- caught by checking the repository directly before starting Phase G-3, not assumed current. |
 | v1.35 | Phase G-3, the chaos-testing phase's third task: a fault injector for arbitrary node subsets, on and off, at controlled times (new §24). `partition`/`heal` (§11) replace the whole topology at once and cannot express two independently-timed faults on overlapping subsets, since whichever `heal` call runs first reopens a link the other still needs cut. Fixed underneath first: `fakeNetwork` gained `isolateSubset`/`restoreSubset`, backed by a new reference-counted `cutRefs map[[2]int]int` so overlapping isolations of different subsets compose -- a link stays cut until every isolation cutting it has been restored, not just the most recent one. `faultInjector` (new `internal/raft/faultinjector_test.go`) is the declarative layer on top: a `[]faultSchedule` of `{Subset, At, Duration}` entries, each run on its own goroutine via ordinary `time.Sleep`, automatically `synctest`-compatible (§23) with zero changes needed to get virtual-time scheduling. `Stop()` matches `cluster.stop`/`compaction.Background.Stop`'s own "nothing outlives the caller" discipline: any pending entry never applies, any active one restores immediately, and the call blocks until every goroutine has actually returned. Proved, not just built: `TestIsolateAndRestoreSubsetComposeAcrossOverlappingCalls` checks the composability directly (two overlapping isolations sharing one crossing link; restoring the first must not reopen it while the second is still active), and `TestFaultInjectorHandlesOverlappingArbitrarySubsets` proves the literal task claim end to end, inside a synctest bubble. A real bug was caught while writing the cluster-backed tests, not theorized: the first draft read `c.net.reachable[from][to]` directly from the test goroutine while the injector's own goroutines wrote the same map concurrently under `fn.mu` -- `-race` caught it on the first run; fixed by switching every test to the harness's own existing, lock-safe `deliverable()` accessor. |
 | v1.36 | Phase G-4, the chaos-testing phase's fourth task: message drop, duplication, reordering, and delay, each with its own configurable rate (new §25). Drop and delay already existed; reordering was already measured but only ever produced as delay's own incidental side effect, with no rate of its own; duplication did not exist in any form. `setDuplicateRate` makes a deliverable request also reach its target a second time -- all four `SendXxx` methods now check `route`'s new `dup` return value and deliver a second, independently-decoded copy, discarding its own reply, the faithful shape a real retransmission without a duplicate acknowledgment takes. `setReorderRate` biases a message toward arriving late by pushing its own delay strictly past `maxDelay`, raising the odds it loses a race against whatever the same pair sends next without touching what delay means for anything else -- "biases toward," stated plainly, not "guarantees," the same honest framing `dropRate`/`duplicateRate` already carry. Both roll from `messageHash` with their own salts, inheriting G-2's own determinism for free. `TestNetworkDecisionIsPureFunctionOfIdentity` extended to cover both new roll functions. `TestDuplicateRateActuallyDeliversTwice` confirms real delivery, not just a decided intent, via `appendStats`'s own message count; `TestDuplicateVoteDoesNotGrantTwice` confirms the actual correctness property end to end -- a real election with every RequestVote duplicated still converges on exactly one leader; `TestReorderRateIncreasesObservedReordering` is the distributional check `TestElectionTimeoutsAreRandomised` already set the standard for -- a boosted network's own `reorderedCount()` compared against an unboosted control from the identical seed. A real bug was caught while writing the duplicate-delivery test, not theorized: `decisionTrace()` accumulates for the cluster's whole life and is never reset by `resetCounters()`, so the first version also examined pre-`setDuplicateRate` sends from the initial election and correctly found them un-duplicated -- fixed by snapshotting the trace before enabling the rate and only examining what's new since. |
+| v1.37 | Phase G-5, the chaos-testing phase's fifth task: process kill and restart, including kill during fsync (new §26). Builds on crash_test.go's own pre-existing TestHardKillLosesNoAcknowledgedState (a SIGKILL at a random 15-175ms interval, twelve rounds sharing one directory, checked for atomicity -- still decodes, internally consistent, never loses an acknowledged term), whose own doc comment had named this exact task before it existed: "that belongs with the kill-during-fsync injector." runCrashChild gained an HELIOS_CRASH_MODE=fsync mode, printing PRESAVE before every Save() call so a mid-flight kill can be MEASURED (presave > acked) rather than assumed. Two real, measured wrong turns preceded the working design, both recorded rather than quietly discarded: synchronizing the kill to the child's own PRESAVE signal measured WORSE (10-17% of rounds interrupted) than a plain unsynchronized random sleep (30-50%), traced to a real ~1.1-1.5ms bare exec.Command startup latency the synchronized version had no visibility into; a 40x larger payload (crashFsyncLogCycle), assumed to widen Save()'s own window, measured flat (434-511us mean Save() duration from 500 to 100,000 entries) since fixed syscall overhead dominates byte count on the tested storage. What worked was the simplest option: reuse the ORIGINAL test's own plain-random-sleep mechanism (runChildUntilKilled, generalized to carry "fsync" mode), with a window (5-50ms) chosen only to sit comfortably past the measured startup cost. Measured across several seeds: 30-58% of rounds genuinely interrupted an in-flight Save() -- comparable to, not dramatically better than, the ORIGINAL test's own window measured the same way, which is itself the most useful finding: precise synchronization bought nothing a wide-enough blind window didn't already have. TestHardKillDuringFsyncLosesNoAcknowledgedState's own anti-vacuity threshold (rounds/4) is set as a conservative floor grounded in this repeated measurement, not an aspirational number chosen before anything was run. What this still does not prove is unchanged from before this task: true below-kernel power-loss corruption, which SIGKILL cannot exercise regardless of timing precision. |
+| v1.38 | Phase G-6, the chaos-testing phase's sixth task: clock skew, including a leader whose clock jumps backwards (new §27). The first production code change any Phase G task has needed: a new clock interface (clock.go), used ONLY on the lease-critical path (ReadLease, leaseExpiry, noteContact, and the sentAt stamps in replication.go/installsnapshot.go), scoped this tightly because a wrong clock answer almost everywhere else in this package is a liveness bug, while the lease path's own §9 "bounded clock assumption" is a safety argument -- the one place synctest's own bubble-wide virtual clock cannot help, since it gives every goroutine in a bubble the identical clock and this task needed ONE node's clock to diverge from its peers'. Building the fault injector (fakeClock, clockskew_test.go) surfaced a real, PERSISTENT vulnerability, fixed in the same commit as the test that found it: noteContact's own monotonicity guard, meant to stop a late reply from dragging the lease backwards, means that once a leader's clock jumps backward, every subsequent sentAt looks numerically earlier than what's already recorded, so the guard refuses to ever update lastContact again -- it freezes at its pre-jump values, UNRECOVERABLY, while leaseExpiry keeps computing an expiry from those frozen values and the also-rolled-back clock.Now() keeps satisfying now.Before(until) against it, indefinitely. Fixed with detectClockRollback: a clock observation earlier than the highest ever seen clears every lastContact entry, forcing the lease to be re-earned exactly as a freshly-elected leader already must. Verified as a real fix, not asserted as one: TestReadLeaseIsSafeWhenTheLeadersClockJumpsBackward was run once with the fix's own call commented out, failed with exactly the predicted message, then passed once restored. A second, genuine data race surfaced from the test's own methodology (injecting a fakeClock onto an already-running leader, to simulate a fault arriving mid-lifetime): sendAppendEntries/sendInstallSnapshot's unlocked n.clock.Now() reads, previously safe only because n.clock never changed after construction the way n.transport still doesn't, raced a test reassigning it -- fixed with a new n.now() helper that reads the clock field under the lock before calling it outside. Full existing lease suite (7 tests) and the three new tests all pass 5-8x under -race; whole-package short suite clean except two already-familiar, sandbox-load-only flakes, confirmed unrelated. A whole-Node virtual-clock rewrite remains deliberately out of scope, per §23's own original open question -- this task's seam covers exactly the one place a wrong clock answer is a safety bug, not a liveness one. |

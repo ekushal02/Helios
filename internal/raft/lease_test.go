@@ -355,7 +355,7 @@ func TestTheLeaseBoundIsTheOnlyThingPreventingAStaleRead(t *testing.T) {
 	n.mu.Lock()
 	leading := n.state == Leader
 	currentTermCommit := n.commitIndex > 0 && n.log[n.commitIndex].Term == n.currentTerm
-	realExpiry := n.leaseExpiry()
+	realExpiry := n.leaseExpiry(n.clock.Now())
 	n.mu.Unlock()
 
 	if !leading || !currentTermCommit {
@@ -435,7 +435,7 @@ func TestALeaseExpiresWhenAMajorityGoesSilent(t *testing.T) {
 	// in flight is discarded on the return path. So every contact time is at or
 	// before silentAt, and the expiry must land within one leaseDuration of it.
 	n.mu.Lock()
-	expiry := n.leaseExpiry()
+	expiry := n.leaseExpiry(n.clock.Now())
 	n.mu.Unlock()
 
 	if held := expiry.Sub(silentAt); held > leaseDuration {
