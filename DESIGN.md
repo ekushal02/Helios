@@ -2,7 +2,7 @@
 
 A distributed, fault-tolerant key-value store built on the Raft consensus protocol.
 
-**Status:** v1.38 — leader election, log replication, the apply path, linearizable
+**Status:** v1.41 — leader election, log replication, the apply path, linearizable
 reads, persistence and snapshotting are implemented. Entries commit on a majority, apply
 in order on every node, survive a crash of the process or the machine, and can be read
 back either through a barrier or, under a bounded-clock assumption, from a leader's
@@ -4783,29 +4783,74 @@ believes its lease is live. This is not a brief window; without a fix, it is
 UNRECOVERABLE until the node loses leadership some other way, since the very
 guard meant to protect the lease is what keeps it wedged.
 
-**Fixed, not merely documented, in the same commit as the test that found
-it.** `detectClockRollback` (read.go) compares each new clock observation on
-the lease-critical path against the highest ever seen; if the new one is
-EARLIER, every recorded `lastContact` entry is cleared. The lease must then
-be re-earned exactly the way a freshly-elected leader already has to -- no
-lease until a majority answers again, this time timestamped by a clock this
-node has actual reason to trust. Wired into both `ReadLease` (checked before
-`leaseExpiry` computes `until`, so a rollback detected there is already
-reflected in the SAME call) and `noteContact` (so a rollback is caught the
-moment any new contact arrives, not only on the next `ReadLease` call). A
-clock that jumps FORWARD needs no equivalent handling: it only makes the
-lease expire sooner, the one direction `leaseDuration`'s own derivation was
-already designed to be safe to be wrong in.
+**Fixed with `detectClockRollback` (read.go)**: a clock observation earlier
+than the highest ever seen clears every recorded `lastContact` entry,
+forcing the lease to be re-earned exactly the way a freshly-elected leader
+already has to -- no lease until a majority answers again, this time
+timestamped by a clock this node has actual reason to trust. A clock that
+jumps FORWARD needs no equivalent handling: it only makes the lease expire
+sooner, the one direction `leaseDuration`'s own derivation was already
+designed to be safe to be wrong in.
 
 **Verified as a real fix, not asserted as one.** The core test,
 `TestReadLeaseIsSafeWhenTheLeadersClockJumpsBackward`, was run once with
-`detectClockRollback`'s own call in `ReadLease` commented out: it failed,
-with exactly the predicted message -- the deposed leader still held a lease
-an hour after its own clock rolled back that far. Restored, it passes. That
-sequence -- break it on purpose, watch it fail for the right reason, put it
-back -- is what makes this a demonstrated fix rather than a plausible one.
+`detectClockRollback`'s own call commented out: it failed, with exactly the
+predicted message -- the deposed leader still held a lease an hour after its
+own clock rolled back that far. Restored, it passes. That sequence -- break
+it on purpose, watch it fail for the right reason, put it back -- is what
+makes this a demonstrated fix rather than a plausible one.
 
-### 27.3 A second, genuine bug the first test's own methodology surfaced
+### 27.3 Where `detectClockRollback` may be called from -- and a real regression this exact question caused
+
+The first working version called `detectClockRollback` from BOTH `ReadLease`
+AND `noteContact`, on the reasoning that catching a rollback the moment any
+new contact arrived was strictly more defensive than waiting for the next
+`ReadLease` call. It passed every test in this package, repeatedly, under
+`-race`, in this project's own development environment. It broke healthy,
+unmodified leaders the first time it ran against a real scheduler on
+different hardware -- `TestALeaseIsRefusedUntilSomethingCommitsInThisTerm`
+and three of its siblings failed intermittently, each with the identical
+symptom: "no read lease" on a node that had just committed and had every
+right to one.
+
+The cause was `noteContact`'s own calling context, not the rollback logic
+itself. `replicateAll` fans `AppendEntries` out to every peer AT ONCE, one
+goroutine per peer, each stamping its own `sentAt` independently before its
+own RPC round-trips. Two peers' round trips do not complete in the order
+their `sentAt` values were captured in -- ordinary network and scheduling
+variance sees to that. `noteContact` for the peer that left LATER but
+answered FIRST can be followed by `noteContact` for the peer that left
+EARLIER but answered SLOWER, presenting `detectClockRollback` with an
+observed time smaller than one it had already recorded, despite the clock
+having done nothing but advance the entire time. Comparing against a single
+global high-water mark from inside `noteContact` could not distinguish that
+from a genuine rollback, and cleared a perfectly healthy leader's
+`lastContact` on essentially any round where two peers' replies happened to
+arrive out of send order.
+
+`ReadLease` does not have this problem, and is now the ONLY caller:
+every call holds `n.mu` for its own entire body, so two calls' own
+`now := n.clock.Now()` reads are strictly ordered by the lock itself, in
+true chronological order, never interleaved with each other or with a
+concurrent `noteContact`. A smaller observation there really is a rollback.
+`noteContact` keeps its own, correct, per-peer monotonicity guard and
+touches nothing global. `TestOutOfOrderPeerRepliesDoNotClearLastContact` and
+`TestNoteContactAloneNeverClearsLastContact` (`clockskew_test.go`) lock this
+design in directly -- the first reproduces the exact interleaving that broke
+real hardware, the second confirms `noteContact` alone, with no `ReadLease`
+call, never clears anything, regardless of what it's handed.
+
+**Why this environment's own tests never caught it.** This package's test
+harness runs an entire cluster inside one process on one machine, and this
+project's own `-race`-clean, repeated runs here never happened to schedule
+two peers' replies out of send order in a way that triggered the bug --
+plausible on a machine with different core counts, load, and scheduler
+behavior than whatever produced the failure, and a genuine reminder that
+`-race` proves the absence of a *data* race, not the absence of a *logic*
+race between events whose real-world ordering this package's own harness
+cannot fully reproduce.
+
+### 27.4 A second, genuine bug the test methodology itself surfaced
 
 Injecting a `fakeClock` onto an ALREADY-RUNNING leader (needed to simulate a
 clock fault arriving mid-lifetime, not only at startup) raced a real,
@@ -4820,7 +4865,7 @@ two-word copy, not the state behind it) and call `.Now()` on the copy
 outside it, safe regardless of which clock it is. `ReadLease` itself needed
 no change; it already holds `n.mu` for its whole body.
 
-### 27.4 What this deliberately does not attempt
+### 27.5 What this deliberately does not attempt
 
 A whole-`Node` virtual-clock rewrite -- letting a test control election and
 heartbeat timers directly, rather than relying on `synctest`'s own bubble --
@@ -4831,7 +4876,296 @@ a liveness one; extending it further would duplicate `synctest`'s own,
 already-adequate handling of every timer this project has not already named
 as different.
 
-## 28. Revision log
+## 28. History recorder: every client operation's invoke and return, timestamped (Phase G-7)
+
+### 28.1 What this is for
+
+Every prior Phase G task injects a fault and checks a specific, structural
+property directly -- a torn write, a lost lease, a permanently frozen
+`lastContact` map. None of them ask the more general question this project's
+own stated end goals name outright: is the observable behavior of a Helios
+cluster under fault injection actually LINEARIZABLE -- does every recorded
+client operation admit SOME total order consistent with real time, the same
+question etcd's own Jepsen analysis (§22) was checked against and held up
+to. Answering that question needs a HISTORY: a timestamped record of when
+every operation was invoked and when it returned, with what it was called
+with and what it got back -- exactly the shape a linearizability checker
+(Porcupine and similar tools all expect this: one Invoke event and one
+Return event per operation, correlated by an id) needs as its own input.
+
+This task is the recording half only. It checks nothing. `internal/history`
+produces histories precise and complete enough for a checker to consume
+later; building or wiring in that checker is real, separate work -- taken
+up directly by the next task, §29.
+
+### 28.2 Design
+
+`Recorder` is a single, shared, ordered, thread-safe log -- one instance
+meant to be wrapped by several `RecordingClient`s at once, one per
+concurrent actor in whatever workload is driving a scenario, so OpIDs stay
+globally unique across the whole run rather than several disjoint per-actor
+logs a checker would have to merge itself. `RecordingClient` wraps a real
+`*client.Client` (embedding it, so every method this package does not
+override -- `Close`, and any future addition -- remains reachable
+unchanged) and logs one `Invoke` and one `Return`, both timestamped, for
+every operation it forwards: `Get`, `GetStale`, `Put`, `Delete`, `Scan`,
+`ScanStale`, `ScanAll`. `Watch` is deliberately excluded -- it returns a
+channel that goes on delivering events indefinitely, which does not fit the
+invoke/return shape at all, and its own correctness property (every applied
+write delivered, in order, exactly once) is a different question from
+linearizability in the first place. Recording subscriptions, if ever
+needed, is separate future work, not a gap in this one.
+
+Every byte slice a recorded `Event` holds is a copy, never an alias into
+the original caller's own buffer -- a recorded history is meant to be a
+durable, inspectable record, and must not silently change underneath a
+later reader because the original caller happened to reuse or mutate a key
+or value slice after the call returned.
+
+**No production code change.** `client.Client`'s own `clientID` field
+(idempotency identity, F-4) is deliberately NOT reused as the history's own
+per-actor identity -- they are different concepts for different purposes
+(one dedups retries against the server; the other identifies which
+concurrent actor issued an operation for a checker's own benefit), and
+conflating them would need an exported accessor on `client.Client` this
+task has no real reason to add. `RecordingClient.Wrap` instead takes an
+explicit `clientID int` from the caller, matching how a linearizability
+checker actually wants "which actor" to mean: typically 0..N-1 for N
+concurrent workers in a benchmark or chaos scenario, assigned by whatever
+drives the workload, not derived from anything internal to the client
+library itself.
+
+**Persistence**: `WriteJSONL`/`ReadJSONL` serialize a recorded history as
+JSON Lines -- one event per line, streamable, appendable, and
+grep/jq-inspectable without a JSON-aware tool, the same shape most
+chaos-testing and history-recording tooling already converges on. `Kind`
+marshals as its own name (`"Put"`, not `2`) for the same reason: a recorded
+history is read by a human debugging a scenario as often as it is fed to a
+checker. Read-side events (`DecodedEvent`) keep `Input`/`Output` as raw,
+undecoded JSON rather than this package's own per-operation Go structs --
+a reader already has `Kind` to know which shape to expect, and
+`DecodeInput`/`DecodeOutput` decode into exactly that shape on request;
+forcing every reader through this package's own concrete types is not what
+a checker (Porcupine's own model takes bare `any` for both) actually needs.
+
+### 28.3 A real, hard limitation this delivery has, stated plainly rather than hidden
+
+**This code could not be built, vetted, or run in this environment at
+all**, for a reason distinct from every prior toolchain limitation in this
+project. Every earlier Phase G task's own "cannot verify here" was a Go
+*version* gap (`testing/synctest` needing 1.24+/1.26, worked around by
+stripping the specific test and verifying everything else). This one is a
+*network* gap: `internal/history` depends on `client`, which depends on
+`google.golang.org/grpc` and `google.golang.org/protobuf`, neither of which
+is cached in this environment's Go module cache, and this environment's
+network egress allowlist does not include `proxy.golang.org` -- `go build`
+fails outright trying to download them, for this package and for
+`client`/`internal/server` generally, which this project has simply never
+needed to build in this environment before now (every prior Phase G task
+stayed within `internal/raft`, `internal/storage/...`, and
+`internal/kvstore`, none of which import grpc at all).
+
+What was actually done instead: every method signature in `recorder.go`
+was checked by hand against `client/client.go`'s own real, current
+signatures (not assumed, not written from memory of the general shape);
+`gofmt` confirmed every file is syntactically valid Go, which needs no
+network access; the test file
+(`internal/history/history_test.go`) was written in full, including a
+real-server harness duplicated from `client/client_test.go`'s own
+`startRealServer`, but has never actually been executed. This is a real
+gap, not a formality -- Kushal's own `go build`/`go vet`/`go test` run
+against this package is the FIRST time any of this code will actually
+compile.
+
+## 29. Linearizability checker: Wing and Gong's algorithm, implemented from scratch
+
+### 29.1 The choice, and why
+
+The task offered wiring in an existing checker (Porcupine, the standard,
+well-regarded Go implementation used by etcd, CockroachDB, and others) as
+an alternative to implementing Wing and Gong's own 1988 algorithm directly,
+with the explicit requirement to understand the algorithm either way.
+Porcupine is an external module, fetched the same way `google.golang.org/grpc`
+would be -- and §28.3 already established that this environment's network
+egress cannot reach `proxy.golang.org` at all. Implementing Wing and Gong
+from scratch was therefore not only the choice that satisfies "understand
+the algorithm" most directly; it was the only choice buildable and testable
+in this environment at all, and it matches how every other major component
+in this project (Raft itself, the LSM engine, the gRPC-adjacent client
+retry logic) was built from its own first principles rather than assembled
+from a library doing the identical job.
+
+### 29.2 The algorithm
+
+A HISTORY is a set of operations, each with a real-time invocation instant
+and a real-time response instant. A LINEARIZATION is a total order of every
+operation such that (1) real-time order is respected -- if operation A's
+response happens at or before operation B's invocation, A must precede B;
+concurrent operations, whose intervals overlap, may be ordered either way
+-- and (2) the order is legal for the object's own SEQUENTIAL SPECIFICATION:
+applying every operation's own input to a model of the object, one at a
+time in this order, from the model's own initial state, produces exactly
+the output each operation actually recorded, at every step. A history is
+linearizable if at least one such order exists.
+
+**The search.** `CheckLinearizability` (`internal/linearize/linearize.go`)
+performs a recursive backtracking search directly over "which operation
+could legally be linearized next" -- exactly Wing and Gong's own
+description. The operations already placed are tracked as a bitset
+(`uint64`, hence the 64-operation structural limit `maxOperations`
+documents). An operation is ELIGIBLE to be placed next if and only if no
+OTHER not-yet-linearized operation necessarily precedes it in real time.
+Choosing an eligible operation means applying its input to the model's
+current state; if the model's own resulting output matches what that
+operation actually recorded, the search recurses with that operation added
+to the bitset and the model advanced. If every eligible choice's own
+recursive attempt fails, the search backtracks to the next eligible
+candidate. All operations placed (the bitset is full) is success; every
+eligible candidate exhausted with no success is failure.
+
+**Memoization, and why it has to be on (bitset, state), not bitset alone.**
+The search space is exponential in the worst case -- a proven, inherent
+property of the general problem (Wing and Gong's own paper shows
+linearizability checking is NP-complete), not a shortcoming of this
+particular implementation. The one optimization applied, matching Wing and
+Gong's own paper, is memoizing FAILURE: once a given (bitset of operations
+linearized, resulting model state) pair is explored and found to have no
+valid continuation, it is never explored again. The state half of that key
+is load-bearing, not optional: two different orderings of the IDENTICAL set
+of operations can reach two genuinely different model states -- a KV
+store's own `Put(k, "a")` then `Put(k, "b")` does not commute -- so
+memoizing on the bitset alone would conflate two different reachable states
+as if they were one, an unsound pruning that could hide a real
+linearization. `Model.StateKey` exists specifically to give the search a
+canonical, comparable representation of a state for this purpose, distinct
+from `Model.Equal` (which compares two OUTPUTS, not two states, and is used
+for a different check entirely -- whether a candidate operation's
+model-predicted result matches what it actually recorded).
+
+**A concrete witness on failure, not just `false`.** `Result.Witness` names
+one operation, at one point in the search, whose every remaining candidate
+ordering failed to match its own recorded output against the model's own
+prediction -- not "the" violation in any absolute sense (a history can fail
+to linearize for more than one independent reason), but a concrete,
+checkable starting point for debugging a failing chaos scenario, which
+`false` on its own would not give.
+
+### 29.3 The sequential model, and what it deliberately does not cover
+
+`KVModel` (`internal/linearize/kvmodel.go`) is the sequential specification
+for `Get`, `GetStale`, `Put`, and `Delete`: exactly what a single, unshared,
+in-memory `map[string]string` does if every operation runs one at a time.
+`Get` and `GetStale` deliberately share one specification -- Helios's own
+`GetStale` is, today, still a leader-only, still-linearizable lease read
+(§16), not the follower-servable, genuinely stale read its name suggests,
+and checking every read against the SAME, fully-linearizable specification
+is exactly the property this project currently claims for it, which would
+show up as a violation the day that claim stops being true without this
+model needing to change to notice it. `Put` and `Delete` ignore Revision
+entirely -- a real revision number depends on how many OTHER writes,
+possibly outside whatever history is being checked, committed before it,
+information the sequential model has no way to predict and has no logical
+reason to: revision is implementation metadata exposed for `Watch`'s own
+benefit, not part of the KV store's own logical specification (a map from
+keys to values).
+
+**Scan, ScanStale, and ScanAll are a named, hard boundary, not an
+oversight.** A single-key read or write's own sequential specification is
+straightforward; a range scan's is real but substantially more involved,
+particularly with pagination, where one logical Scan can span several
+separate recorded operations, each carrying a continuation token whose own
+validity depends on exactly what another operation might have mutated in
+between pages. `ToLinearizeOperations` (§29.4) refuses outright, with an
+error, rather than silently ignoring them -- a choice made specifically so
+a real Scan-related violation can never slip through unchecked as a side
+effect of this checker simply not looking.
+
+**An operation whose own outcome is ambiguous is excluded, not guessed
+at.** An operation that returned a client-visible error, or one invoked but
+never returned (a history read mid-flight), is dropped from what gets
+checked rather than assumed to have succeeded or failed. `client.Client`'s
+own retry loop means a client-visible error does not prove an operation
+never took effect -- a commit that succeeded on the server whose
+acknowledgment was lost is exactly the scenario this project's own
+reply-drop tests (§11) exist to exercise. Correctly modeling "this may or
+may not have happened" needs trying both possibilities in the search, real,
+separate future work not attempted here; excluding the operation is the
+honest, well-scoped alternative for this first version, not a shortcut
+taken silently.
+
+### 29.4 A real architectural constraint this task's own environment imposed, and the design decision it produced
+
+`internal/linearize`'s own core (`linearize.go`, `kvmodel.go`) has no
+dependency beyond the standard library -- deliberately, so the algorithm
+itself, the part of this task actually worth verifying carefully, could be
+built, vetted, and tested in full in this environment, unlike §28's own
+`internal/history`. The bridge converting a recorded `history.Event` stream
+into `[]linearize.Operation` -- `ToLinearizeOperations` -- lives in
+`internal/history` itself (`internal/history/linearize_bridge.go`), NOT in
+`internal/linearize`, for exactly this reason.
+
+The first attempt put it the other way, as a separate file inside
+`internal/linearize`, on the assumption that keeping the grpc-dependent
+code in its OWN FILE would be enough to keep the REST of the package
+buildable without network access. It is not: Go compiles a package as one
+unit, every file together, regardless of which specific file within it
+imports what. The moment a single file in `internal/linearize` imported
+`internal/history` (and therefore, transitively, gRPC), the WHOLE package
+-- `linearize.go` and `kvmodel.go` included, both of which had already been
+built and tested successfully moments before -- stopped building at all in
+this environment. Moving the bridge into `internal/history` instead (which
+already depends on gRPC, so gains nothing new to lose) resolved this
+completely: `internal/linearize` imports nothing beyond the standard
+library, `internal/history` imports `internal/linearize`, one direction
+only, no cycle, and the actual algorithm -- the part of this task's own
+scope that most needed careful, real verification -- got it.
+
+`ToLinearizeOperations` and its own tests
+(`internal/history/linearize_bridge_test.go`) still could not be built or
+run here, for the identical §28.3 network reason -- they live in
+`internal/history`, which needs gRPC regardless of which file within it
+does. Every type and field reference in both files was checked by hand
+against the real, current source of both packages; `gofmt` confirmed
+syntactic validity. Two of the bridge's own tests
+(`TestToLinearizeOperationsEndToEndAgainstARealServer`,
+`TestToLinearizeOperationsEndToEndConcurrentWorkload`) are the first tests
+in this whole project to exercise `internal/history` and
+`internal/linearize` together, end to end, against a real server -- proving
+the two packages actually compose, not just that each independently does
+what its own unit tests say it does -- and are exactly the tests most
+worth running first once this environment's own network limitation no
+longer applies.
+
+### 29.5 What was actually verified, and the real numbers
+
+Every test in `internal/linearize/linearize_test.go` was built, vetted, and
+run: the classic stale-read counterexample (a read that starts after an
+already-completed write to the same key but does not see it -- correctly
+reported non-linearizable); its positive counterpart (two concurrent writes
+to the same key, with a later read pinning down which one the search must
+find went last); malformed-input rejection (End before Start); the
+64-operation structural limit; and a randomized correctness check building
+30 independently-generated histories, each constructed with a KNOWN-VALID
+linearization by construction (the exact order used to generate it), all
+30 confirmed linearizable by the checker.
+
+Real performance, measured directly rather than assumed: on realistic,
+moderately-concurrent histories shaped like an actual chaos scenario's own
+workload, checking completed in under 200 microseconds even at the full
+64-operation limit. This is not a claim about the algorithm's own worst
+case, which remains genuinely exponential and NP-complete by Wing and
+Gong's own proof -- it is a measurement of the specific shape of history
+this checker is actually meant to run against, which is small, and where
+memoization does real, effective pruning against realistic concurrency
+levels.
+
+`internal/history/linearize_bridge.go` and its own tests could not be
+built, vetted, or run here, for the identical §28.3 reason -- both live in
+`internal/history`, which needs gRPC. `internal/linearize` itself,
+including every test named above, has none of that dependency and was
+fully verified.
+
+## 30. Revision log
 
 
 | Version | Change |
@@ -4879,4 +5213,7 @@ as different.
 | v1.35 | Phase G-3, the chaos-testing phase's third task: a fault injector for arbitrary node subsets, on and off, at controlled times (new §24). `partition`/`heal` (§11) replace the whole topology at once and cannot express two independently-timed faults on overlapping subsets, since whichever `heal` call runs first reopens a link the other still needs cut. Fixed underneath first: `fakeNetwork` gained `isolateSubset`/`restoreSubset`, backed by a new reference-counted `cutRefs map[[2]int]int` so overlapping isolations of different subsets compose -- a link stays cut until every isolation cutting it has been restored, not just the most recent one. `faultInjector` (new `internal/raft/faultinjector_test.go`) is the declarative layer on top: a `[]faultSchedule` of `{Subset, At, Duration}` entries, each run on its own goroutine via ordinary `time.Sleep`, automatically `synctest`-compatible (§23) with zero changes needed to get virtual-time scheduling. `Stop()` matches `cluster.stop`/`compaction.Background.Stop`'s own "nothing outlives the caller" discipline: any pending entry never applies, any active one restores immediately, and the call blocks until every goroutine has actually returned. Proved, not just built: `TestIsolateAndRestoreSubsetComposeAcrossOverlappingCalls` checks the composability directly (two overlapping isolations sharing one crossing link; restoring the first must not reopen it while the second is still active), and `TestFaultInjectorHandlesOverlappingArbitrarySubsets` proves the literal task claim end to end, inside a synctest bubble. A real bug was caught while writing the cluster-backed tests, not theorized: the first draft read `c.net.reachable[from][to]` directly from the test goroutine while the injector's own goroutines wrote the same map concurrently under `fn.mu` -- `-race` caught it on the first run; fixed by switching every test to the harness's own existing, lock-safe `deliverable()` accessor. |
 | v1.36 | Phase G-4, the chaos-testing phase's fourth task: message drop, duplication, reordering, and delay, each with its own configurable rate (new §25). Drop and delay already existed; reordering was already measured but only ever produced as delay's own incidental side effect, with no rate of its own; duplication did not exist in any form. `setDuplicateRate` makes a deliverable request also reach its target a second time -- all four `SendXxx` methods now check `route`'s new `dup` return value and deliver a second, independently-decoded copy, discarding its own reply, the faithful shape a real retransmission without a duplicate acknowledgment takes. `setReorderRate` biases a message toward arriving late by pushing its own delay strictly past `maxDelay`, raising the odds it loses a race against whatever the same pair sends next without touching what delay means for anything else -- "biases toward," stated plainly, not "guarantees," the same honest framing `dropRate`/`duplicateRate` already carry. Both roll from `messageHash` with their own salts, inheriting G-2's own determinism for free. `TestNetworkDecisionIsPureFunctionOfIdentity` extended to cover both new roll functions. `TestDuplicateRateActuallyDeliversTwice` confirms real delivery, not just a decided intent, via `appendStats`'s own message count; `TestDuplicateVoteDoesNotGrantTwice` confirms the actual correctness property end to end -- a real election with every RequestVote duplicated still converges on exactly one leader; `TestReorderRateIncreasesObservedReordering` is the distributional check `TestElectionTimeoutsAreRandomised` already set the standard for -- a boosted network's own `reorderedCount()` compared against an unboosted control from the identical seed. A real bug was caught while writing the duplicate-delivery test, not theorized: `decisionTrace()` accumulates for the cluster's whole life and is never reset by `resetCounters()`, so the first version also examined pre-`setDuplicateRate` sends from the initial election and correctly found them un-duplicated -- fixed by snapshotting the trace before enabling the rate and only examining what's new since. |
 | v1.37 | Phase G-5, the chaos-testing phase's fifth task: process kill and restart, including kill during fsync (new §26). Builds on crash_test.go's own pre-existing TestHardKillLosesNoAcknowledgedState (a SIGKILL at a random 15-175ms interval, twelve rounds sharing one directory, checked for atomicity -- still decodes, internally consistent, never loses an acknowledged term), whose own doc comment had named this exact task before it existed: "that belongs with the kill-during-fsync injector." runCrashChild gained an HELIOS_CRASH_MODE=fsync mode, printing PRESAVE before every Save() call so a mid-flight kill can be MEASURED (presave > acked) rather than assumed. Two real, measured wrong turns preceded the working design, both recorded rather than quietly discarded: synchronizing the kill to the child's own PRESAVE signal measured WORSE (10-17% of rounds interrupted) than a plain unsynchronized random sleep (30-50%), traced to a real ~1.1-1.5ms bare exec.Command startup latency the synchronized version had no visibility into; a 40x larger payload (crashFsyncLogCycle), assumed to widen Save()'s own window, measured flat (434-511us mean Save() duration from 500 to 100,000 entries) since fixed syscall overhead dominates byte count on the tested storage. What worked was the simplest option: reuse the ORIGINAL test's own plain-random-sleep mechanism (runChildUntilKilled, generalized to carry "fsync" mode), with a window (5-50ms) chosen only to sit comfortably past the measured startup cost. Measured across several seeds: 30-58% of rounds genuinely interrupted an in-flight Save() -- comparable to, not dramatically better than, the ORIGINAL test's own window measured the same way, which is itself the most useful finding: precise synchronization bought nothing a wide-enough blind window didn't already have. TestHardKillDuringFsyncLosesNoAcknowledgedState's own anti-vacuity threshold (rounds/4) is set as a conservative floor grounded in this repeated measurement, not an aspirational number chosen before anything was run. What this still does not prove is unchanged from before this task: true below-kernel power-loss corruption, which SIGKILL cannot exercise regardless of timing precision. |
-| v1.38 | Phase G-6, the chaos-testing phase's sixth task: clock skew, including a leader whose clock jumps backwards (new §27). The first production code change any Phase G task has needed: a new clock interface (clock.go), used ONLY on the lease-critical path (ReadLease, leaseExpiry, noteContact, and the sentAt stamps in replication.go/installsnapshot.go), scoped this tightly because a wrong clock answer almost everywhere else in this package is a liveness bug, while the lease path's own §9 "bounded clock assumption" is a safety argument -- the one place synctest's own bubble-wide virtual clock cannot help, since it gives every goroutine in a bubble the identical clock and this task needed ONE node's clock to diverge from its peers'. Building the fault injector (fakeClock, clockskew_test.go) surfaced a real, PERSISTENT vulnerability, fixed in the same commit as the test that found it: noteContact's own monotonicity guard, meant to stop a late reply from dragging the lease backwards, means that once a leader's clock jumps backward, every subsequent sentAt looks numerically earlier than what's already recorded, so the guard refuses to ever update lastContact again -- it freezes at its pre-jump values, UNRECOVERABLY, while leaseExpiry keeps computing an expiry from those frozen values and the also-rolled-back clock.Now() keeps satisfying now.Before(until) against it, indefinitely. Fixed with detectClockRollback: a clock observation earlier than the highest ever seen clears every lastContact entry, forcing the lease to be re-earned exactly as a freshly-elected leader already must. Verified as a real fix, not asserted as one: TestReadLeaseIsSafeWhenTheLeadersClockJumpsBackward was run once with the fix's own call commented out, failed with exactly the predicted message, then passed once restored. A second, genuine data race surfaced from the test's own methodology (injecting a fakeClock onto an already-running leader, to simulate a fault arriving mid-lifetime): sendAppendEntries/sendInstallSnapshot's unlocked n.clock.Now() reads, previously safe only because n.clock never changed after construction the way n.transport still doesn't, raced a test reassigning it -- fixed with a new n.now() helper that reads the clock field under the lock before calling it outside. Full existing lease suite (7 tests) and the three new tests all pass 5-8x under -race; whole-package short suite clean except two already-familiar, sandbox-load-only flakes, confirmed unrelated. A whole-Node virtual-clock rewrite remains deliberately out of scope, per §23's own original open question -- this task's seam covers exactly the one place a wrong clock answer is a safety bug, not a liveness one. |
+| v1.38 | Phase G-6, the chaos-testing phase's sixth task: clock skew, including a leader whose clock jumps backwards (new §27). The first production code change any Phase G task has needed: a new clock interface (clock.go), used ONLY on the lease-critical path (ReadLease, leaseExpiry, noteContact, and the sentAt stamps in replication.go/installsnapshot.go), scoped this tightly because a wrong clock answer almost everywhere else in this package is a liveness bug, while the lease path's own §9 "bounded clock assumption" is a safety argument -- the one place synctest's own bubble-wide virtual clock cannot help, since it gives every goroutine in a bubble the identical clock and this task needed ONE node's clock to diverge from its peers'. Building the fault injector (fakeClock, clockskew_test.go) surfaced a real, PERSISTENT vulnerability: a leader whose clock jumps backward gets lastContact frozen at its pre-jump values FOREVER, since noteContact's own monotonicity guard -- meant to stop a late reply from dragging the lease backwards -- refuses every post-jump sentAt for looking numerically earlier than what it already has. Fixed with detectClockRollback: a clock observation earlier than the highest ever seen clears lastContact, forcing the lease to be re-earned exactly as a freshly-elected leader already must. Verified by disabling the fix and confirming the core test failed with exactly the predicted message, then restoring it. |
+| v1.39 | A real regression in v1.38's own first working version, found on real hardware and fixed (§27.3 corrected). detectClockRollback had been called from both ReadLease and noteContact; the noteContact call site broke healthy, unmodified leaders intermittently -- replicateAll fans AppendEntries out one goroutine per peer, and two peers' round trips do not complete in the order their own sentAt values were captured in, so an entirely ordinary out-of-order reply pair looked identical to a real rollback from inside noteContact's own calling context, clearing lastContact on a perfectly healthy leader. Fixed by restricting detectClockRollback to ReadLease alone, where n.mu genuinely guarantees successive now := n.clock.Now() reads are chronologically ordered, a guarantee noteContact's concurrent, per-peer callers cannot provide. TestOutOfOrderPeerRepliesDoNotClearLastContact and TestNoteContactAloneNeverClearsLastContact added to lock the corrected design in directly. This package's own test harness, running an entire cluster in one process, never happened to schedule the triggering interleaving in any run performed before the original commit -- caught only once run against a real scheduler on different hardware, recorded as a reminder that -race proves the absence of a data race, not a logic race between events the harness cannot fully reproduce. |
+| v1.40 | Phase G-7, the first task past chaos-fault-injection proper: a history recorder (new §28), the recording half of what a future linearizability checker (Porcupine and similar tools) will need as input -- one timestamped Invoke and one timestamped Return per client operation, correlated by an id. New package internal/history: Recorder (a single, shared, thread-safe, ordered log meant to be wrapped by several RecordingClients at once, one per concurrent actor, so OpIDs stay globally unique across a whole run) and RecordingClient (embeds a real *client.Client, logging every operation except Watch -- which returns an indefinitely-live channel rather than a single return, and does not fit the invoke/return model at all). Every recorded byte slice is a copy, never an alias into the caller's own buffer. No production code change: client.Client's own clientID (idempotency identity, F-4) is deliberately not reused as the history's own per-actor identity -- different concepts for different purposes -- so RecordingClient.Wrap takes an explicit, caller-assigned clientID instead. WriteJSONL/ReadJSONL persist a history as JSON Lines, human-inspectable and checker-portable; Kind marshals as its own name, not a bare integer. A real, stated limitation, not a formality: this package could not be built, vetted, or run in this environment at all -- internal/history depends on client, which depends on grpc/protobuf, neither cached here, and this environment's network egress does not reach proxy.golang.org to fetch them, a gap distinct from every prior Go-version limitation in this project and the first time any Phase G deliverable has gone completely unverified before delivery. Every method signature was checked by hand against client/client.go's own real, current source; gofmt confirmed syntactic validity; the full test suite (internal/history/history_test.go, including a real-server harness duplicated from client/client_test.go's own startRealServer) was written but never executed. |
+| v1.41 | A linearizability checker (new §29): Wing and Gong's own 1988 algorithm, implemented from scratch rather than wiring in Porcupine, chosen both because it satisfies "understand the algorithm" most directly and because Porcupine, an external module, would need the identical network access to proxy.golang.org that v1.40's own record already established this environment does not have. internal/linearize's core (linearize.go: the recursive backtracking search over "which operation could legally be linearized next," bitset-tracked, memoized on (bitset, model state) rather than bitset alone -- unsound otherwise, since two orderings of the identical operation set can reach different states when operations don't commute; kvmodel.go: the sequential specification for Get/GetStale/Put/Delete, deliberately excluding Scan/ScanStale/ScanAll as a named, hard boundary rather than an oversight) has NO dependency beyond the standard library, and was fully built, vetted, and tested in this environment: the classic stale-read counterexample, its positive concurrent-writes counterpart, malformed-input and 64-operation-limit rejection, and a 30-trial randomized correctness check, all passing. Real measured performance: under 200 microseconds even at the 64-operation limit on realistic, chaos-scenario-shaped histories, though the algorithm's own worst case remains genuinely exponential (Wing and Gong's own proof of NP-completeness, not a property specific to this implementation). A real architectural lesson from this environment's own constraints: the first attempt put the internal/history-to-linearize.Operation bridge in its OWN FILE inside internal/linearize, assuming file-level separation would keep the rest of the package buildable without gRPC -- it does not, since Go compiles a package as one unit regardless of which specific file imports what, and the whole package (including the already-verified core) stopped building the moment one file pulled in gRPC transitively. Fixed by moving the bridge (ToLinearizeOperations) into internal/history instead, which already depends on gRPC and gains nothing new to lose -- internal/linearize stays dependency-free, one-directional, no cycle. The bridge itself and its own tests (internal/history/linearize_bridge.go, linearize_bridge_test.go, including two new end-to-end tests exercising internal/history and internal/linearize together against a real server) could not be built or run here, for the identical reason as v1.40. |
